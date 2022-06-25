@@ -1,6 +1,4 @@
-use hir::FnArg;
-
-use crate::ast;
+use crate::ast::{self, Spanned};
 use crate::hir;
 use crate::hir::HirError;
 
@@ -47,7 +45,7 @@ pub fn item_fn<'hir>(ctx: &Ctx<'hir>, ast: &ast::ItemFn) -> Result<hir::ItemFn<'
 }
 
 /// Lower a function argument.
-fn fn_arg<'hir>(ctx: &Ctx<'hir>, ast: &ast::FnArg) -> Result<FnArg<'hir>, HirError> {
+fn fn_arg<'hir>(ctx: &Ctx<'hir>, ast: &ast::FnArg) -> Result<hir::FnArg<'hir>, HirError> {
     Ok(match ast {
         ast::FnArg::SelfValue(_) => hir::FnArg::SelfValue,
         ast::FnArg::Pat(ast) => hir::FnArg::Pat(ctx.arena.alloc(pat(ctx, ast)?)?),
@@ -134,10 +132,11 @@ fn path_segment<'hir>(
 fn block<'hir>(ctx: &Ctx<'hir>, ast: &ast::Block) -> Result<hir::Block<'hir>, HirError> {
     Ok(hir::Block {
         id: ast.id,
+        span: ast.span(),
         statements: todo!(),
     })
 }
 
 fn attribute<'hir>(ctx: &Ctx<'hir>, ast: &ast::Attribute) -> Result<hir::Attribute, HirError> {
-    Ok(hir::Attribute {})
+    Ok(hir::Attribute { span: ast.span() })
 }

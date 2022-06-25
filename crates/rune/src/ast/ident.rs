@@ -30,7 +30,7 @@ use crate::ast::prelude::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Spanned)]
 #[non_exhaustive]
 pub struct Ident {
-    /// The kind of the identifier.
+    /// The span of the identifier.
     pub span: Span,
     /// The kind of the identifier.
     #[rune(skip)]

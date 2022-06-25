@@ -1,6 +1,6 @@
 use crate::ast::prelude::*;
 
-/// An identifier, like `foo` or `Hello`.".
+/// An identifier, like `foo` or `Hello`.
 ///
 /// Custom identifiers are constructed in macros using
 /// [MacroContext::ident][crate::macros::MacroContext::ident].

@@ -7,6 +7,7 @@ use crate::compile::{
     PrivStructMeta, PrivVariantMeta,
 };
 use crate::hash::ParametersBuilder;
+use crate::hir;
 use crate::parse::{Id, ParseErrorKind, Resolve};
 use crate::query::{BuiltInFormat, BuiltInTemplate, Named};
 use crate::runtime::{

@@ -76,7 +76,7 @@ impl<'hir, 'a> Ctx<'hir, 'a> {
 
 /// Lower a function item.
 pub fn item_fn<'hir>(
-    ctx: &Ctx<'hir, '_>,
+    ctx: &mut Ctx<'hir, '_>,
     ast: &ast::ItemFn,
 ) -> Result<hir::ItemFn<'hir>, HirError> {
     Ok(hir::ItemFn {
@@ -91,7 +91,7 @@ pub fn item_fn<'hir>(
 
 /// Lower a closure expression.
 pub fn expr_closure<'hir>(
-    ctx: &Ctx<'hir, '_>,
+    ctx: &mut Ctx<'hir, '_>,
     ast: &ast::ExprClosure,
 ) -> Result<hir::ExprClosure<'hir>, HirError> {
     Ok(hir::ExprClosure {
@@ -107,7 +107,10 @@ pub fn expr_closure<'hir>(
 }
 
 /// Lower the specified block.
-pub fn block<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Block) -> Result<hir::Block<'hir>, HirError> {
+pub fn block<'hir>(
+    ctx: &mut Ctx<'hir, '_>,
+    ast: &ast::Block,
+) -> Result<hir::Block<'hir>, HirError> {
     Ok(hir::Block {
         id: ast.id,
         span: ast.span(),
@@ -116,7 +119,7 @@ pub fn block<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Block) -> Result<hir::Block<'
 }
 
 /// Lower an expression.
-pub fn expr<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Expr) -> Result<hir::Expr<'hir>, HirError> {
+pub fn expr<'hir>(ctx: &mut Ctx<'hir, '_>, ast: &ast::Expr) -> Result<hir::Expr<'hir>, HirError> {
     let kind = match ast {
         ast::Expr::Path(ast) => hir::ExprKind::Path(alloc!(ctx, ast; path(ctx, ast)?)),
         ast::Expr::Assign(ast) => hir::ExprKind::Assign(alloc!(ctx, ast; hir::ExprAssign {
@@ -252,8 +255,8 @@ pub fn expr<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Expr) -> Result<hir::Expr<'hir
             to: option!(ctx, ast; &ast.to, |ast| expr(ctx, ast)?),
         })),
         ast::Expr::Group(ast) => hir::ExprKind::Group(alloc!(ctx, ast; expr(ctx, &ast.expr)?)),
-        ast::Expr::MacroCall(ast) => {
-            hir::ExprKind::MacroCall(alloc!(ctx, ast; match ctx.q.builtin_macro_for(ast)? {
+        ast::Expr::MacroCall(ast) => hir::ExprKind::MacroCall(
+            alloc!(ctx, ast; match ctx.q.builtin_macro_for(ast)?.clone() {
                 query::BuiltInMacro::Template(ast) => hir::MacroCall::Template(alloc!(ctx, ast; hir::BuiltInTemplate {
                     span: ast.span,
                     from_literal: ast.from_literal,
@@ -278,8 +281,8 @@ pub fn expr<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Expr) -> Result<hir::Expr<'hir
                     value: ast.value,
                 })),
             }
-            ))
-        }
+            ),
+        ),
     };
 
     Ok(hir::Expr {
@@ -290,7 +293,7 @@ pub fn expr<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Expr) -> Result<hir::Expr<'hir
 
 /// Lower a block expression.
 pub fn expr_block<'hir>(
-    ctx: &Ctx<'hir, '_>,
+    ctx: &mut Ctx<'hir, '_>,
     ast: &ast::ExprBlock,
 ) -> Result<hir::ExprBlock<'hir>, HirError> {
     Ok(hir::ExprBlock {
@@ -306,7 +309,7 @@ pub fn expr_block<'hir>(
 
 /// Visibility covnersion.
 fn visibility<'hir>(
-    ctx: &Ctx<'hir, '_>,
+    ctx: &mut Ctx<'hir, '_>,
     ast: &ast::Visibility,
 ) -> Result<hir::Visibility<'hir>, HirError> {
     Ok(match ast {
@@ -322,7 +325,7 @@ fn visibility<'hir>(
 }
 
 /// Lower a function argument.
-fn fn_arg<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::FnArg) -> Result<hir::FnArg<'hir>, HirError> {
+fn fn_arg<'hir>(ctx: &mut Ctx<'hir, '_>, ast: &ast::FnArg) -> Result<hir::FnArg<'hir>, HirError> {
     Ok(match ast {
         ast::FnArg::SelfValue(ast) => hir::FnArg::SelfValue(ast.span()),
         ast::FnArg::Pat(ast) => hir::FnArg::Pat(alloc!(ctx, ast; pat(ctx, ast)?)),
@@ -330,7 +333,7 @@ fn fn_arg<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::FnArg) -> Result<hir::FnArg<'hir
 }
 
 /// Lower an assignment.
-fn local<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Local) -> Result<hir::Local<'hir>, HirError> {
+fn local<'hir>(ctx: &mut Ctx<'hir, '_>, ast: &ast::Local) -> Result<hir::Local<'hir>, HirError> {
     Ok(hir::Local {
         span: ast.span(),
         pat: alloc!(ctx, ast; pat(ctx, &ast.pat)?),
@@ -339,7 +342,7 @@ fn local<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Local) -> Result<hir::Local<'hir>
 }
 
 /// Lower a statement
-fn stmt<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Stmt) -> Result<hir::Stmt<'hir>, HirError> {
+fn stmt<'hir>(ctx: &mut Ctx<'hir, '_>, ast: &ast::Stmt) -> Result<hir::Stmt<'hir>, HirError> {
     Ok(match ast {
         ast::Stmt::Local(ast) => hir::Stmt::Local(alloc!(ctx, ast; local(ctx, ast)?)),
         ast::Stmt::Expr(ast) => hir::Stmt::Expr(alloc!(ctx, ast; expr(ctx, ast)?)),
@@ -348,7 +351,7 @@ fn stmt<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Stmt) -> Result<hir::Stmt<'hir>, H
     })
 }
 
-fn pat<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Pat) -> Result<hir::Pat<'hir>, HirError> {
+fn pat<'hir>(ctx: &mut Ctx<'hir, '_>, ast: &ast::Pat) -> Result<hir::Pat<'hir>, HirError> {
     Ok(hir::Pat {
         span: ast.span(),
         kind: match ast {
@@ -402,7 +405,7 @@ fn pat<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Pat) -> Result<hir::Pat<'hir>, HirE
 }
 
 fn object_key<'hir>(
-    ctx: &Ctx<'hir, '_>,
+    ctx: &mut Ctx<'hir, '_>,
     ast: &ast::ObjectKey,
 ) -> Result<hir::ObjectKey<'hir>, HirError> {
     Ok(match ast {
@@ -413,7 +416,7 @@ fn object_key<'hir>(
 
 /// Lower an object identifier to an optional path.
 fn object_ident<'hir>(
-    ctx: &Ctx<'hir, '_>,
+    ctx: &mut Ctx<'hir, '_>,
     ast: &ast::ObjectIdent,
 ) -> Result<Option<&'hir hir::Path<'hir>>, HirError> {
     Ok(match ast {
@@ -423,7 +426,7 @@ fn object_ident<'hir>(
 }
 
 /// Lower the given path.
-pub fn path<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Path) -> Result<hir::Path<'hir>, HirError> {
+pub fn path<'hir>(ctx: &mut Ctx<'hir, '_>, ast: &ast::Path) -> Result<hir::Path<'hir>, HirError> {
     Ok(hir::Path {
         id: ast.id,
         span: ast.span(),
@@ -435,7 +438,7 @@ pub fn path<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Path) -> Result<hir::Path<'hir
 }
 
 fn path_segment<'hir>(
-    ctx: &Ctx<'hir, '_>,
+    ctx: &mut Ctx<'hir, '_>,
     ast: &ast::PathSegment,
 ) -> Result<hir::PathSegment<'hir>, HirError> {
     let kind = match ast {
@@ -455,7 +458,7 @@ fn path_segment<'hir>(
     })
 }
 
-fn label<'hir>(_: &Ctx<'hir, '_>, ast: &ast::Label) -> Result<ast::Label, HirError> {
+fn label<'hir>(_: &mut Ctx<'hir, '_>, ast: &ast::Label) -> Result<ast::Label, HirError> {
     Ok(ast::Label {
         span: ast.span,
         source: ast.source,
@@ -463,7 +466,7 @@ fn label<'hir>(_: &Ctx<'hir, '_>, ast: &ast::Label) -> Result<ast::Label, HirErr
 }
 
 fn condition<'hir>(
-    ctx: &Ctx<'hir, '_>,
+    ctx: &mut Ctx<'hir, '_>,
     ast: &ast::Condition,
 ) -> Result<hir::Condition<'hir>, HirError> {
     Ok(match ast {

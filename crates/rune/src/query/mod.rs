@@ -31,6 +31,7 @@ pub use self::query_error::{QueryError, QueryErrorKind};
 mod query_error;
 
 /// An internally resolved macro.
+#[derive(Debug, Clone, Spanned)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum BuiltInMacro {
     Template(BuiltInTemplate),
@@ -40,7 +41,7 @@ pub(crate) enum BuiltInMacro {
 }
 
 /// An internally resolved template.
-#[derive(Spanned)]
+#[derive(Debug, Clone, Spanned)]
 pub(crate) struct BuiltInTemplate {
     /// The span of the built-in template.
     #[rune(span)]
@@ -52,7 +53,7 @@ pub(crate) struct BuiltInTemplate {
 }
 
 /// An internal format specification.
-#[derive(Spanned)]
+#[derive(Debug, Clone, Spanned)]
 pub(crate) struct BuiltInFormat {
     #[rune(span)]
     pub(crate) span: Span,
@@ -1053,8 +1054,8 @@ impl<'a> Query<'a> {
                 let ir_fn = {
                     // TODO: avoid this arena?
                     let arena = crate::hir::Arena::new();
-                    let ctx = crate::hir::lowering::Ctx::new(&arena, self.borrow());
-                    let hir = crate::hir::lowering::item_fn(&ctx, &c.item_fn)?;
+                    let mut ctx = crate::hir::lowering::Ctx::new(&arena, self.borrow());
+                    let hir = crate::hir::lowering::item_fn(&mut ctx, &c.item_fn)?;
                     let mut c = IrCompiler {
                         source_id: c.location.source_id,
                         q: self.borrow(),

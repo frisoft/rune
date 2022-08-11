@@ -6,8 +6,8 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use crate::ast;
-use crate::ast::{Span, Spanned};
+use crate::arena::Arena;
+use crate::ast::{self, Span, Spanned};
 use crate::collections::LinkedHashMap;
 use crate::collections::{hash_map, HashMap, HashSet};
 use crate::compile::{
@@ -23,6 +23,7 @@ use crate::parse::{Id, NonZeroId, Opaque, Resolve, ResolveContext};
 use crate::runtime::format;
 use crate::runtime::Call;
 use crate::shared::{Consts, Gen, Items};
+use crate::Diagnostics;
 use crate::{Context, Hash, SourceId, Sources};
 
 /// The permitted number of import recursions when constructing a path.
@@ -34,6 +35,7 @@ mod query_error;
 
 /// An internally resolved macro.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 pub(crate) enum BuiltInMacro {
     Template(BuiltInTemplate),
     Format(BuiltInFormat),
@@ -42,7 +44,7 @@ pub(crate) enum BuiltInMacro {
 }
 
 /// An internally resolved template.
-#[derive(Spanned)]
+#[derive(Clone, Spanned)]
 pub(crate) struct BuiltInTemplate {
     /// The span of the built-in template.
     #[rune(span)]
@@ -54,7 +56,7 @@ pub(crate) struct BuiltInTemplate {
 }
 
 /// An internal format specification.
-#[derive(Spanned)]
+#[derive(Clone, Spanned)]
 pub(crate) struct BuiltInFormat {
     #[rune(span)]
     pub(crate) span: Span,
@@ -137,6 +139,8 @@ pub(crate) struct Query<'a> {
     pub(crate) pool: &'a mut Pool,
     /// Visitor for the compiler meta.
     pub(crate) visitor: &'a mut dyn CompileVisitor,
+    /// Diagnostics.
+    pub(crate) diagnostics: &'a mut Diagnostics,
     /// Shared id generator.
     gen: &'a Gen,
     /// Inner state of the query engine.
@@ -153,6 +157,7 @@ impl<'a> Query<'a> {
         sources: &'a mut Sources,
         pool: &'a mut Pool,
         visitor: &'a mut dyn CompileVisitor,
+        diagnostics: &'a mut Diagnostics,
         gen: &'a Gen,
         inner: &'a mut QueryInner,
     ) -> Self {
@@ -164,6 +169,7 @@ impl<'a> Query<'a> {
             sources,
             pool,
             visitor,
+            diagnostics,
             gen,
             inner,
         }
@@ -179,6 +185,7 @@ impl<'a> Query<'a> {
             pool: self.pool,
             sources: self.sources,
             visitor: self.visitor,
+            diagnostics: self.diagnostics,
             gen: self.gen,
             inner: self.inner,
         }
@@ -451,10 +458,7 @@ impl<'a> Query<'a> {
     ) -> Result<(), QueryError> {
         tracing::trace!(item = ?self.pool.item(item_meta.item));
 
-        let mut c = IrCompiler {
-            source_id: item_meta.location.source_id,
-            q: self.borrow(),
-        };
+        let mut c = IrCompiler::new(item_meta.location.source_id, self.borrow());
         let ir = f(value, &mut c)?;
 
         self.index(IndexedEntry {
@@ -821,7 +825,7 @@ impl<'a> Query<'a> {
         let span = path.span();
 
         let local = match local {
-            Some(local) => Some(local.resolve(resolve_context!(self))?.into()),
+            Some(local) => Some(local),
             None => None,
         };
 
@@ -1147,9 +1151,13 @@ impl<'a> Query<'a> {
             Indexed::ConstFn(c) => {
                 let ir_fn = {
                     // TODO: avoid this arena?
-                    let arena = crate::hir::Arena::new();
-                    let ctx = crate::hir::lowering::Ctx::new(&arena, self.borrow());
-                    let hir = crate::hir::lowering::item_fn(&ctx, &c.item_fn)?;
+                    let arena = Arena::new();
+                    let mut cx = crate::hir::lowering::Ctxt::new(
+                        c.location.source_id,
+                        self.borrow(),
+                        &arena,
+                    );
+                    let hir = crate::hir::lowering::item_fn(&mut cx, &c.item_fn)?;
                     let mut c = IrCompiler {
                         source_id: c.location.source_id,
                         q: self.borrow(),
@@ -1516,6 +1524,8 @@ pub(crate) struct InstanceFunction {
     /// The item of the instance function.
     pub(crate) impl_item: ItemId,
     /// The span of the instance function.
+    // TODO: remove this
+    #[allow(unused)]
     pub(crate) instance_span: Span,
 }
 
@@ -1624,7 +1634,7 @@ pub(crate) struct QueryConstFn {
 #[derive(Debug)]
 pub(crate) struct Named<'hir> {
     /// If the resolved value is local.
-    pub(crate) local: Option<Box<str>>,
+    pub(crate) local: Option<&'hir ast::Ident>,
     /// The path resolved to the given item.
     pub(crate) item: ItemId,
     /// Generic arguments if any.
@@ -1633,9 +1643,9 @@ pub(crate) struct Named<'hir> {
 
 impl Named<'_> {
     /// Get the local identifier of this named.
-    pub(crate) fn as_local(&self) -> Option<&str> {
+    pub(crate) fn as_local(&self) -> Option<&ast::Ident> {
         if self.generics.is_none() {
-            self.local.as_deref()
+            self.local
         } else {
             None
         }

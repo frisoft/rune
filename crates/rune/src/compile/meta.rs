@@ -396,6 +396,8 @@ pub(crate) enum PrivMetaKind {
         /// Sequence of captured variables.
         captures: Arc<[CaptureMeta]>,
         /// If the async block moves its environment.
+        // TODO: remove this
+        #[allow(unused)]
         do_move: bool,
     },
     /// The constant expression.

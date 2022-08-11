@@ -134,7 +134,7 @@ pub(crate) async fn run(
 
             for (hash, kind) in functions {
                 if let Some(signature) = unit.debug_info().and_then(|d| d.functions.get(&hash)) {
-                    writeln!(io.stdout, "{} = {}", hash, signature)?;
+                    writeln!(io.stdout, "{} = {} ({})", hash, signature, kind)?;
                 } else {
                     writeln!(io.stdout, "{} = {}", hash, kind)?;
                 }

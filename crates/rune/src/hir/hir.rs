@@ -41,8 +41,6 @@ pub struct Pat<'hir> {
 pub enum PatKind<'hir> {
     /// An ignored binding.
     PatIgnore,
-    /// The rest pattern `..`.
-    PatRest,
     /// A path pattern.
     PatPath(&'hir Path<'hir>),
     /// A literal pattern. This is represented as an expression.
@@ -52,9 +50,19 @@ pub enum PatKind<'hir> {
     /// A tuple pattern.
     PatTuple(&'hir PatItems<'hir>),
     /// An object pattern.
-    PatObject(&'hir PatItems<'hir>),
-    /// A binding `a: pattern` or `"foo": pattern`.
-    PatBinding(&'hir PatBinding<'hir>),
+    PatObject(&'hir PatObject<'hir>),
+}
+
+/// An object pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PatObject<'hir> {
+    /// The path, if the object is typed.
+    pub path: Option<&'hir Path<'hir>>,
+    /// The items in the tuple.
+    pub bindings: &'hir [PatBinding<'hir>],
+    /// If the pattern is open.
+    pub is_open: bool,
 }
 
 /// A tuple pattern.
@@ -67,14 +75,14 @@ pub struct PatItems<'hir> {
     pub items: &'hir [Pat<'hir>],
     /// If the pattern is open.
     pub is_open: bool,
-    /// The number of elements in the pattern.
-    pub count: usize,
 }
 
 /// An object item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PatBinding<'hir> {
+    /// The span of the binding.
+    pub span: Span,
     /// The key of an object.
     pub key: &'hir ObjectKey<'hir>,
     /// What the binding is to.
@@ -96,10 +104,10 @@ pub struct Expr<'hir> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ExprKind<'hir> {
+    Empty,
     Path(&'hir Path<'hir>),
     Assign(&'hir ExprAssign<'hir>),
     Loop(&'hir ExprLoop<'hir>),
-    For(&'hir ExprFor<'hir>),
     Let(&'hir ExprLet<'hir>),
     If(&'hir ExprIf<'hir>),
     Match(&'hir ExprMatch<'hir>),
@@ -109,7 +117,7 @@ pub enum ExprKind<'hir> {
     Unary(&'hir ExprUnary<'hir>),
     Index(&'hir ExprIndex<'hir>),
     Block(&'hir ExprBlock<'hir>),
-    Break(Option<&'hir ExprBreakValue<'hir>>),
+    Break(&'hir ExprBreakValue<'hir>),
     Continue(Option<&'hir ast::Label>),
     Yield(Option<&'hir Expr<'hir>>),
     Return(Option<&'hir Expr<'hir>>),
@@ -213,24 +221,26 @@ pub struct ExprLoop<'hir> {
     /// A label.
     pub label: Option<&'hir ast::Label>,
     /// A condition to execute the loop, if a condition is necessary.
-    pub condition: Option<&'hir Condition<'hir>>,
+    pub condition: LoopCondition<'hir>,
     /// The body of the loop.
     pub body: &'hir Block<'hir>,
 }
 
-/// A `for` loop over an iterator: `for i in [1, 2, 3] {}`.
+/// The condition for a loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct ExprFor<'hir> {
-    /// The label of the loop.
-    pub label: Option<&'hir ast::Label>,
-    /// The pattern binding to use.
-    /// Non-trivial pattern bindings will panic if the value doesn't match.
-    pub binding: &'hir Pat<'hir>,
-    /// Expression producing the iterator.
-    pub iter: &'hir Expr<'hir>,
-    /// The body of the loop.
-    pub body: &'hir Block<'hir>,
+pub enum LoopCondition<'hir> {
+    /// A missing condition.
+    Forever,
+    /// A regular condition.
+    Condition { condition: &'hir Condition<'hir> },
+    /// An iterator condition.
+    Iterator {
+        /// The loop binding to use.
+        binding: &'hir Pat<'hir>,
+        /// The expression that produces the iterator.
+        iter: &'hir Expr<'hir>,
+    },
 }
 
 /// A let expression `let <name> = <expr>`
@@ -319,17 +329,6 @@ pub struct ExprCall<'hir> {
     pub args: &'hir [Expr<'hir>],
 }
 
-impl<'hir> ExprCall<'hir> {
-    /// Get the target of the call expression.
-    pub(crate) fn target(&self) -> &Expr {
-        if let ExprKind::FieldAccess(access) = self.expr.kind {
-            return access.expr;
-        }
-
-        self.expr
-    }
-}
-
 /// A field access `<expr>.<field>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -351,7 +350,7 @@ pub enum ExprField<'hir> {
 }
 
 /// A binary expression.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Spanned)]
 #[non_exhaustive]
 pub struct ExprBinary<'hir> {
     /// The left-hand side of a binary operation.
@@ -386,6 +385,8 @@ pub struct ExprIndex<'hir> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ExprBreakValue<'hir> {
+    /// Empty break value.
+    None,
     /// Breaking a value out of a loop.
     Expr(&'hir Expr<'hir>),
     /// Break and jump to the given label.
@@ -393,7 +394,7 @@ pub enum ExprBreakValue<'hir> {
 }
 
 /// A block expression.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Spanned)]
 #[non_exhaustive]
 pub struct ExprBlock<'hir> {
     /// The kind of the block.
@@ -401,6 +402,7 @@ pub struct ExprBlock<'hir> {
     /// The optional move token.
     pub block_move: bool,
     /// The close brace.
+    #[rune(span)]
     pub block: &'hir Block<'hir>,
 }
 
@@ -494,16 +496,16 @@ impl<'a, 'hir> Resolve<'a> for ObjectKey<'hir> {
 
     fn resolve(&self, ctx: ResolveContext<'a>) -> Result<Self::Output, ResolveError> {
         Ok(match *self {
-            Self::LitStr(lit_str) => lit_str.resolve(ctx)?,
-            Self::Path(path) => {
-                let ident = match path.try_as_ident() {
+            Self::LitStr(ast) => ast.resolve(ctx)?,
+            Self::Path(hir) => {
+                let ast = match hir.try_as_ident() {
                     Some(ident) => ident,
                     None => {
-                        return Err(ResolveError::expected(path, "object key"));
+                        return Err(ResolveError::expected(hir, "object key"));
                     }
                 };
 
-                Cow::Borrowed(ident.resolve(ctx)?)
+                Cow::Borrowed(ast.resolve(ctx)?)
             }
         })
     }
@@ -710,29 +712,16 @@ pub struct Block<'hir> {
     pub span: Span,
     /// Statements in the block.
     pub statements: &'hir [Stmt<'hir>],
-}
-
-impl Block<'_> {
-    /// Test if the block doesn't produce anything. Which is when the last
-    /// element is either a non-expression or is an expression terminated by a
-    /// semi.
-    pub(crate) fn produces_nothing(&self) -> bool {
-        matches!(self.statements.last(), Some(Stmt::Semi(..)) | None)
-    }
+    /// The tail statement being returned.
+    pub tail: Option<&'hir Expr<'hir>>,
 }
 
 /// A statement within a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Spanned)]
 #[non_exhaustive]
 pub enum Stmt<'hir> {
-    /// A local declaration.
     Local(&'hir Local<'hir>),
-    /// An expression.
     Expr(&'hir Expr<'hir>),
-    /// An expression with a trailing semi-colon.
-    Semi(&'hir Expr<'hir>),
-    /// An ignored item.
-    Item(Span),
 }
 
 /// A local variable declaration `let <pattern> = <expr>;`

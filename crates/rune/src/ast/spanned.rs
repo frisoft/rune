@@ -35,7 +35,7 @@ where
 
 impl<T> Spanned for &T
 where
-    T: Spanned,
+    T: ?Sized + Spanned,
 {
     fn span(&self) -> Span {
         Spanned::span(*self)
@@ -44,7 +44,7 @@ where
 
 impl<T> Spanned for &mut T
 where
-    T: Spanned,
+    T: ?Sized + Spanned,
 {
     fn span(&self) -> Span {
         Spanned::span(*self)

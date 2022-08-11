@@ -19,7 +19,8 @@ fn test_import_cycle() {
             Foo
         }             
         "#,
-        span, QueryError { error: ImportCycle { .. } } => {
+        span, QueryError { error } => {
+            assert_matches!(*error, ImportCycle { .. });
             assert_eq!(span, span!(244, 247));
         }
     };
@@ -38,11 +39,14 @@ fn test_import_cycle() {
             a::Foo
         }           
         "#,
-        span, QueryError { error: ImportCycle { path, .. } } => {
+        span, QueryError { error } => {
             assert_eq!(span, span!(177, 183));
-            assert_eq!(3, path.len());
-            assert_eq!(span!(107, 120), path[0].location.span);
-            assert_eq!(span!(37, 50), path[1].location.span);
+
+            assert_matches!(*error, ImportCycle { path, .. } => {
+                assert_eq!(3, path.len());
+                assert_eq!(span!(107, 120), path[0].location.span);
+                assert_eq!(span!(37, 50), path[1].location.span);
+            })
         }
     };
 }

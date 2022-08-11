@@ -25,7 +25,7 @@ impl Derive {
 
         match &self.input.data {
             syn::Data::Struct(st) => {
-                if let Some(stream) = expander.expand_struct(&self.input, st) {
+                if let Ok(stream) = expander.expand_struct(&self.input, st) {
                     return Ok(stream);
                 }
             }
@@ -58,12 +58,8 @@ impl Expander {
         &mut self,
         input: &syn::DeriveInput,
         st: &syn::DataStruct,
-    ) -> Option<TokenStream> {
-        let inner = self.expand_struct_fields(input, &st.fields)?;
-
-        Some(quote! {
-            #inner
-        })
+    ) -> Result<TokenStream, ()> {
+        self.expand_struct_fields(input, &st.fields)
     }
 
     /// Expand field decoding.
@@ -71,7 +67,7 @@ impl Expander {
         &mut self,
         input: &syn::DeriveInput,
         fields: &syn::Fields,
-    ) -> Option<TokenStream> {
+    ) -> Result<TokenStream, ()> {
         match fields {
             syn::Fields::Named(named) => self.expand_struct_named(input, named),
             syn::Fields::Unnamed(..) => {
@@ -79,14 +75,14 @@ impl Expander {
                     fields,
                     "tuple structs are not supported",
                 ));
-                None
+                Err(())
             }
             syn::Fields::Unit => {
                 self.ctx.errors.push(syn::Error::new_spanned(
                     fields,
                     "unit structs are not supported",
                 ));
-                None
+                Err(())
             }
         }
     }
@@ -96,7 +92,7 @@ impl Expander {
         &mut self,
         input: &syn::DeriveInput,
         named: &syn::FieldsNamed,
-    ) -> Option<TokenStream> {
+    ) -> Result<TokenStream, ()> {
         let ident = &input.ident;
         let mut fields = Vec::new();
 
@@ -131,13 +127,13 @@ impl Expander {
             if i - skipped != meta_fields.len() {
                 self.ctx.errors.push(syn::Error::new_spanned(
                     field,
-                    format!(
+                    format_args!(
                         "The first sequence of fields may have `#[rune({})]`, \
                         but field is outside of that sequence.",
                         crate::internals::META,
                     ),
                 ));
-                return None;
+                return Err(());
             }
 
             let ident = self.ctx.field_ident(field)?;
@@ -201,6 +197,6 @@ impl Expander {
             }
         };
 
-        Some(output)
+        Ok(output)
     }
 }

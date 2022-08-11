@@ -200,6 +200,14 @@ impl Diagnostics {
         self.warning(source_id, WarningDiagnosticKind::NotUsed { span, context });
     }
 
+    /// Indicate that the given span is unreachable.
+    pub fn unreachable(&mut self, source_id: SourceId, span: Span, context: Option<Span>) {
+        self.warning(
+            source_id,
+            WarningDiagnosticKind::Unreachable { span, context },
+        );
+    }
+
     /// Indicate that a binding pattern might panic.
     ///
     /// Like `let (a, b) = value`.

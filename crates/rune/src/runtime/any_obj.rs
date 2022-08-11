@@ -1,6 +1,6 @@
 //! Helper types for a holder of data.
 
-use crate::runtime::RawStr;
+use crate::runtime::{RawStr, TypeInfo};
 use crate::{Any, Hash};
 use std::any;
 use std::fmt;
@@ -442,6 +442,11 @@ impl AnyObj {
     /// Access the underlying type name for the data.
     pub fn type_name(&self) -> RawStr {
         (self.vtable.type_name)()
+    }
+
+    /// Get the type info for this object.
+    pub fn type_info(&self) -> TypeInfo {
+        TypeInfo::Any(self.type_name())
     }
 
     /// Access the underlying type id for the data.

@@ -24,7 +24,7 @@ impl Derive {
 
         match &self.input.data {
             syn::Data::Struct(st) => {
-                if let Some(stream) = expander.expand_struct(&self.input, st) {
+                if let Ok(stream) = expander.expand_struct(&self.input, st) {
                     return Ok(stream);
                 }
             }
@@ -57,7 +57,7 @@ impl Expander {
         &mut self,
         input: &syn::DeriveInput,
         st: &syn::DataStruct,
-    ) -> Option<TokenStream> {
+    ) -> Result<TokenStream, ()> {
         let accessor = self.pick_field(&st.fields)?;
 
         let ident = &input.ident;
@@ -66,7 +66,7 @@ impl Expander {
 
         let (gen_impl, gen_type, gen_where) = input.generics.split_for_impl();
 
-        Some(quote! {
+        Ok(quote! {
             impl #gen_impl #opaque for #ident #gen_type #gen_where {
                 fn id(&self) -> #id {
                     #accessor
@@ -76,7 +76,7 @@ impl Expander {
     }
 
     /// Expand field decoding.
-    fn pick_field(&mut self, fields: &syn::Fields) -> Option<TokenStream> {
+    fn pick_field(&mut self, fields: &syn::Fields) -> Result<TokenStream, ()> {
         let mut field = None;
 
         for (n, f) in fields.iter().enumerate() {
@@ -101,11 +101,11 @@ impl Expander {
                     fields,
                     "could not find a suitable identifier field",
                 ));
-                return None;
+                return Err(());
             }
         };
 
-        Some(match &f.ident {
+        Ok(match &f.ident {
             Some(ident) => quote!(self.#ident),
             None => quote!(self.#n),
         })

@@ -34,6 +34,7 @@ impl WarningDiagnostic {
     pub fn span(&self) -> Span {
         match &self.kind {
             WarningDiagnosticKind::NotUsed { span, .. } => *span,
+            WarningDiagnosticKind::Unreachable { span, .. } => *span,
             WarningDiagnosticKind::LetPatternMightPanic { span, .. } => *span,
             WarningDiagnosticKind::TemplateWithoutExpansions { span, .. } => *span,
             WarningDiagnosticKind::RemoveTupleCallParams { span, .. } => *span,
@@ -62,6 +63,14 @@ pub enum WarningDiagnosticKind {
     /// Item identified by the span is not used.
     #[error("not used")]
     NotUsed {
+        /// The span that is not used.
+        span: Span,
+        /// The context in which the value was not used.
+        context: Option<Span>,
+    },
+    /// Item identified by being unreachable.
+    #[error("unreachable")]
+    Unreachable {
         /// The span that is not used.
         span: Span,
         /// The context in which the value was not used.

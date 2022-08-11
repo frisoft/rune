@@ -1,7 +1,14 @@
+// TODO: remove this
+#![allow(unused)]
+
+use std::fmt;
+
+use rune_macros::Instruction;
+use serde::{Deserialize, Serialize};
+
+use crate::runtime::stack::StackError;
 use crate::runtime::{FormatSpec, Value};
 use crate::Hash;
-use serde::{Deserialize, Serialize};
-use std::fmt;
 
 /// Pre-canned panic reasons.
 ///
@@ -61,59 +68,42 @@ pub enum TypeCheck {
     GeneratorState(usize),
 }
 
-impl fmt::Display for TypeCheck {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unit => write!(fmt, "Unit"),
-            Self::Tuple => write!(fmt, "Tuple"),
-            Self::Object => write!(fmt, "Object"),
-            Self::Vec => write!(fmt, "Vec"),
-            Self::Option(0) => write!(fmt, "Option::Some"),
-            Self::Option(..) => write!(fmt, "Option::None"),
-            Self::Result(0) => write!(fmt, "Result::Ok"),
-            Self::Result(..) => write!(fmt, "Result::Err"),
-            Self::GeneratorState(0) => write!(fmt, "GeneratorState::Yielded"),
-            Self::GeneratorState(..) => write!(fmt, "GeneratorState::Complete"),
-        }
-    }
-}
-
 /// An operation in the stack-based virtual machine.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Instruction)]
+#[rune(module = "crate")]
 pub enum Inst {
-    /// Not operator. Takes a boolean from the top of the stack  and inverts its
+    /// Not operator. Takes a boolean from the given address  and inverts its
     /// logical value.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <bool>
-    /// => <bool>
-    /// ```
-    Not,
+    Not {
+        /// The boolean to invert.
+        #[rune(address)]
+        address: Address,
+        /// Where to store the inverted boolean.
+        #[rune(address)]
+        output: Address,
+    },
     /// Negate the numerical value on the stack.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <number>
-    /// => <number>
-    /// ```
-    Neg,
+    Neg {
+        /// The value to negate.
+        #[rune(address)]
+        address: Address,
+        /// Where to store the negated value.
+        #[rune(address)]
+        output: Address,
+    },
     /// Construct a closure that takes the given number of arguments and
-    /// captures `count` elements from the top of the stack.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value..>
-    /// => <fn>
-    /// ```
+    /// captures `count` elements starting at `address`.
     Closure {
         /// The hash of the internally stored closure function.
         hash: Hash,
+        /// Base address to allocate environment from.
+        #[rune(address)]
+        address: Address,
         /// The number of arguments to store in the environment on the stack.
         count: usize,
+        /// Where to store the loaded closure.
+        #[rune(address)]
+        output: Address,
     },
     /// Perform a function call.
     ///
@@ -122,8 +112,14 @@ pub enum Inst {
     Call {
         /// The hash of the function to call.
         hash: Hash,
+        /// The base where the call arguments are located.
+        #[rune(address)]
+        address: Address,
         /// The number of arguments expected on the stack for this call.
-        args: usize,
+        count: usize,
+        /// Where to store the return value of the call.
+        #[rune(address)]
+        output: Address,
     },
     /// Perform a instance function call.
     ///
@@ -132,850 +128,655 @@ pub enum Inst {
     CallInstance {
         /// The hash of the name of the function to call.
         hash: Hash,
+        /// The base where the call arguments are located.
+        #[rune(address)]
+        address: Address,
         /// The number of arguments expected on the stack for this call.
-        args: usize,
+        count: usize,
+        /// Where to store the return value when calling the instance function.
+        #[rune(address)]
+        output: Address,
     },
-    /// Lookup the specified instance function and put it on the stack.
-    /// This might help in cases where a single instance function is called many
+    /// Perform a function call on a function pointer stored on the stack.
+    CallFn {
+        /// Address from where to load the function.
+        #[rune(address)]
+        function: Address,
+        /// Address to value which describes the function to call.
+        #[rune(address)]
+        address: Address,
+        /// The number of arguments expected on the stack for this call.
+        count: usize,
+        /// Where to write the return value of the function.
+        #[rune(address)]
+        output: Address,
+    },
+    /// Lookup the specified instance function and put it on the stack. This
+    /// might help in cases where a single instance function is called many
     /// times (like in a loop) since it avoids calculating its full hash on
     /// every iteration.
     ///
     /// Note that this does not resolve that the instance function exists, only
     /// that the instance does.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// => <fn>
-    /// ```
     LoadInstanceFn {
+        /// Address where the instance is located.
+        #[rune(address)]
+        address: Address,
         /// The name hash of the instance function.
         hash: Hash,
-    },
-    /// Perform a function call on a function pointer stored on the stack.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <fn>
-    /// <args...>
-    /// => <ret>
-    /// ```
-    CallFn {
-        /// The number of arguments expected on the stack for this call.
-        args: usize,
+        /// Where to write the loaded instance function.
+        #[rune(address)]
+        output: Address,
     },
     /// Perform an index get operation. Pushing the result on the stack.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <target>
-    /// <index>
-    /// => <value>
-    /// ```
     IndexGet {
-        /// How the target is addressed.
-        target: InstAddress,
+        /// Address to the target of the operation.
+        #[rune(address)]
+        address: Address,
         /// How the index is addressed.
-        index: InstAddress,
+        #[rune(address)]
+        index: Address,
+        /// The output of an index get operation.
+        #[rune(address)]
+        output: Address,
     },
-    /// Get the given index out of a tuple on the top of the stack.
+    /// Get the given index out of a tuple on the given address.
     /// Errors if the item doesn't exist or the item is not a tuple.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <tuple>
-    /// => <value>
-    /// ```
     TupleIndexGet {
+        /// Address to the target of the operation.
+        #[rune(address)]
+        address: Address,
         /// The index to fetch.
         index: usize,
+        /// Output address.
+        #[rune(address)]
+        output: Address,
     },
     /// Set the given index of the tuple on the stack, with the given value.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// <tuple>
-    /// => *nothing*
-    /// ```
     TupleIndexSet {
+        /// Target of the set operation.
+        #[rune(address)]
+        address: Address,
+        /// Address of value to set.
+        #[rune(address)]
+        value: Address,
         /// The index to set.
         index: usize,
+        /// Where to store the output of this operation.
+        #[rune(address)]
+        output: Address,
     },
-    /// Get the given index out of a tuple from the given variable slot.
-    /// Errors if the item doesn't exist or the item is not a tuple.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// => <value>
-    /// ```
-    TupleIndexGetAt {
-        /// The slot offset to load the tuple from.
-        offset: usize,
-        /// The index to fetch.
-        index: usize,
-    },
-    /// Get the given index out of an object on the top of the stack.
+    /// Get the given index out of an object on the given address.
     /// Errors if the item doesn't exist or the item is not an object.
     ///
     /// The index is identifier by a static string slot, which is provided as an
     /// argument.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <object>
-    /// => <value>
-    /// ```
     ObjectIndexGet {
+        /// Address of the object to index.
+        #[rune(address)]
+        address: Address,
         /// The static string slot corresponding to the index to fetch.
         slot: usize,
+        /// Address to store the output of the operation.
+        #[rune(address)]
+        output: Address,
     },
-    /// Set the given index out of an object on the top of the stack.
+    /// Set the given index out of an object on the given address.
     /// Errors if the item doesn't exist or the item is not an object.
     ///
     /// The index is identifier by a static string slot, which is provided as an
     /// argument.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <object>
-    /// <value>
-    /// =>
-    /// ```
     ObjectIndexSet {
+        /// Address of object where to set a value.
+        #[rune(address)]
+        address: Address,
         /// The static string slot corresponding to the index to set.
         slot: usize,
-    },
-    /// Get the given index out of an object from the given variable slot.
-    /// Errors if the item doesn't exist or the item is not an object.
-    ///
-    /// The index is identifier by a static string slot, which is provided as an
-    /// argument.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// => <value>
-    /// ```
-    ObjectIndexGetAt {
-        /// The slot offset to get the value to load from.
-        offset: usize,
-        /// The static string slot corresponding to the index to fetch.
-        slot: usize,
+        /// The value of the address being set.
+        #[rune(address)]
+        value: Address,
+        /// Where to store the output of this operation.
+        #[rune(address)]
+        output: Address,
     },
     /// Perform an index set operation.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <target>
-    /// <index>
-    /// <value>
-    /// => *noop*
-    /// ```
-    IndexSet,
-    /// Await the future that is on the stack and push the value that it
-    /// produces.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <future>
-    /// => <value>
-    /// ```
-    Await,
+    IndexSet {
+        /// The target that is being set.
+        #[rune(address)]
+        address: Address,
+        /// The index on the target that is being set.
+        #[rune(address)]
+        index: Address,
+        /// The value that is being set.
+        #[rune(address)]
+        value: Address,
+        /// Where to store the output of this operation.
+        #[rune(address)]
+        output: Address,
+    },
     /// Select over `len` futures on the stack. Sets the `branch` register to
     /// the index of the branch that completed. And pushes its value on the
     /// stack.
     ///
     /// This operation will block the VM until at least one of the underlying
     /// futures complete.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <future...>
-    /// => <value>
-    /// ```
     Select {
-        /// The number of futures to poll.
+        /// The base address where to select futures over.
+        #[rune(address)]
+        address: Address,
+        /// The number of values being selected over.
         len: usize,
+        /// The location to store the output of the evaluated select.
+        #[rune(address)]
+        output: Address,
+        /// Where to store the branch address.
+        #[rune(address)]
+        branch_output: Address,
     },
     /// Load the given function by hash and push onto the stack.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// => <value>
-    /// ```
     LoadFn {
         /// The hash of the function to push.
         hash: Hash,
+        /// The location to load the function to.
+        #[rune(address)]
+        output: Address,
     },
-    /// Push a value onto the stack.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// => <value>
-    /// ```
-    Push {
+    /// Store a value onto the current stack at the given location.
+    Store {
         /// The value to push.
         value: InstValue,
+        /// The address to store the value.
+        #[rune(address)]
+        output: Address,
     },
-    /// Pop the value on the stack, discarding its result.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// =>
-    /// ```
-    Pop,
-    /// Pop the given number of elements from the stack.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value..>
-    /// => *noop*
-    /// ```
-    PopN {
-        /// The number of elements to pop from the stack.
-        count: usize,
-    },
-    /// If the stop of the stack is false, will pop the given `count` entries on
-    /// the stack and jump to the given offset.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <bool>
-    /// => *noop*
-    /// ```
-    PopAndJumpIfNot {
-        /// The number of entries to pop of the condition is true.
-        count: usize,
-        /// The offset to jump if the condition is true.
-        offset: isize,
-    },
-    /// Clean the stack by keeping the top of it, and popping `count` values
-    /// under it.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <top>
-    /// <value..>
-    /// => <top>
-    /// ```
-    Clean {
-        /// The number of entries in the stack to pop.
-        count: usize,
-    },
-    /// Copy a variable from a location `offset` relative to the current call
-    /// frame.
-    ///
-    /// A copy is very cheap. It simply means pushing a reference to the stack.
-    Copy {
-        /// Offset to copy value from.
-        offset: usize,
-    },
-    /// Move a variable from a location `offset` relative to the current call
-    /// frame.
-    Move {
-        /// Offset to move value from.
-        offset: usize,
-    },
-    /// Drop the value in the given frame offset, cleaning out it's slot in
-    /// memory.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// => *noop*
-    /// ```
+    /// Drop the value at the given stack location.
     Drop {
-        /// Frame offset to drop.
-        offset: usize,
+        /// Address of value to drop.
+        #[rune(address)]
+        address: Address,
     },
-    /// Duplicate the value at the top of the stack.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// => <value>
-    /// ```
-    Dup,
-    /// Replace a value at the offset relative from the top of the stack, with
-    /// the top of the stack.
-    Replace {
-        /// Offset to swap value from.
-        offset: usize,
+    /// Copy a value from one location of the stack to another.
+    Copy {
+        /// Address to copy the value from.
+        #[rune(address)]
+        address: Address,
+        /// Address to copy the value to.
+        #[rune(address)]
+        output: Address,
+    },
+    /// Move a value. The value at the original location will be deinitialized.
+    Move {
+        /// Address to move the value from.
+        #[rune(address)]
+        address: Address,
+        /// Address to move the value to.
+        #[rune(address)]
+        output: Address,
     },
     /// Pop the current stack frame and restore the instruction pointer from it.
     ///
-    /// The stack frame will be cleared, and the value on the top of the stack
-    /// will be left on top of it.
+    /// The value indicated by `address` will be returned from the current stack
+    /// frame.
     Return {
         /// The address of the value to return.
-        address: InstAddress,
-        /// Number of variables to clean. If address is top, this should only
-        /// specify variables in excess of the top variable. Otherwise, this
-        /// includes the return value.
-        clean: usize,
+        #[rune(address)]
+        address: Address,
     },
     /// Pop the current stack frame and restore the instruction pointer from it.
     ///
-    /// The stack frame will be cleared, and a unit value will be pushed to the
-    /// top of the stack.
+    /// A unit will be returned from the current stack frame.
     ReturnUnit,
     /// Unconditionally jump to `offset` relative to the current instruction
     /// pointer.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// *nothing*
-    /// => *nothing*
-    /// ```
     Jump {
         /// Offset to jump to.
+        #[rune(label)]
         offset: isize,
     },
     /// Jump to `offset` relative to the current instruction pointer if the
-    /// condition is `true`.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <boolean>
-    /// => *nothing*
-    /// ```
+    /// value stored at `address` is boolean `true`.
     JumpIf {
+        /// Address of the condition for the jump.
+        #[rune(address)]
+        address: Address,
         /// Offset to jump to.
+        #[rune(label)]
         offset: isize,
     },
     /// Jump to `offset` relative to the current instruction pointer if the
-    /// condition is `true`. Will only pop the stack is a jump is not performed.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <boolean>
-    /// => *nothing*
-    /// ```
-    JumpIfOrPop {
+    /// value stored at `address` is boolean `false`.
+    JumpIfNot {
+        /// Address of the condition for the jump.
+        #[rune(address)]
+        address: Address,
         /// Offset to jump to.
+        #[rune(label)]
         offset: isize,
     },
-    /// Jump to `offset` relative to the current instruction pointer if the
-    /// condition is `false`. Will only pop the stack is a jump is not performed.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <boolean>
-    /// => *nothing*
-    /// ```
-    JumpIfNotOrPop {
-        /// Offset to jump to.
-        offset: isize,
-    },
-    /// Compares the `branch` register with the top of the stack, and if they
-    /// match pops the top of the stack and performs the jump to offset.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <integer>
-    /// => *nothing*
-    /// ```
+    /// Compares the `branch` register with the given address, and if they
+    /// match pops the given address and performs the jump to offset.
     JumpIfBranch {
+        /// The address to compare the value with.
+        #[rune(address)]
+        address: Address,
         /// The branch value to compare against.
         branch: i64,
         /// The offset to jump.
+        #[rune(label)]
         offset: isize,
     },
-    /// Construct a push a vector value onto the stack. The number of elements
-    /// in the vector are determined by `count` and are popped from the stack.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value..>
-    /// => <vec>
-    /// ```
+    /// Construct a vector by popping `count` elements off the stack. Writes the
+    /// allocated vector to `output`.
     Vec {
+        /// The base address where the vector is allocated.
+        #[rune(address)]
+        address: Address,
         /// The size of the vector.
         count: usize,
+        /// The address where we write the newly allocated vector.
+        #[rune(address)]
+        output: Address,
     },
     /// Construct a push a one-tuple value onto the stack.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// => <tuple>
-    /// ```
     Tuple1 {
         /// First element of the tuple.
-        args: [InstAddress; 1],
+        #[rune(address, debug)]
+        args: [Address; 1],
+        /// where to write the allocated tuple.
+        #[rune(address)]
+        output: Address,
     },
     /// Construct a push a two-tuple value onto the stack.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// => <tuple>
-    /// ```
     Tuple2 {
         /// Tuple arguments.
-        args: [InstAddress; 2],
+        #[rune(address, debug)]
+        args: [Address; 2],
+        /// where to write the allocated tuple.
+        #[rune(address)]
+        output: Address,
     },
     /// Construct a push a three-tuple value onto the stack.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// => <tuple>
-    /// ```
     Tuple3 {
         /// Tuple arguments.
-        args: [InstAddress; 3],
+        #[rune(address, debug)]
+        args: [Address; 3],
+        /// where to write the allocated tuple.
+        #[rune(address)]
+        output: Address,
     },
     /// Construct a push a four-tuple value onto the stack.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// => <tuple>
-    /// ```
     Tuple4 {
         /// Tuple arguments.
-        args: [InstAddress; 4],
+        #[rune(address, debug)]
+        args: [Address; 4],
+        /// where to write the allocated tuple.
+        #[rune(address)]
+        output: Address,
     },
-    /// Construct a push a tuple value onto the stack. The number of elements
-    /// in the tuple are determined by `count` and are popped from the stack.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value..>
-    /// => <tuple>
-    /// ```
+    /// Construct a tuple by popping `count` elements off the stack. Writes the
+    /// tuple to the `output` address.
     Tuple {
+        /// The base address where the tuple is allocated.
+        #[rune(address)]
+        address: Address,
         /// The size of the tuple.
         count: usize,
+        /// where to write the allocated tuple.
+        #[rune(address)]
+        output: Address,
     },
-    /// Take the tuple that is on top of the stack and push its content onto the
-    /// stack.
-    ///
-    /// Note: this is used by closures to "unpack" their environment into local
-    /// variables.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <tuple>
-    /// => <value...>
-    /// ```
-    PushTuple,
+    /// Take the tuple that is on top of the stack and unpack its content onto the
+    /// stack starting at `output`.
+    UnpackTuple {
+        /// Address of the tuple to unpack.
+        #[rune(address)]
+        address: Address,
+        /// The output address to push the tuple onto.
+        #[rune(address)]
+        output: Address,
+    },
     /// Construct a push an object onto the stack. The number of elements
     /// in the object are determined the slot of the object keys `slot` and are
     /// popped from the stack.
     ///
     /// For each element, a value is popped corresponding to the object key.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value..>
-    /// => <object>
-    /// ```
     Object {
+        /// The base address where object values are allocated from.
+        #[rune(address)]
+        address: Address,
         /// The static slot of the object keys.
         slot: usize,
+        /// The address to write the newly allocated object.
+        #[rune(address)]
+        output: Address,
     },
     /// Construct a range. This will pop the start and end of the range from the
     /// stack.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <from>
-    /// <to>
-    /// => <range>
-    /// ```
     Range {
+        /// Where to load the from value from.
+        #[rune(address)]
+        from: Address,
+        /// Where to load the to value from.
+        #[rune(address)]
+        to: Address,
         /// The limits of the range.
         limits: InstRangeLimits,
+        /// Where to write the range object.
+        #[rune(address)]
+        output: Address,
     },
     /// Construct a push an object of the given type onto the stack. The type is
     /// an empty struct.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// => <object>
-    /// ```
     UnitStruct {
         /// The type of the object to construct.
         hash: Hash,
+        /// Where to write the unit struct.
+        #[rune(address)]
+        output: Address,
     },
     /// Construct a push an object of the given type onto the stack. The number
     /// of elements in the object are determined the slot of the object keys
     /// `slot` and are popped from the stack.
     ///
     /// For each element, a value is popped corresponding to the object key.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value..>
-    /// => <object>
-    /// ```
     Struct {
         /// The type of the object to construct.
         hash: Hash,
+        /// Base address where to allocate struct fields from.
+        #[rune(address)]
+        address: Address,
         /// The static slot of the object keys.
         slot: usize,
+        /// Where to write the allocated struct.
+        #[rune(address)]
+        output: Address,
     },
     /// Construct a push an object variant of the given type onto the stack. The
     /// type is an empty struct.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// => <object>
-    /// ```
     UnitVariant {
         /// The type hash of the object variant to construct.
         hash: Hash,
+        /// Where to write the allocated unit variant.
+        #[rune(address)]
+        output: Address,
     },
     /// Construct a push an object variant of the given type onto the stack. The
     /// number of elements in the object are determined the slot of the object
     /// keys `slot` and are popped from the stack.
     ///
     /// For each element, a value is popped corresponding to the object key.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value..>
-    /// => <object>
-    /// ```
     StructVariant {
         /// The type hash of the object variant to construct.
         hash: Hash,
+        /// The base address where fields are allocated from.
+        #[rune(address)]
+        address: Address,
         /// The static slot of the object keys.
         slot: usize,
+        /// Where to write the allocated struct variant.
+        #[rune(address)]
+        output: Address,
     },
     /// Load a literal string from a static string slot.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// => <string>
-    /// ```
     String {
         /// The static string slot to load the string from.
         slot: usize,
+        /// Where to write the string.
+        #[rune(address)]
+        output: Address,
     },
     /// Load a literal byte string from a static byte string slot.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// => <bytes>
-    /// ```
     Bytes {
         /// The static byte string slot to load the string from.
         slot: usize,
+        /// Where to write the byte buffer.
+        #[rune(address)]
+        output: Address,
     },
-    /// Pop the given number of values from the stack, and concatenate a string
-    /// from them.
+    /// Read the given number of values from the stack starting at `address`,
+    /// and concatenate a string from them.
     ///
     /// This is a dedicated template-string optimization.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value...>
-    /// => <string>
-    /// ```
     StringConcat {
-        /// The number of items to pop from the stack.
-        len: usize,
+        /// Base address to concatenate string from.
+        #[rune(address)]
+        address: Address,
+        /// The number of string components to fetch from the stack.
+        count: usize,
         /// The minimum string size used.
         size_hint: usize,
+        /// Where to store the result of the string concatenation.
+        #[rune(address)]
+        output: Address,
     },
-    /// Push a combined format specification and value onto the stack. The value
+    /// Write a combined format specification and value onto the stack. The value
     /// used is the last value on the stack.
     Format {
+        /// Address of the value to format.
+        #[rune(address)]
+        address: Address,
         /// The format specification to use.
+        #[rune(debug)]
         spec: FormatSpec,
+        /// Where to write the newly allocated format specification.
+        #[rune(address)]
+        output: Address,
     },
-    /// Test if the top of the stack is a unit.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// => <boolean>
-    /// ```
-    IsUnit,
+    /// Await the future that is on the stack and push the value that it
+    /// produces.
+    Await {
+        /// The address of the value to await.
+        #[rune(address)]
+        address: Address,
+        /// The stack address to store the result of the await.
+        #[rune(address)]
+        output: Address,
+    },
     /// Perform the try operation which takes the value at the given `address`
     /// and tries to unwrap it or return from the current call frame.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// => <boolean>
-    /// ```
     Try {
         /// Address to test if value.
-        address: InstAddress,
-        /// Variable count that needs to be cleaned in case the operation
-        /// results in a return.
-        clean: usize,
-        /// If the value on top of the stack should be preserved.
-        preserve: bool,
+        #[rune(address)]
+        address: Address,
+        /// Address to write the output of the operation if it doesn't return.
+        #[rune(address)]
+        output: Address,
     },
-    /// Test if the top of the stack is a specific byte.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// => <boolean>
-    /// ```
-    EqByte {
-        /// The byte to test against.
-        byte: u8,
+    /// Test if the given address is a unit.
+    MatchValue {
+        /// Address to test.
+        #[rune(address)]
+        address: Address,
+        /// Literal value to match.
+        value: InstValue,
+        /// Where to jump if the specified address does not match a unit.
+        #[rune(label)]
+        offset: isize,
     },
-    /// Test if the top of the stack is a specific character.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// => <boolean>
-    /// ```
-    EqChar {
-        /// The character to test against.
-        char: char,
-    },
-    /// Test if the top of the stack is a specific integer.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// => <boolean>
-    /// ```
-    EqInteger {
-        /// The integer to test against.
-        integer: i64,
-    },
-
-    /// Test if the top of the stack is a specific boolean.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// => <boolean>
-    /// ```
-    EqBool {
-        /// The bool to test against.
-        boolean: bool,
-    },
-    /// Compare the top of the stack against a static string slot.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// => <boolean>
-    /// ```
-    EqString {
+    /// Compare the given address against a static string slot.
+    MatchString {
+        /// Address to test.
+        #[rune(address)]
+        address: Address,
         /// The slot to test against.
         slot: usize,
+        /// Where to jump if the string does not match.
+        #[rune(label)]
+        offset: isize,
     },
-    /// Compare the top of the stack against a static bytes slot.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// => <boolean>
-    /// ```
-    EqBytes {
+    /// Compare the given address against a static bytes slot.
+    MatchBytes {
+        /// Address to test.
+        #[rune(address)]
+        address: Address,
         /// The slot to test against.
         slot: usize,
+        /// Where to jump if the bytes does not match.
+        #[rune(label)]
+        offset: isize,
     },
-    /// Test that the top of the stack has the given type.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// => <boolean>
-    /// ```
+    /// Test that the given address has the given type.
     MatchType {
+        /// Address to test.
+        #[rune(address)]
+        address: Address,
         /// The type hash to match against.
-        hash: Hash,
+        type_hash: Hash,
+        /// Where to jump if the type doesn't match.
+        #[rune(label)]
+        offset: isize,
     },
     /// Test if the specified variant matches. This is distinct from
     /// [Inst::MatchType] because it will match immediately on the variant type
     /// if appropriate which is possible for internal types, but external types
     /// will require an additional runtime check for matching.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// => <boolean>
-    /// ```
     MatchVariant {
+        /// Address to test.
+        #[rune(address)]
+        address: Address,
         /// The exact type hash of the variant.
         variant_hash: Hash,
         /// The container type.
         enum_hash: Hash,
         /// The index of the variant.
         index: usize,
+        /// Where to jump on a mismatch.
+        #[rune(label)]
+        offset: isize,
+        /// Output of any operation needed to test if the variant is a variant.
+        #[rune(address)]
+        output: Address,
     },
-    /// Test if the top of the stack is the given builtin type or variant.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// => <boolean>
-    /// ```
+    /// Test if the given address is the given builtin type or variant.
     MatchBuiltIn {
+        /// Address to test.
+        #[rune(address)]
+        address: Address,
         /// The type to check for.
+        #[rune(debug)]
         type_check: TypeCheck,
+        /// Where to jump on a mismatch.
+        #[rune(label)]
+        offset: isize,
     },
-    /// Test that the top of the stack is a tuple with the given length
+    /// Test that the given address is a tuple with the given length
     /// requirements.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// => <boolean>
-    /// ```
     MatchSequence {
+        /// Address to test.
+        #[rune(address)]
+        address: Address,
         /// Type constraints that the sequence must match.
+        #[rune(debug)]
         type_check: TypeCheck,
         /// The minimum length to test for.
         len: usize,
         /// Whether the operation should check exact `true` or minimum length
         /// `false`.
         exact: bool,
+        /// Where to jump in case the sequence does not match.
+        #[rune(label)]
+        offset: isize,
+        /// The address where the sequence is unpacked if it matches.
+        #[rune(address)]
+        output: Address,
     },
-    /// Test that the top of the stack is an object matching the given slot of
+    /// Test that the given address is an object matching the given slot of
     /// object keys.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <object>
-    /// => <boolean>
-    /// ```
     MatchObject {
+        /// Address to test.
+        #[rune(address)]
+        address: Address,
         /// The slot of object keys to use.
         slot: usize,
         /// Whether the operation should check exact `true` or minimum length
         /// `false`.
         exact: bool,
+        /// Where to jump in case the sequence does not match.
+        #[rune(label)]
+        offset: isize,
+        /// Where to write the output of the operation.
+        #[rune(address)]
+        output: Address,
     },
     /// Perform a generator yield where the value yielded is expected to be
-    /// found at the top of the stack.
+    /// found at the given address.
     ///
     /// This causes the virtual machine to suspend itself.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// => <value>
-    /// ```
-    Yield,
-    /// Perform a generator yield with a unit.
+    Yield {
+        /// Address of the value to yield.
+        #[rune(address)]
+        address: Address,
+        /// Address where to store the output of the yield.
+        #[rune(address)]
+        output: Address,
+    },
+    /// Perform a generator yield which produces a unit.
     ///
     /// This causes the virtual machine to suspend itself.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// => <unit>
-    /// ```
-    YieldUnit,
+    YieldUnit {
+        /// Address where to store the output of the yield.
+        #[rune(address)]
+        output: Address,
+    },
     /// Construct a built-in variant onto the stack.
     ///
     /// The variant will pop as many values of the stack as necessary to
     /// construct it.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value..>
-    /// => <variant>
-    /// ```
     Variant {
+        /// Base address where values that the variant is constructed from is loaded.
+        #[rune(address)]
+        address: Address,
         /// The kind of built-in variant to construct.
         variant: InstVariant,
+        /// Where to write the newly allocated variant.
+        #[rune(address)]
+        output: Address,
     },
     /// A built-in operation like `a + b` that takes its operands and pushes its
     /// result to and from the stack.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// => <value>
-    /// ```
     Op {
         /// The actual operation.
         op: InstOp,
         /// The address of the first argument.
-        a: InstAddress,
+        #[rune(address)]
+        a: Address,
         /// The address of the second argument.
-        b: InstAddress,
+        #[rune(address)]
+        b: Address,
+        /// The output of the operation.
+        #[rune(address)]
+        output: Address,
     },
-    /// A built-in operation that assigns to the left-hand side operand. Like
-    /// `a += b`.
+    /// A built-in operation that assigns to the left-hand side operand. Like `a
+    /// += b`.
     ///
     /// The target determines the left hand side operation.
-    ///
-    /// # Operation
-    ///
-    /// ```text
-    /// <value>
-    /// =>
-    /// ```
     Assign {
+        /// Left hand side operand.
+        #[rune(address)]
+        lhs: Address,
+        /// Right hand side operand.
+        #[rune(address)]
+        rhs: Address,
         /// The target of the operation.
         target: InstTarget,
         /// The actual operation.
         op: InstAssignOp,
+        /// Where to store the output of the operation.
+        #[rune(address)]
+        output: Address,
     },
     /// Advance an iterator at the given position.
     IterNext {
-        /// The offset of the value being advanced.
-        offset: usize,
+        /// The address of the value being advanced.
+        #[rune(address)]
+        address: Address,
         /// A relative jump to perform if the iterator could not be advanced.
-        jump: isize,
+        #[rune(label)]
+        offset: isize,
+        /// Where to store the output of the advanced iterator.
+        #[rune(address)]
+        output: Address,
     },
     /// Cause the VM to panic and error out without a reason.
     ///
@@ -987,345 +788,25 @@ pub enum Inst {
     },
 }
 
-impl Inst {
-    /// Construct an instruction to push a unit.
-    pub fn unit() -> Self {
-        Self::Push {
-            value: InstValue::Unit,
-        }
-    }
-
-    /// Construct an instruction to push a boolean.
-    pub fn bool(b: bool) -> Self {
-        Self::Push {
-            value: InstValue::Bool(b),
-        }
-    }
-
-    /// Construct an instruction to push a byte.
-    pub fn byte(b: u8) -> Self {
-        Self::Push {
-            value: InstValue::Byte(b),
-        }
-    }
-
-    /// Construct an instruction to push a character.
-    pub fn char(c: char) -> Self {
-        Self::Push {
-            value: InstValue::Char(c),
-        }
-    }
-
-    /// Construct an instruction to push an integer.
-    pub fn integer(v: i64) -> Self {
-        Self::Push {
-            value: InstValue::Integer(v),
-        }
-    }
-
-    /// Construct an instruction to push a float.
-    pub fn float(v: f64) -> Self {
-        Self::Push {
-            value: InstValue::Float(v),
-        }
-    }
-}
-
-impl fmt::Display for Inst {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Drop { offset } => {
-                write!(fmt, "drop offset={}", offset)?;
-            }
-            Self::Not => {
-                write!(fmt, "not")?;
-            }
-            Self::Neg => {
-                write!(fmt, "neg")?;
-            }
-            Self::Call { hash, args } => {
-                write!(fmt, "call hash={}, args={}", hash, args)?;
-            }
-            Self::CallInstance { hash, args } => {
-                write!(fmt, "call-instance hash={}, args={}", hash, args)?;
-            }
-            Self::Closure { hash, count } => {
-                write!(fmt, "closure hash={}, count={}", hash, count)?;
-            }
-            Self::CallFn { args } => {
-                write!(fmt, "call-fn args={}", args)?;
-            }
-            Self::LoadInstanceFn { hash } => {
-                write!(fmt, "load-instance-fn hash={}", hash)?;
-            }
-            Self::IndexGet { target, index } => {
-                write!(fmt, "index-get target={}, index={}", target, index)?;
-            }
-            Self::TupleIndexGet { index } => {
-                write!(fmt, "tuple-index-get index={}", index)?;
-            }
-            Self::TupleIndexSet { index } => {
-                write!(fmt, "tuple-index-set index={}", index)?;
-            }
-            Self::TupleIndexGetAt { offset, index } => {
-                write!(fmt, "tuple-index-get-at offset={}, index={}", offset, index)?;
-            }
-            Self::ObjectIndexGet { slot } => {
-                write!(fmt, "object-index-get slot={}", slot)?;
-            }
-            Self::ObjectIndexSet { slot } => {
-                write!(fmt, "object-index-set slot={}", slot)?;
-            }
-            Self::ObjectIndexGetAt { offset, slot } => {
-                write!(fmt, "object-index-get-at offset={}, slot={}", offset, slot)?;
-            }
-            Self::IndexSet => {
-                write!(fmt, "index-set")?;
-            }
-            Self::Await => {
-                write!(fmt, "await")?;
-            }
-            Self::Select { len } => {
-                write!(fmt, "select len={}", len)?;
-            }
-            Self::LoadFn { hash } => {
-                write!(fmt, "load-fn hash={}", hash)?;
-            }
-            Self::Push { value } => {
-                write!(fmt, "push value={}", value)?;
-            }
-            Self::Pop => {
-                write!(fmt, "pop")?;
-            }
-            Self::PopN { count } => {
-                write!(fmt, "pop-n count={}", count)?;
-            }
-            Self::PopAndJumpIfNot { count, offset } => {
-                write!(
-                    fmt,
-                    "pop-and-jump-if-not count={}, offset={}",
-                    count, offset
-                )?;
-            }
-            Self::Clean { count } => {
-                write!(fmt, "clean count={}", count)?;
-            }
-            Self::Copy { offset } => {
-                write!(fmt, "copy offset={}", offset)?;
-            }
-            Self::Move { offset } => {
-                write!(fmt, "move offset={}", offset)?;
-            }
-            Self::Dup => {
-                write!(fmt, "dup")?;
-            }
-            Self::Replace { offset } => {
-                write!(fmt, "replace offset={}", offset)?;
-            }
-            Self::Return { address, clean } => {
-                write!(fmt, "return address={}, clean={}", address, clean)?;
-            }
-            Self::ReturnUnit => {
-                write!(fmt, "return-unit")?;
-            }
-            Self::Jump { offset } => {
-                write!(fmt, "jump offset={}", offset)?;
-            }
-            Self::JumpIf { offset } => {
-                write!(fmt, "jump-if offset={}", offset)?;
-            }
-            Self::JumpIfOrPop { offset } => {
-                write!(fmt, "jump-if-or-pop offset={}", offset)?;
-            }
-            Self::JumpIfNotOrPop { offset } => {
-                write!(fmt, "jump-if-not-or-pop offset={}", offset)?;
-            }
-            Self::JumpIfBranch { branch, offset } => {
-                write!(fmt, "jump-if-branch branch={}, offset={}", branch, offset)?;
-            }
-            Self::Vec { count } => {
-                write!(fmt, "vec count={}", count)?;
-            }
-            Self::Tuple1 { args: [a] } => {
-                write!(fmt, "tuple-1 {}", a)?;
-            }
-            Self::Tuple2 { args: [a, b] } => {
-                write!(fmt, "tuple-2 {}, {}", a, b)?;
-            }
-            Self::Tuple3 { args: [a, b, c] } => {
-                write!(fmt, "tuple-3 {}, {}, {}", a, b, c)?;
-            }
-            Self::Tuple4 { args: [a, b, c, d] } => {
-                write!(fmt, "tuple-4 {}, {}, {}, {}", a, b, c, d)?;
-            }
-            Self::Tuple { count } => {
-                write!(fmt, "tuple count={}", count)?;
-            }
-            Self::PushTuple => {
-                write!(fmt, "push-tuple")?;
-            }
-            Self::UnitStruct { hash } => {
-                write!(fmt, "unit-struct hash={}", hash)?;
-            }
-            Self::Struct { hash, slot } => {
-                write!(fmt, "struct hash={}, slot={}", hash, slot)?;
-            }
-            Self::UnitVariant { hash } => {
-                write!(fmt, "unit-variant hash={}", hash)?;
-            }
-            Self::StructVariant { hash, slot } => {
-                write!(fmt, "struct-variant hash={}, slot={}", hash, slot)?;
-            }
-            Self::Object { slot } => {
-                write!(fmt, "object slot={}", slot)?;
-            }
-            Self::Range { limits } => {
-                write!(fmt, "range limits={}", limits)?;
-            }
-            Self::String { slot } => {
-                write!(fmt, "string slot={}", slot)?;
-            }
-            Self::Bytes { slot } => {
-                write!(fmt, "bytes slot={}", slot)?;
-            }
-            Self::StringConcat { len, size_hint } => {
-                write!(fmt, "string-concat len={}, size_hint={}", len, size_hint)?;
-            }
-            Self::Format { spec } => {
-                write!(
-                    fmt,
-                    "format {fill:?}, {align}, {flags:?}, {width}, {precision}, {format_type}",
-                    fill = spec.fill,
-                    align = spec.align,
-                    flags = spec.flags,
-                    width = option(&spec.width),
-                    precision = option(&spec.precision),
-                    format_type = spec.format_type
-                )?;
-            }
-            Self::IsUnit => {
-                write!(fmt, "is-unit")?;
-            }
-            Self::Try {
-                address,
-                clean,
-                preserve,
-            } => {
-                write!(
-                    fmt,
-                    "try address={}, clean={}, preserve={}",
-                    address, clean, preserve
-                )?;
-            }
-            Self::EqByte { byte } => {
-                write!(fmt, "eq-byte byte={:?}", byte)?;
-            }
-            Self::EqChar { char } => {
-                write!(fmt, "eq-character char={:?}", char)?;
-            }
-            Self::EqInteger { integer } => {
-                write!(fmt, "eq-integer integer={}", integer)?;
-            }
-            Self::EqBool { boolean } => {
-                write!(fmt, "eq-integer boolean={}", boolean)?;
-            }
-            Self::EqString { slot } => {
-                write!(fmt, "eq-string slot={}", slot)?;
-            }
-            Self::EqBytes { slot } => {
-                write!(fmt, "eq-bytes slot={}", slot)?;
-            }
-            Self::MatchType { hash } => {
-                write!(fmt, "match-type hash={}", hash,)?;
-            }
-            Self::MatchVariant {
-                variant_hash,
-                enum_hash,
-                index,
-            } => {
-                write!(
-                    fmt,
-                    "match-variant variant_hash={}, enum_hash={}, index={}",
-                    enum_hash, variant_hash, index
-                )?;
-            }
-            Self::MatchBuiltIn { type_check } => {
-                write!(fmt, "match-builtin type_check={}", type_check)?;
-            }
-            Self::MatchSequence {
-                type_check,
-                len,
-                exact,
-            } => {
-                write!(
-                    fmt,
-                    "match-sequence type_check={}, len={}, exact={}",
-                    type_check, len, exact
-                )?;
-            }
-            Self::MatchObject { slot, exact } => {
-                write!(fmt, "match-object slot={}, exact={}", slot, exact)?;
-            }
-            Self::Yield => {
-                write!(fmt, "yield")?;
-            }
-            Self::YieldUnit => {
-                write!(fmt, "yield-unit")?;
-            }
-            Self::Variant { variant } => {
-                write!(fmt, "variant variant={}", variant)?;
-            }
-            Self::Op { op, a, b } => {
-                write!(fmt, "op op={}, a={}, b={}", op, a, b)?;
-            }
-            Self::Assign { target, op } => {
-                write!(fmt, "assign target={}, op={}", target, op)?;
-            }
-            Self::IterNext { offset, jump } => {
-                write!(fmt, "iter-next offset={}, jump={}", offset, jump)?;
-            }
-            Self::Panic { reason } => {
-                write!(fmt, "panic reason={}", reason.ident())?;
-            }
-        }
-
-        return Ok(());
-
-        fn option<T>(value: &Option<T>) -> OptionDebug<'_, T> {
-            OptionDebug(value.as_ref())
-        }
-
-        struct OptionDebug<'a, T>(Option<&'a T>);
-
-        impl<'a, T> fmt::Display for OptionDebug<'a, T>
-        where
-            T: fmt::Display,
-        {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                match self.0 {
-                    Some(value) => write!(f, "{}", value),
-                    None => write!(f, "?"),
-                }
-            }
-        }
-    }
-}
-
-/// How an instruction addresses a value.
+/// The address of a value on the stack. Address 0 is the return value of the
+/// current stack frame.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum InstAddress {
-    /// Addressed from the top of the stack.
-    Top,
-    /// Value addressed at the given offset.
-    Offset(usize),
+#[serde(transparent)]
+pub struct Address(pub(crate) u32);
+
+impl Address {
+    /// The base address of the stack.
+    pub const BASE: Self = Self(0);
+
+    /// Step to the next stack address.
+    pub(crate) fn step(self) -> Result<Self, StackError> {
+        Ok(Self(self.0.checked_add(1).ok_or(StackError::new())?))
+    }
 }
 
-impl fmt::Display for InstAddress {
+impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Top => write!(f, "top"),
-            Self::Offset(offset) => write!(f, "offset({})", offset),
-        }
+        self.0.fmt(f)
     }
 }
 
@@ -1351,19 +832,19 @@ impl fmt::Display for InstRangeLimits {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum InstTarget {
     /// Target is an offset to the current call frame.
-    Offset(usize),
-    /// Target the field of an object.
-    Field(usize),
-    /// Target a tuple field.
+    Offset,
+    /// Target the field of a tuple.
     TupleField(usize),
+    /// Target the field of an object.
+    ObjectField(usize),
 }
 
 impl fmt::Display for InstTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Offset(offset) => write!(f, "offset({})", offset),
-            Self::Field(slot) => write!(f, "field({})", slot),
+            Self::Offset => write!(f, "offset"),
             Self::TupleField(slot) => write!(f, "tuple-field({})", slot),
+            Self::ObjectField(slot) => write!(f, "object-field({})", slot),
         }
     }
 }
@@ -1489,7 +970,7 @@ pub enum InstOp {
     /// => <bool>
     /// ```
     Neq,
-    /// Test if the top of the stack is an instance of the second item on the
+    /// Test if the given address is an instance of the second item on the
     /// stack.
     ///
     /// # Operation
@@ -1500,7 +981,7 @@ pub enum InstOp {
     /// => <boolean>
     /// ```
     Is,
-    /// Test if the top of the stack is not an instance of the second item on
+    /// Test if the given address is not an instance of the second item on
     /// the stack.
     ///
     /// # Operation
@@ -1604,7 +1085,7 @@ impl fmt::Display for InstOp {
 }
 
 /// A literal value that can be pushed.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum InstValue {
     /// A unit.
     Unit,
@@ -1624,7 +1105,7 @@ pub enum InstValue {
 
 impl InstValue {
     /// Convert into a value that can be pushed onto the stack.
-    pub fn into_value(self) -> Value {
+    pub(crate) fn into_value(self) -> Value {
         match self {
             Self::Unit => Value::Unit,
             Self::Bool(v) => Value::Bool(v),

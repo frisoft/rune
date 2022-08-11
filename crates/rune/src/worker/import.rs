@@ -1,6 +1,6 @@
 use crate::ast;
 use crate::ast::Spanned;
-use crate::compile::{CompileError, CompileErrorKind, CompileResult, ItemBuf, ModId, Visibility};
+use crate::compile::{CompileError, CompileErrorKind, ItemBuf, ModId, Visibility};
 use crate::parse::Resolve;
 use crate::query::Query;
 use crate::worker::{ImportKind, Task, WildcardImport};
@@ -42,7 +42,7 @@ impl Import {
         context: &Context,
         q: &mut Query,
         add_task: &mut impl FnMut(Task),
-    ) -> CompileResult<()> {
+    ) -> Result<(), CompileError> {
         let (name, first, initial) = match self.kind {
             ImportKind::Global => {
                 match self.ast.path.global {

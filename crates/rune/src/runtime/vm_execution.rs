@@ -1,11 +1,13 @@
-use crate::runtime::budget;
-use crate::runtime::{
-    Generator, GeneratorState, Stream, Value, Vm, VmError, VmErrorKind, VmHalt, VmHaltInfo,
-};
-use crate::shared::AssertSend;
 use std::fmt;
 use std::future::Future;
+use std::mem;
 use std::mem::take;
+
+use crate::runtime::budget;
+use crate::runtime::{
+    Address, Generator, GeneratorState, Stream, Value, Vm, VmError, VmErrorKind, VmHalt, VmHaltInfo,
+};
+use crate::shared::AssertSend;
 
 /// The state of an execution. We keep track of this because it's important to
 /// correctly interact with functions that yield (like generators and streams)
@@ -14,18 +16,20 @@ use std::mem::take;
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub enum ExecutionState {
-    /// The initial state of an execution.
-    Initial,
-    /// The resumed state of an execution. This expects a value to be pushed
-    /// onto the virtual machine before it is continued.
-    Resumed,
+    /// The waiting execution state.
+    Waiting,
+    /// Execution state is yielded.
+    Yielded {
+        /// Address where the return address of the yield should be written.
+        address: Address,
+    },
 }
 
 impl fmt::Display for ExecutionState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ExecutionState::Initial => write!(f, "initial"),
-            ExecutionState::Resumed => write!(f, "resumed"),
+            ExecutionState::Waiting => write!(f, "waiting"),
+            ExecutionState::Yielded { address } => write!(f, "yielded {address}"),
         }
     }
 }
@@ -74,13 +78,13 @@ where
         Self {
             head,
             vms: vec![],
-            state: ExecutionState::Initial,
+            state: ExecutionState::Waiting,
         }
     }
 
     /// Test if the current execution state is resumed.
     pub(crate) fn is_resumed(&self) -> bool {
-        matches!(self.state, ExecutionState::Resumed)
+        matches!(self.state, ExecutionState::Yielded { .. })
     }
 
     /// Coerce the current execution into a generator if appropriate.
@@ -192,15 +196,14 @@ where
     /// Resume the current execution with the given value and resume
     /// asynchronous execution.
     pub async fn async_resume_with(&mut self, value: Value) -> Result<GeneratorState, VmError> {
-        if !matches!(self.state, ExecutionState::Resumed) {
-            return Err(VmErrorKind::ExpectedExecutionState {
-                expected: ExecutionState::Resumed,
-                actual: self.state,
+        let address = match mem::replace(&mut self.state, ExecutionState::Waiting) {
+            ExecutionState::Yielded { address } => address,
+            _ => {
+                return Err(VmError::from(VmErrorKind::ExpectedYieldedExecutionState));
             }
-            .into());
-        }
+        };
 
-        vm_mut!(self).stack_mut().push(value);
+        vm_mut!(self).stack_mut().store(address, value)?;
         self.inner_async_resume().await
     }
 
@@ -209,10 +212,10 @@ where
     /// If the function being executed is a generator or stream this will resume
     /// it while returning a unit from the current `yield`.
     pub async fn async_resume(&mut self) -> Result<GeneratorState, VmError> {
-        if matches!(self.state, ExecutionState::Resumed) {
-            vm_mut!(self).stack_mut().push(Value::Unit);
-        } else {
-            self.state = ExecutionState::Resumed;
+        if let ExecutionState::Yielded { address } =
+            mem::replace(&mut self.state, ExecutionState::Waiting)
+        {
+            vm_mut!(self).stack_mut().store(address, Value::Unit)?;
         }
 
         self.inner_async_resume().await
@@ -233,8 +236,13 @@ where
                     vm_call.into_execution(self)?;
                     continue;
                 }
-                VmHalt::Yielded => {
-                    let value = vm.stack_mut().pop()?;
+                VmHalt::Yielded { address, output } => {
+                    let value = match address {
+                        Some(address) => mem::take(vm.stack_mut().at_mut(address)?),
+                        None => Value::Unit,
+                    };
+
+                    self.state = ExecutionState::Yielded { address: output };
                     return Ok(GeneratorState::Yielded(value));
                 }
                 halt => {
@@ -256,15 +264,14 @@ where
     /// Resume the current execution with the given value and resume synchronous
     /// execution.
     pub fn resume_with(&mut self, value: Value) -> Result<GeneratorState, VmError> {
-        if !matches!(self.state, ExecutionState::Resumed) {
-            return Err(VmErrorKind::ExpectedExecutionState {
-                expected: ExecutionState::Resumed,
-                actual: self.state,
+        let address = match mem::replace(&mut self.state, ExecutionState::Waiting) {
+            ExecutionState::Yielded { address } => address,
+            _ => {
+                return Err(VmError::from(VmErrorKind::ExpectedYieldedExecutionState));
             }
-            .into());
-        }
+        };
 
-        vm_mut!(self).stack_mut().push(value);
+        vm_mut!(self).stack_mut().store(address, value)?;
         self.inner_resume()
     }
 
@@ -276,10 +283,10 @@ where
     /// If any async instructions are encountered, this will error with
     /// [VmErrorKind::Halted].
     pub fn resume(&mut self) -> Result<GeneratorState, VmError> {
-        if matches!(self.state, ExecutionState::Resumed) {
-            vm_mut!(self).stack_mut().push(Value::Unit);
-        } else {
-            self.state = ExecutionState::Resumed;
+        if let ExecutionState::Yielded { address } =
+            mem::replace(&mut self.state, ExecutionState::Waiting)
+        {
+            vm_mut!(self).stack_mut().store(address, Value::Unit)?;
         }
 
         self.inner_resume()
@@ -296,8 +303,13 @@ where
                     vm_call.into_execution(self)?;
                     continue;
                 }
-                VmHalt::Yielded => {
-                    let value = vm.stack_mut().pop()?;
+                VmHalt::Yielded { address, output } => {
+                    let value = match address {
+                        Some(address) => mem::take(vm.stack_mut().at_mut(address)?),
+                        None => Value::Unit,
+                    };
+
+                    self.state = ExecutionState::Yielded { address: output };
                     return Ok(GeneratorState::Yielded(value));
                 }
                 halt => {
@@ -383,30 +395,31 @@ where
     /// End execution and perform debug checks.
     pub(crate) fn end(&mut self) -> Result<Value, VmError> {
         let vm = self.head.as_mut();
-        let value = vm.stack_mut().pop()?;
+        let value = mem::take(vm.stack_mut().at_mut(Address::BASE)?);
         debug_assert!(self.vms.is_empty(), "execution vms should be empty");
         Ok(value)
     }
 
     /// Push a virtual machine state onto the execution.
-    pub(crate) fn push_vm(&mut self, vm: Vm) {
-        self.vms.push((vm, self.state));
-        self.state = ExecutionState::Initial;
+    pub(crate) fn push_vm(&mut self, vm: Vm, address: Address) {
+        self.vms.push((vm, ExecutionState::Yielded { address }));
+        self.state = ExecutionState::Waiting;
     }
 
     /// Pop a virtual machine state from the execution and transfer the top of
     /// the stack from the popped machine.
     fn pop_vm(&mut self) -> Result<(), VmError> {
         let (mut from, state) = self.vms.pop().ok_or(VmErrorKind::NoRunningVm)?;
-
-        let stack = from.stack_mut();
-        let value = stack.pop()?;
-        debug_assert!(stack.is_empty(), "vm stack not clean");
+        let value = from.stack_mut().take_at(Address::BASE)?;
 
         let onto = vm_mut!(self);
-        onto.stack_mut().push(value);
+
+        if let ExecutionState::Yielded { address } = state {
+            onto.stack_mut().store(address, value)?;
+        }
+
         onto.advance();
-        self.state = state;
+        self.state = ExecutionState::Waiting;
         Ok(())
     }
 

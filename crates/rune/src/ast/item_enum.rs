@@ -49,6 +49,15 @@ pub struct ItemVariant {
     pub body: ItemVariantBody,
 }
 
+impl Peek for ItemVariant {
+    fn peek(p: &mut Peeker<'_>) -> bool {
+        match p.nth(0) {
+            K![ident] => true,
+            _ => ast::Attribute::peek(p),
+        }
+    }
+}
+
 /// An item body declaration.
 #[derive(Debug, Clone, PartialEq, Eq, ToTokens, OptionSpanned)]
 #[non_exhaustive]

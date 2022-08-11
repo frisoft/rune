@@ -7,6 +7,9 @@ pub struct Symbol(&'static str);
 
 pub const RUNE: Symbol = Symbol("rune");
 pub const ID: Symbol = Symbol("id");
+pub const ADDRESS: Symbol = Symbol("address");
+pub const LABEL: Symbol = Symbol("label");
+pub const DEBUG: Symbol = Symbol("debug");
 pub const SKIP: Symbol = Symbol("skip");
 pub const ITER: Symbol = Symbol("iter");
 pub const OPTIONAL: Symbol = Symbol("optional");

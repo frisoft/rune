@@ -1,5 +1,7 @@
-use crate::compile::{ImportStep, IrError, IrErrorKind, ItemBuf, Location, Meta, Visibility};
-use crate::hir::{HirError, HirErrorKind};
+use crate::compile::{
+    CompileError, CompileErrorKind, ImportStep, IrError, IrErrorKind, ItemBuf, Location, Meta,
+    Visibility,
+};
 use crate::parse::{Id, ParseError, ParseErrorKind, ResolveError, ResolveErrorKind};
 use crate::runtime::debug::DebugSignature;
 use crate::Hash;
@@ -15,7 +17,7 @@ error! {
     impl From<IrError>;
     impl From<ParseError>;
     impl From<ResolveError>;
-    impl From<HirError>;
+    impl From<CompileError>;
 }
 
 /// Error raised during queries.
@@ -29,25 +31,25 @@ pub enum QueryErrorKind {
     IrError {
         #[source]
         #[from]
-        error: IrErrorKind,
+        error: Box<IrErrorKind>,
     },
     #[error("{error}")]
     ParseError {
         #[source]
         #[from]
-        error: ParseErrorKind,
+        error: Box<ParseErrorKind>,
     },
     #[error("{error}")]
     ResolveError {
         #[source]
         #[from]
-        error: ResolveErrorKind,
+        error: Box<ResolveErrorKind>,
     },
     #[error("{error}")]
-    HirError {
+    CompileError {
         #[source]
         #[from]
-        error: HirErrorKind,
+        error: Box<CompileErrorKind>,
     },
     #[error("missing {what} for id {id:?}")]
     MissingId { what: &'static str, id: Id },

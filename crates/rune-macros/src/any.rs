@@ -71,8 +71,8 @@ impl Derive {
         let mut ctx = Context::new();
 
         let attrs = match ctx.type_attrs(&self.input.attrs) {
-            Some(attrs) => attrs,
-            None => return Err(ctx.errors),
+            Ok(attrs) => attrs,
+            Err(()) => return Err(ctx.errors),
         };
 
         let tokens = ctx.tokens_with_module(attrs.module.as_ref());
@@ -80,8 +80,8 @@ impl Derive {
         let generics = &self.input.generics;
         let install_with =
             match expand_install_with(&mut ctx, &self.input, &tokens, &attrs, generics) {
-                Some(install_with) => install_with,
-                None => return Err(ctx.errors),
+                Ok(install_with) => install_with,
+                Err(()) => return Err(ctx.errors),
             };
 
         let name = match attrs.name {
@@ -103,7 +103,7 @@ pub(crate) fn expand_install_with(
     tokens: &Tokens,
     attrs: &TypeAttrs,
     generics: &syn::Generics,
-) -> Option<TokenStream> {
+) -> Result<TokenStream, ()> {
     let mut installers = Vec::new();
 
     let ident = &input.ident;
@@ -120,7 +120,7 @@ pub(crate) fn expand_install_with(
                 input,
                 "`Any` not supported on unions",
             ));
-            return None;
+            return Err(());
         }
     }
 
@@ -130,7 +130,7 @@ pub(crate) fn expand_install_with(
         });
     }
 
-    Some(quote! {
+    Ok(quote! {
         #(#installers)*
         Ok(())
     })
@@ -141,7 +141,7 @@ fn expand_struct_install_with(
     installers: &mut Vec<TokenStream>,
     st: &syn::DataStruct,
     tokens: &Tokens,
-) -> Option<()> {
+) -> Result<(), ()> {
     let mut fields = Vec::new();
 
     for (n, field) in st.fields.iter().enumerate() {
@@ -197,7 +197,7 @@ fn expand_struct_install_with(
         syn::Fields::Unit => {}
     }
 
-    Some(())
+    Ok(())
 }
 
 fn expand_enum_install_with(
@@ -207,7 +207,7 @@ fn expand_enum_install_with(
     en: &syn::DataEnum,
     tokens: &Tokens,
     generics: &syn::Generics,
-) -> Option<()> {
+) -> Result<(), ()> {
     let protocol = &tokens.protocol;
     let variant_meta = &tokens.variant;
     let vm_error = &tokens.vm_error;
@@ -245,7 +245,7 @@ fn expand_enum_install_with(
                         None => {
                             ctx.errors
                                 .push(syn::Error::new_spanned(f, "missing field name"));
-                            return None;
+                            return Err(());
                         }
                     };
 
@@ -295,7 +295,7 @@ fn expand_enum_install_with(
                 if variant_attrs.constructor {
                     if fields_len != fields.unnamed.len() {
                         ctx.errors.push(syn::Error::new_spanned(fields, "#[rune(constructor)] can only be used if all fields are marked with #[rune(get)"));
-                        return None;
+                        return Err(());
                     }
 
                     constructors.push(quote!(#variant_index, #ident #generics :: #variant_ident));
@@ -361,7 +361,7 @@ fn expand_enum_install_with(
         installers.push(quote!(module.variant_constructor(#constructor)?;))
     }
 
-    Some(())
+    Ok(())
 }
 
 /// Expand the necessary implementation details for `Any`.

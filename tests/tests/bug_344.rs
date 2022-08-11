@@ -9,7 +9,7 @@
 
 use futures_executor::block_on;
 use rune::compile::Named;
-use rune::runtime::{RawRef, RawStr, Stack, TypeInfo, TypeOf, UnsafeFromValue, VmError};
+use rune::runtime::{RawRef, RawStr, Stack, TypeInfo, TypeOf, UnsafeFromValue, VmError, Address};
 use rune::{Any, Context, Hash, InstallWith, Module, Value};
 use std::any;
 use std::cell::Cell;
@@ -31,7 +31,7 @@ fn bug_344_function() -> rune::Result<()> {
 
     let mut stack = Stack::new();
     stack.push(GuardCheck::new());
-    function(&mut stack, 1)?;
+    function(&mut stack, Address::BASE, 1, Address::BASE)?;
     assert_eq!(stack.pop()?.into_integer()?, 42);
     return Ok(());
 
@@ -59,7 +59,7 @@ fn bug_344_inst_fn() -> rune::Result<()> {
     let mut stack = Stack::new();
     stack.push(GuardCheck::new());
     stack.push(GuardCheck::new());
-    function(&mut stack, 2)?;
+    function(&mut stack, Address::BASE, 2, Address::BASE)?;
 
     assert_eq!(stack.pop()?.into_integer()?, 42);
     return Ok(());
@@ -87,7 +87,7 @@ fn bug_344_async_function() -> rune::Result<()> {
 
     let mut stack = Stack::new();
     stack.push(GuardCheck::new());
-    function(&mut stack, 1)?;
+    function(&mut stack, Address::BASE, 1, Address::BASE)?;
 
     let future = stack.pop()?.into_future()?;
     assert_eq!(block_on(future)?.into_integer()?, 42);
@@ -117,7 +117,7 @@ fn bug_344_async_inst_fn() -> rune::Result<()> {
     let mut stack = Stack::new();
     stack.push(GuardCheck::new());
     stack.push(GuardCheck::new());
-    function(&mut stack, 2)?;
+    function(&mut stack, Address::BASE, 2, Address::BASE)?;
 
     let future = stack.pop()?.into_future()?;
     assert_eq!(block_on(future)?.into_integer()?, 42);

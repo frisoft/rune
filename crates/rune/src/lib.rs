@@ -210,6 +210,8 @@ cfg_emit! {
     pub use ::codespan_reporting::term::termcolor;
 }
 
+pub(crate) mod arena;
+
 mod any;
 pub use self::any::Any;
 

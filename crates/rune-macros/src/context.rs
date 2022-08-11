@@ -34,6 +34,12 @@ pub(crate) struct FieldAttrs {
     pub(crate) copy: bool,
     /// Whether this field should be known at compile time or not.
     pub(crate) field: bool,
+    /// This is an address field.
+    pub(crate) address: Option<Span>,
+    /// This is a label field.
+    pub(crate) label: Option<Span>,
+    /// If the debug impl should be used to format this field.
+    pub(crate) debug: Option<Span>,
 }
 
 impl FieldAttrs {
@@ -137,15 +143,15 @@ impl Context {
     }
 
     /// Get a field identifier.
-    pub(crate) fn field_ident<'a>(&mut self, field: &'a syn::Field) -> Option<&'a syn::Ident> {
+    pub(crate) fn field_ident<'a>(&mut self, field: &'a syn::Field) -> Result<&'a syn::Ident, ()> {
         match &field.ident {
-            Some(ident) => Some(ident),
+            Some(ident) => Ok(ident),
             None => {
                 self.errors.push(syn::Error::new_spanned(
                     field,
                     "unnamed fields are not supported",
                 ));
-                None
+                Err(())
             }
         }
     }
@@ -155,29 +161,29 @@ impl Context {
         &mut self,
         attr: &syn::Attribute,
         symbol: Symbol,
-    ) -> Option<Vec<syn::NestedMeta>> {
+    ) -> Result<Vec<syn::NestedMeta>, ()> {
         if attr.path != symbol {
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
 
         match attr.parse_meta() {
-            Ok(List(meta)) => Some(meta.nested.into_iter().collect()),
+            Ok(List(meta)) => Ok(meta.nested.into_iter().collect()),
             Ok(other) => {
                 self.errors.push(syn::Error::new_spanned(
                     other,
                     format!("expected #[{}(...)]", symbol),
                 ));
-                None
+                Err(())
             }
             Err(error) => {
                 self.errors.push(syn::Error::new(Span::call_site(), error));
-                None
+                Err(())
             }
         }
     }
 
     /// Parse field attributes.
-    pub(crate) fn field_attrs(&mut self, input: &[syn::Attribute]) -> Option<FieldAttrs> {
+    pub(crate) fn field_attrs(&mut self, input: &[syn::Attribute]) -> Result<FieldAttrs, ()> {
         macro_rules! generate_op {
             ($proto:ident, $op:tt) => {
                 |g| {
@@ -231,6 +237,18 @@ impl Context {
                 let span = meta.span();
 
                 match meta {
+                    // Parse `#[rune(address)]`
+                    Meta(Path(word)) if word == ADDRESS => {
+                        attrs.address = Some(span);
+                    }
+                    // Parse `#[rune(label)]`
+                    Meta(Path(word)) if word == LABEL => {
+                        attrs.label = Some(span);
+                    }
+                    // Parse `#[rune(debug)]`
+                    Meta(Path(word)) if word == DEBUG => {
+                        attrs.debug = Some(span);
+                    }
                     // Parse `#[rune(id)]`
                     Meta(Path(word)) if word == ID => {
                         attrs.id = Some(span);
@@ -269,7 +287,7 @@ impl Context {
 
                             error.combine(syn::Error::new_spanned(old, "previously defined here"));
                             self.errors.push(error);
-                            return None;
+                            return Err(());
                         }
 
                         attrs.parse_with = Some(syn::Ident::new(&s.value(), s.span()));
@@ -411,19 +429,18 @@ impl Context {
                     }
                     _ => {
                         self.errors
-                            .push(syn::Error::new_spanned(meta, "unsupported attribute"));
-
-                        return None;
+                            .push(syn::Error::new_spanned(meta, "unsupported field attribute"));
+                        return Err(());
                     }
                 }
             }
         }
 
-        Some(attrs)
+        Ok(attrs)
     }
 
     /// Parse field attributes.
-    pub(crate) fn type_attrs(&mut self, input: &[syn::Attribute]) -> Option<TypeAttrs> {
+    pub(crate) fn type_attrs(&mut self, input: &[syn::Attribute]) -> Result<TypeAttrs, ()> {
         let mut attrs = TypeAttrs::default();
 
         for attr in input {
@@ -447,7 +464,7 @@ impl Context {
                                         other
                                     ),
                                 ));
-                                return None;
+                                return Err(());
                             }
                         };
 
@@ -471,7 +488,7 @@ impl Context {
                             Ok(module) => module,
                             Err(e) => {
                                 self.errors.push(e);
-                                return None;
+                                return Err(());
                             }
                         };
 
@@ -487,7 +504,7 @@ impl Context {
                             Ok(install_with) => install_with,
                             Err(e) => {
                                 self.errors.push(e);
-                                return None;
+                                return Err(());
                             }
                         };
 
@@ -497,17 +514,17 @@ impl Context {
                         self.errors
                             .push(syn::Error::new_spanned(meta, "unsupported type attribute"));
 
-                        return None;
+                        return Err(());
                     }
                 }
             }
         }
 
-        Some(attrs)
+        Ok(attrs)
     }
 
     /// Parse and extract variant attributes.
-    pub(crate) fn variant_attrs(&mut self, input: &[syn::Attribute]) -> Option<VariantAttrs> {
+    pub(crate) fn variant_attrs(&mut self, input: &[syn::Attribute]) -> Result<VariantAttrs, ()> {
         let mut attrs = VariantAttrs::default();
         let mut error = false;
 
@@ -529,23 +546,23 @@ impl Context {
                         self.errors
                             .push(syn::Error::new_spanned(meta, "unsupported attribute"));
 
-                        return None;
+                        return Err(());
                     }
                 }
             }
         }
 
         if error {
-            return None;
+            return Err(());
         }
 
-        Some(attrs)
+        Ok(attrs)
     }
 
     /// Parse path to custom field function.
-    fn parse_field_custom(&mut self, meta: syn::Meta) -> Option<Option<syn::Path>> {
+    fn parse_field_custom(&mut self, meta: syn::Meta) -> Result<Option<syn::Path>, ()> {
         let s = match meta {
-            Path(..) => return Some(None),
+            Path(..) => return Ok(None),
             NameValue(syn::MetaNameValue {
                 lit: syn::Lit::Str(s),
                 ..
@@ -553,15 +570,15 @@ impl Context {
             _ => {
                 self.errors
                     .push(syn::Error::new(meta.span(), "unsupported meta"));
-                return None;
+                return Err(());
             }
         };
 
         match s.parse_with(syn::Path::parse_mod_style) {
-            Ok(path) => Some(Some(path)),
+            Ok(path) => Ok(Some(path)),
             Err(error) => {
                 self.errors.push(error);
-                None
+                Err(())
             }
         }
     }
@@ -571,15 +588,15 @@ impl Context {
         &mut self,
         tokens: &Tokens,
         back: bool,
-        mut it: impl Iterator<Item = (Option<TokenStream>, &'a syn::Field)>,
-    ) -> Option<(bool, Option<TokenStream>)> {
+        mut it: impl Iterator<Item = (Result<TokenStream, ()>, &'a syn::Field)>,
+    ) -> Result<(bool, Option<TokenStream>), ()> {
         let mut quote = None::<TokenStream>;
 
         loop {
             let (var, field) = match it.next() {
                 Some((var, field)) => (var?, field),
                 None => {
-                    return Some((true, quote));
+                    return Ok((true, quote));
                 }
             };
 
@@ -641,7 +658,7 @@ impl Context {
                 });
             }
 
-            return Some((false, quote));
+            return Ok((false, quote));
         }
     }
 
@@ -649,7 +666,8 @@ impl Context {
     pub(crate) fn explicit_span(
         &mut self,
         named: &syn::FieldsNamed,
-    ) -> Option<Option<TokenStream>> {
+        tokens: &Tokens,
+    ) -> Result<Option<TokenStream>, ()> {
         let mut explicit_span = None;
 
         for field in &named.named {
@@ -661,18 +679,19 @@ impl Context {
                         span,
                         "only one field can be marked `#[rune(span)]`",
                     ));
-                    return None;
+                    return Err(());
                 }
 
                 let ident = &field.ident;
+                let spanned = &tokens.spanned;
 
                 explicit_span = Some(quote_spanned! {
-                    field.span() => self.#ident
+                    field.span() => #spanned::span(&self.#ident)
                 })
             }
         }
 
-        Some(explicit_span)
+        Ok(explicit_span)
     }
 
     pub(crate) fn tokens_with_module(&self, module: Option<&syn::Path>) -> Tokens {
@@ -725,6 +744,13 @@ impl Context {
             variant: quote!(#module::compile::Variant),
             vm_error_kind: quote!(#module::runtime::VmErrorKind),
             vm_error: quote!(#module::runtime::VmError),
+            compile_error: quote!(#module::compile::CompileError),
+            scopes: quote!(#module::compile::Scopes),
+            assembly_address: quote!(#module::compile::AssemblyAddress),
+            label: quote!(#module::compile::Label),
+            fmt_display: quote!(core::fmt::Display),
+            fmt_result: quote!(core::fmt::Result),
+            fmt_formatter: quote!(core::fmt::Formatter),
         }
     }
 }
@@ -767,6 +793,13 @@ pub(crate) struct Tokens {
     pub(crate) variant: TokenStream,
     pub(crate) vm_error_kind: TokenStream,
     pub(crate) vm_error: TokenStream,
+    pub(crate) compile_error: TokenStream,
+    pub(crate) scopes: TokenStream,
+    pub(crate) assembly_address: TokenStream,
+    pub(crate) label: TokenStream,
+    pub(crate) fmt_display: TokenStream,
+    pub(crate) fmt_result: TokenStream,
+    pub(crate) fmt_formatter: TokenStream,
 }
 
 impl Tokens {

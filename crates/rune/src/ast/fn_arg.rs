@@ -28,3 +28,12 @@ impl Parse for FnArg {
         })
     }
 }
+
+impl Peek for FnArg {
+    fn peek(p: &mut Peeker<'_>) -> bool {
+        match p.nth(0) {
+            K![self] => true,
+            _ => ast::Pat::peek(p),
+        }
+    }
+}

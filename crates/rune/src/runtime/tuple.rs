@@ -2,6 +2,7 @@ use crate::runtime::{
     ConstValue, FromValue, Mut, Ref, ToValue, Value, Vm, VmError, VmErrorKind, TUPLE_TYPE,
 };
 use std::fmt;
+use std::mem;
 use std::ops;
 use std::slice;
 
@@ -105,6 +106,37 @@ impl ops::Deref for Tuple {
 impl ops::DerefMut for Tuple {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut *self.inner
+    }
+}
+
+impl IntoIterator for Tuple {
+    type Item = Value;
+    type IntoIter = IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter::new(self)
+    }
+}
+
+/// Owned iterator over a [Tuple].
+pub struct IntoIter {
+    tuple: Tuple,
+    index: usize,
+}
+
+impl IntoIter {
+    fn new(tuple: Tuple) -> Self {
+        Self { tuple, index: 0 }
+    }
+}
+
+impl Iterator for IntoIter {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let value = mem::take(self.tuple.get_mut(self.index)?);
+        self.index = self.index.checked_add(1)?;
+        Some(value)
     }
 }
 

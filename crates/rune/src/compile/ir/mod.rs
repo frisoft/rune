@@ -18,6 +18,7 @@ pub(crate) use self::interpreter::{IrBudget, IrInterpreter};
 mod value;
 pub use self::value::IrValue;
 
+use crate::arena::Arena;
 use crate::ast::{Span, Spanned};
 use crate::compile::ast;
 use crate::compile::ir;
@@ -28,7 +29,7 @@ use crate::query::Used;
 
 /// Context used for [IrEval].
 pub struct IrEvalContext<'a> {
-    pub(crate) c: IrCompiler<'a>,
+    pub(crate) compiler: IrCompiler<'a>,
     pub(crate) item: &'a ItemMeta,
 }
 
@@ -38,25 +39,29 @@ pub struct IrEvalContext<'a> {
 pub trait IrEval {
     /// Evaluate the current value as a constant expression and return its value
     /// through its intermediate representation [IrValue].
-    fn eval(&self, ctx: &mut IrEvalContext<'_>) -> Result<IrValue, IrError>;
+    fn eval(&self, cx: &mut IrEvalContext<'_>) -> Result<IrValue, IrError>;
 }
 
 impl IrEval for ast::Expr {
-    fn eval(&self, ctx: &mut IrEvalContext<'_>) -> Result<IrValue, IrError> {
-        let ir = {
-            // TODO: avoid this arena?
-            let arena = crate::hir::Arena::new();
-            let hir_ctx = crate::hir::lowering::Ctx::new(&arena, ctx.c.q.borrow());
-            let hir = crate::hir::lowering::expr(&hir_ctx, self)?;
-            compile::expr(&hir, &mut ctx.c)?
+    fn eval(&self, cx: &mut IrEvalContext<'_>) -> Result<IrValue, IrError> {
+        // TODO: avoid this arena?
+        let arena = Arena::new();
+        let hir = {
+            let mut cx = crate::hir::lowering::Ctxt::new(
+                cx.item.location.source_id,
+                cx.compiler.q.borrow(),
+                &arena,
+            );
+            crate::hir::lowering::expr(&mut cx, self)?
         };
+        let ir = compile::expr(&hir, &mut cx.compiler)?;
 
         let mut ir_interpreter = IrInterpreter {
             budget: IrBudget::new(1_000_000),
             scopes: Default::default(),
-            module: ctx.item.module,
-            item: ctx.item.item,
-            q: ctx.c.q.borrow(),
+            module: cx.item.module,
+            item: cx.item.item,
+            q: cx.compiler.q.borrow(),
         };
 
         ir_interpreter.eval_value(&ir, Used::Used)
@@ -221,7 +226,7 @@ pub struct IrScope {
     /// Instructions in the scope.
     pub(crate) instructions: Vec<Ir>,
     /// The implicit value of the scope.
-    pub(crate) last: Option<Box<Ir>>,
+    pub(crate) tail: Option<Box<Ir>>,
 }
 
 /// A binary operation.
@@ -400,16 +405,12 @@ impl IrBreak {
     fn compile_ast(
         span: Span,
         c: &mut IrCompiler<'_>,
-        hir: Option<&hir::ExprBreakValue>,
+        hir: &hir::ExprBreakValue,
     ) -> Result<Self, IrError> {
-        let kind = match hir {
-            Some(expr) => match *expr {
-                hir::ExprBreakValue::Expr(e) => ir::IrBreakKind::Ir(Box::new(compile::expr(e, c)?)),
-                hir::ExprBreakValue::Label(label) => {
-                    ir::IrBreakKind::Label(c.resolve(label)?.into())
-                }
-            },
-            None => ir::IrBreakKind::Inherent,
+        let kind = match *hir {
+            hir::ExprBreakValue::None => ir::IrBreakKind::Inherent,
+            hir::ExprBreakValue::Expr(e) => ir::IrBreakKind::Ir(Box::new(compile::expr(e, c)?)),
+            hir::ExprBreakValue::Label(label) => ir::IrBreakKind::Label(c.resolve(label)?.into()),
         };
 
         Ok(ir::IrBreak { span, kind })

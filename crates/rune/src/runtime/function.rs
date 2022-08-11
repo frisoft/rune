@@ -1,7 +1,7 @@
 use crate::runtime::{
-    Args, Call, ConstValue, FromValue, FunctionHandler, RawRef, Ref, Rtti, RuntimeContext, Shared,
-    Stack, Tuple, Unit, UnsafeFromValue, Value, VariantRtti, Vm, VmCall, VmError, VmErrorKind,
-    VmHalt,
+    Address, Args, Call, ConstValue, FromValue, FunctionHandler, RawRef, Ref, Rtti, RuntimeContext,
+    Shared, Stack, Tuple, Unit, UnsafeFromValue, Value, VariantRtti, Vm, VmCall, VmError,
+    VmErrorKind, VmHalt,
 };
 use crate::shared::AssertSend;
 use crate::Hash;
@@ -50,7 +50,9 @@ impl Function {
     {
         Self(FunctionImpl {
             inner: Inner::FnHandler(FnHandler {
-                handler: Arc::new(move |stack, args| f.fn_call(stack, args)),
+                handler: Arc::new(move |stack, address, args, output| {
+                    f.fn_call(stack, address, args, output)
+                }),
                 hash: Hash::EMPTY,
             }),
         })
@@ -92,7 +94,9 @@ impl Function {
     {
         Self(FunctionImpl {
             inner: Inner::FnHandler(FnHandler {
-                handler: Arc::new(move |stack, args| f.fn_call(stack, args)),
+                handler: Arc::new(move |stack, address, args, output| {
+                    f.fn_call(stack, address, args, output)
+                }),
                 hash: Hash::EMPTY,
             }),
         })
@@ -136,6 +140,7 @@ impl Function {
     /// assert_eq!(value.call::<_, u32>((1, 2))?, 3);
     /// # Ok(()) }
     /// ```
+    #[tracing::instrument(skip_all)]
     pub fn call<A, T>(&self, args: A) -> Result<T, VmError>
     where
         A: Args,
@@ -150,8 +155,14 @@ impl Function {
     ///
     /// A stop reason will be returned in case the function call results in
     /// a need to suspend the execution.
-    pub(crate) fn call_with_vm(&self, vm: &mut Vm, args: usize) -> Result<Option<VmHalt>, VmError> {
-        self.0.call_with_vm(vm, args)
+    pub(crate) fn call_with_vm(
+        &self,
+        vm: &mut Vm,
+        address: Address,
+        args: usize,
+        output: Address,
+    ) -> Result<Option<VmHalt>, VmError> {
+        self.0.call_with_vm(vm, address, args, output)
     }
 
     /// Create a function pointer from a handler.
@@ -166,10 +177,11 @@ impl Function {
         offset: usize,
         call: Call,
         args: usize,
+        frame: usize,
         hash: Hash,
     ) -> Self {
         Self(FunctionImpl::from_offset(
-            context, unit, offset, call, args, hash,
+            context, unit, offset, call, args, frame, hash,
         ))
     }
 
@@ -180,6 +192,7 @@ impl Function {
         offset: usize,
         call: Call,
         args: usize,
+        frame: usize,
         environment: Box<[Value]>,
         hash: Hash,
     ) -> Self {
@@ -189,6 +202,7 @@ impl Function {
             offset,
             call,
             args,
+            frame,
             environment,
             hash,
         ))
@@ -448,7 +462,7 @@ where
 
 impl<V> FunctionImpl<V>
 where
-    V: Clone,
+    V: fmt::Debug + Clone,
     Tuple: From<Box<[V]>>,
 {
     fn call<A, T>(&self, args: A) -> Result<T, VmError>
@@ -456,13 +470,15 @@ where
         A: Args,
         T: FromValue,
     {
+        tracing::trace!(?self.inner);
+
         let value = match &self.inner {
             Inner::FnHandler(handler) => {
                 let arg_count = args.count();
                 let mut stack = Stack::with_capacity(arg_count);
                 args.into_stack(&mut stack)?;
-                (handler.handler)(&mut stack, arg_count)?;
-                stack.pop()?
+                (handler.handler)(&mut stack, Address::BASE, arg_count, Address::BASE)?;
+                std::mem::take(stack.at_mut(Address::BASE)?)
             }
             Inner::FnOffset(fn_offset) => fn_offset.call(args, ())?,
             Inner::FnClosureOffset(closure) => closure
@@ -474,7 +490,7 @@ where
             }
             Inner::FnTupleStruct(tuple) => {
                 check_args(args.count(), tuple.args)?;
-                Value::tuple_struct(tuple.rtti.clone(), args.into_vec()?)
+                Value::tuple_struct(tuple.rtti.clone(), args.into_vec()?.into())
             }
             Inner::FnUnitVariant(unit) => {
                 check_args(args.count(), 0)?;
@@ -482,7 +498,7 @@ where
             }
             Inner::FnTupleVariant(tuple) => {
                 check_args(args.count(), tuple.args)?;
-                Value::tuple_variant(tuple.rtti.clone(), args.into_vec()?)
+                Value::tuple_variant(tuple.rtti.clone(), args.into_vec()?.into())
             }
         };
 
@@ -524,14 +540,20 @@ where
     ///
     /// A stop reason will be returned in case the function call results in
     /// a need to suspend the execution.
-    pub(crate) fn call_with_vm(&self, vm: &mut Vm, args: usize) -> Result<Option<VmHalt>, VmError> {
+    pub(crate) fn call_with_vm(
+        &self,
+        vm: &mut Vm,
+        address: Address,
+        args: usize,
+        output: Address,
+    ) -> Result<Option<VmHalt>, VmError> {
         let reason = match &self.inner {
             Inner::FnHandler(handler) => {
-                (handler.handler)(vm.stack_mut(), args)?;
+                (handler.handler)(vm.stack_mut(), address, args, output)?;
                 None
             }
             Inner::FnOffset(fn_offset) => {
-                if let Some(vm_call) = fn_offset.call_with_vm(vm, args, ())? {
+                if let Some(vm_call) = fn_offset.call_with_vm(vm, address, args, (), output)? {
                     return Ok(Some(VmHalt::VmCall(vm_call)));
                 }
 
@@ -540,8 +562,10 @@ where
             Inner::FnClosureOffset(closure) => {
                 if let Some(vm_call) = closure.fn_offset.call_with_vm(
                     vm,
+                    address,
                     args,
                     (Tuple::from(closure.environment.clone()),),
+                    output,
                 )? {
                     return Ok(Some(VmHalt::VmCall(vm_call)));
                 }
@@ -550,30 +574,34 @@ where
             }
             Inner::FnUnitStruct(empty) => {
                 check_args(args, 0)?;
-                vm.stack_mut().push(Value::unit_struct(empty.rtti.clone()));
+                *vm.stack_mut().at_mut(output)? = Value::unit_struct(empty.rtti.clone());
                 None
             }
             Inner::FnTupleStruct(tuple) => {
                 check_args(args, tuple.args)?;
 
-                let value =
-                    Value::tuple_struct(tuple.rtti.clone(), vm.stack_mut().pop_sequence(args)?);
-                vm.stack_mut().push(value);
+                let value = Value::tuple_struct(
+                    tuple.rtti.clone(),
+                    vm.stack_mut().drain_at(address, args)?.collect(),
+                );
+                *vm.stack_mut().at_mut(output)? = value;
                 None
             }
             Inner::FnUnitVariant(tuple) => {
                 check_args(args, 0)?;
 
                 let value = Value::unit_variant(tuple.rtti.clone());
-                vm.stack_mut().push(value);
+                *vm.stack_mut().at_mut(output)? = value;
                 None
             }
             Inner::FnTupleVariant(tuple) => {
                 check_args(args, tuple.args)?;
 
-                let value =
-                    Value::tuple_variant(tuple.rtti.clone(), vm.stack_mut().pop_sequence(args)?);
-                vm.stack_mut().push(value);
+                let value = Value::tuple_variant(
+                    tuple.rtti.clone(),
+                    vm.stack_mut().drain_at(address, args)?.collect(),
+                );
+                *vm.stack_mut().at_mut(output)? = value;
                 None
             }
         };
@@ -595,6 +623,7 @@ where
         offset: usize,
         call: Call,
         args: usize,
+        frame: usize,
         hash: Hash,
     ) -> Self {
         Self {
@@ -604,6 +633,7 @@ where
                 offset,
                 call,
                 args,
+                frame,
                 hash,
             }),
         }
@@ -616,6 +646,7 @@ where
         offset: usize,
         call: Call,
         args: usize,
+        frame: usize,
         environment: Box<[V]>,
         hash: Hash,
     ) -> Self {
@@ -627,6 +658,7 @@ where
                     offset,
                     call,
                     args,
+                    frame,
                     hash,
                 },
                 environment,
@@ -789,6 +821,8 @@ struct FnOffset {
     call: Call,
     /// The number of arguments the function takes.
     args: usize,
+    /// Number of slots to allocate for the function call.
+    frame: usize,
     /// Hash for the function type
     hash: Hash,
 }
@@ -801,13 +835,15 @@ impl FnOffset {
         E: Args,
     {
         check_args(args.count(), self.args)?;
-
-        let mut vm = Vm::new(self.context.clone(), self.unit.clone());
-
+        let mut vm = Vm::with_stack(
+            self.context.clone(),
+            self.unit.clone(),
+            Stack::with_capacity(self.frame),
+        );
         vm.set_ip(self.offset);
         args.into_stack(vm.stack_mut())?;
         extra.into_stack(vm.stack_mut())?;
-
+        vm.stack_mut().resize_frame(self.frame)?;
         self.call.call_with_vm(vm)
     }
 
@@ -815,7 +851,14 @@ impl FnOffset {
     ///
     /// This will cause a halt in case the vm being called into isn't the same
     /// as the context and unit of the function.
-    fn call_with_vm<E>(&self, vm: &mut Vm, args: usize, extra: E) -> Result<Option<VmCall>, VmError>
+    fn call_with_vm<E>(
+        &self,
+        vm: &mut Vm,
+        address: Address,
+        args: usize,
+        extra: E,
+        output: Address,
+    ) -> Result<Option<VmCall>, VmError>
     where
         E: Args,
     {
@@ -824,17 +867,18 @@ impl FnOffset {
         // Fast past, just allocate a call frame and keep running.
         if let Call::Immediate = self.call {
             if vm.is_same(&self.context, &self.unit) {
-                vm.push_call_frame(self.offset, args)?;
+                vm.push_call_frame(self.offset, address, self.frame, output)?;
                 extra.into_stack(vm.stack_mut())?;
                 return Ok(None);
             }
         }
 
-        let mut new_stack = vm.stack_mut().drain(args)?.collect::<Stack>();
-        extra.into_stack(&mut new_stack)?;
-        let mut vm = Vm::with_stack(self.context.clone(), self.unit.clone(), new_stack);
+        let mut stack = vm.stack_mut().drain_at(address, args)?.collect::<Stack>();
+        extra.into_stack(&mut stack)?;
+        stack.resize_frame(self.frame)?;
+        let mut vm = Vm::with_stack(self.context.clone(), self.unit.clone(), stack);
         vm.set_ip(self.offset);
-        Ok(Some(VmCall::new(self.call, vm)))
+        Ok(Some(VmCall::new(self.call, vm, output)))
     }
 }
 
@@ -846,6 +890,8 @@ impl fmt::Debug for FnOffset {
             .field("offset", &self.offset)
             .field("call", &self.call)
             .field("args", &self.args)
+            .field("frame", &self.frame)
+            .field("hash", &self.hash)
             .finish()
     }
 }

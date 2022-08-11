@@ -1,15 +1,14 @@
-use crate::ast;
-use crate::ast::{Span, Spanned, SpannedError};
-use crate::compile::{IrError, IrErrorKind, ItemBuf, Location, Meta};
-use crate::hir::{HirError, HirErrorKind};
+use std::io;
+use std::path::PathBuf;
+
+use thiserror::Error;
+
+use crate::ast::{self, Span, Spanned, SpannedError};
+use crate::compile::{BindingName, IrError, IrErrorKind, ItemBuf, Location, Meta};
 use crate::parse::{ParseError, ParseErrorKind, ResolveError, ResolveErrorKind};
 use crate::query::{QueryError, QueryErrorKind};
 use crate::runtime::debug::DebugSignature;
-use crate::runtime::Label;
 use crate::{Error, Hash, SourceId};
-use std::io;
-use std::path::PathBuf;
-use thiserror::Error;
 
 error! {
     /// An error raised by the compiler.
@@ -22,7 +21,6 @@ error! {
     impl From<IrError>;
     impl From<QueryError>;
     impl From<ResolveError>;
-    impl From<HirError>;
 }
 
 impl From<CompileError> for SpannedError {
@@ -77,7 +75,7 @@ pub enum CompileErrorKind {
     QueryError {
         #[source]
         #[from]
-        error: QueryErrorKind,
+        error: Box<QueryErrorKind>,
     },
     #[error("{error}")]
     ParseError {
@@ -90,12 +88,6 @@ pub enum CompileErrorKind {
         #[source]
         #[from]
         error: ResolveErrorKind,
-    },
-    #[error("{error}")]
-    HirError {
-        #[source]
-        #[from]
-        error: HirErrorKind,
     },
     #[error("failed to load `{path}`: {error}")]
     ModFileError {
@@ -115,7 +107,7 @@ pub enum CompileErrorKind {
         existing: (SourceId, Span),
     },
     #[error("variable `{name}` conflicts")]
-    VariableConflict { name: String, existing_span: Span },
+    VariableConflict { name: Box<str>, existing_span: Span },
     #[error("missing macro `{item}`")]
     MissingMacro { item: ItemBuf },
     #[error("{error}")]
@@ -140,8 +132,10 @@ pub enum CompileErrorKind {
     UnsupportedUnaryOp { op: ast::UnOp },
     #[error("unsupported binary operator `{op}`")]
     UnsupportedBinaryOp { op: ast::BinOp },
-    #[error("{meta} is not an object")]
-    UnsupportedLitObject { meta: Meta },
+    #[error("{meta} does not refer to a struct")]
+    MetaNotStruct { meta: Meta },
+    #[error("is not a struct")]
+    NotStruct,
     #[error("missing field `{field}` in declaration of `{item}`")]
     LitObjectMissingField { field: Box<str>, item: ItemBuf },
     #[error("`{field}` is not a field in `{item}`")]
@@ -162,14 +156,6 @@ pub enum CompileErrorKind {
         expected: usize,
         actual: usize,
     },
-    #[error("{meta} is not supported here")]
-    UnsupportedPattern { meta: Meta },
-    #[error("this kind of expression is not supported as a pattern")]
-    UnsupportedPatternExpr,
-    #[error("not a valid binding")]
-    UnsupportedBinding,
-    #[error("floating point numbers cannot be used in patterns")]
-    MatchFloatInPattern,
     #[error("duplicate key in literal object")]
     DuplicateObjectKey { existing: Span, object: Span },
     #[error("`yield` must be used in function or closure")]
@@ -188,8 +174,6 @@ pub enum CompileErrorKind {
     ContinueOutsideOfLoop,
     #[error("multiple `default` branches in select")]
     SelectMultipleDefaults,
-    #[error("expected expression to be terminated by a semicolon `;`")]
-    ExpectedBlockSemiColon { followed_span: Span },
     #[error("macro call must be terminated by a semicolon `;`")]
     ExpectedMacroSemi,
     #[error("an `fn` can't both be `async` and `const` at the same time")]
@@ -258,9 +242,9 @@ pub enum CompileErrorKind {
         existing: Box<[String]>,
     },
     #[error("duplicate label `{label}`")]
-    DuplicateLabel { label: Label },
+    DuplicateLabel { label: Box<str> },
     #[error("missing label `{label}`")]
-    MissingLabel { label: Label },
+    MissingLabel { label: Box<str> },
     #[error("missing loop label `{label}`")]
     MissingLoopLabel { label: Box<str> },
     #[error("base offset overflow")]
@@ -292,6 +276,28 @@ pub enum CompileErrorKind {
         item: ItemBuf,
         fields: Box<[Box<str>]>,
     },
+    #[error("writing arena slice out of bounds for index {index}")]
+    ArenaWriteSliceOutOfBounds { index: usize },
+    #[error("allocation error for {requested} bytes")]
+    ArenaAllocError { requested: usize },
+    #[error("expected expression that evaluates to value")]
+    ExpectedExpr,
+    #[error("not supported as a struct key")]
+    InvalidStructKey,
+    #[error("duplicate binding in pattern")]
+    DuplicateBinding { previous_span: Span },
+    #[error("expected tuple type")]
+    ExpectedTuple,
+    #[error("expected struct type")]
+    ExpectedStruct,
+    #[error("unsupported pattern")]
+    UnsupportedPattern,
+    #[error("`..` is not supported in this location")]
+    UnsupportedPatternRest,
+    #[error("expected expression to be terminated by a semicolon `;`")]
+    ExpectedBlockSemiColon { followed_span: Span },
+    #[error("internal: missing binding {binding_name:?}")]
+    MissingBindingName { binding_name: BindingName },
 }
 
 /// A single step in an import.

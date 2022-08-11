@@ -34,14 +34,15 @@ pub fn with<T>(budget: usize, value: T) -> Budget<T> {
 #[inline(never)]
 pub(crate) fn take() -> bool {
     BUDGET.with(|tls| {
-        let v = tls.get();
+        let budget = tls.get();
+        tracing::trace!(budget = budget);
 
-        if v == usize::max_value() {
+        if budget == usize::max_value() {
             true
-        } else if v == 0 {
+        } else if budget == 0 {
             false
         } else {
-            tls.set(v - 1);
+            tls.set(budget - 1);
             true
         }
     })

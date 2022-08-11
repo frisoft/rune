@@ -14,7 +14,7 @@ impl Expander {
         &mut self,
         input: &syn::DeriveInput,
         st: &syn::DataStruct,
-    ) -> Option<TokenStream> {
+    ) -> Result<TokenStream, ()> {
         let inner = self.expand_fields(&st.fields)?;
 
         let ident = &input.ident;
@@ -22,7 +22,7 @@ impl Expander {
         let vm_error = &self.tokens.vm_error;
         let to_value = &self.tokens.to_value;
 
-        Some(quote! {
+        Ok(quote! {
             impl #to_value for #ident {
                 fn to_value(self) -> ::std::result::Result<#value, #vm_error> {
                     #inner
@@ -32,7 +32,7 @@ impl Expander {
     }
 
     /// Expand field decoding.
-    fn expand_fields(&mut self, fields: &syn::Fields) -> Option<TokenStream> {
+    fn expand_fields(&mut self, fields: &syn::Fields) -> Result<TokenStream, ()> {
         match fields {
             syn::Fields::Unnamed(named) => self.expand_unnamed(named),
             syn::Fields::Named(named) => self.expand_named(named),
@@ -41,27 +41,27 @@ impl Expander {
                     fields,
                     "unit structs are not supported",
                 ));
-                None
+                Err(())
             }
         }
     }
 
     /// Get a field identifier.
-    fn field_ident<'a>(&mut self, field: &'a syn::Field) -> Option<&'a syn::Ident> {
+    fn field_ident<'a>(&mut self, field: &'a syn::Field) -> Result<&'a syn::Ident, ()> {
         match &field.ident {
-            Some(ident) => Some(ident),
+            Some(ident) => Ok(ident),
             None => {
                 self.ctx.errors.push(syn::Error::new_spanned(
                     field,
                     "unnamed fields are not supported",
                 ));
-                None
+                Err(())
             }
         }
     }
 
     /// Expand unnamed fields.
-    fn expand_unnamed(&mut self, unnamed: &syn::FieldsUnnamed) -> Option<TokenStream> {
+    fn expand_unnamed(&mut self, unnamed: &syn::FieldsUnnamed) -> Result<TokenStream, ()> {
         let mut to_values = Vec::new();
 
         for (index, field) in unnamed.unnamed.iter().enumerate() {
@@ -81,7 +81,7 @@ impl Expander {
         let value = &self.tokens.value;
         let tuple = &self.tokens.tuple;
 
-        Some(quote_spanned! {
+        Ok(quote_spanned! {
             unnamed.span() =>
             let mut tuple = Vec::with_capacity(#cap);
             #(#to_values)*
@@ -90,7 +90,7 @@ impl Expander {
     }
 
     /// Expand named fields.
-    fn expand_named(&mut self, named: &syn::FieldsNamed) -> Option<TokenStream> {
+    fn expand_named(&mut self, named: &syn::FieldsNamed) -> Result<TokenStream, ()> {
         let mut to_values = Vec::new();
 
         for field in &named.named {
@@ -110,7 +110,7 @@ impl Expander {
         let value = &self.tokens.value;
         let object = &self.tokens.object;
 
-        Some(quote_spanned! {
+        Ok(quote_spanned! {
             named.span() =>
             let mut object = <#object>::new();
             #(#to_values)*
@@ -123,8 +123,8 @@ pub(super) fn expand(input: &syn::DeriveInput) -> Result<TokenStream, Vec<syn::E
     let mut ctx = Context::new();
 
     let attrs = match ctx.type_attrs(&input.attrs) {
-        Some(attrs) => attrs,
-        None => {
+        Ok(attrs) => attrs,
+        Err(()) => {
             return Err(ctx.errors);
         }
     };
@@ -138,7 +138,7 @@ pub(super) fn expand(input: &syn::DeriveInput) -> Result<TokenStream, Vec<syn::E
 
     match &input.data {
         syn::Data::Struct(st) => {
-            if let Some(expanded) = expander.expand_struct(input, st) {
+            if let Ok(expanded) = expander.expand_struct(input, st) {
                 return Ok(expanded);
             }
         }

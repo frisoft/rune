@@ -174,11 +174,6 @@ impl Number {
         self.as_primitive(spanned, neg, num::ToPrimitive::to_u32)
     }
 
-    /// Convert into a 64-bit signed number.
-    pub(crate) fn as_i64(&self, spanned: Span, neg: bool) -> Result<i64, ParseError> {
-        self.as_primitive(spanned, neg, num::ToPrimitive::to_i64)
-    }
-
     /// Convert into usize.
     pub(crate) fn as_usize(&self, spanned: Span, neg: bool) -> Result<usize, ParseError> {
         self.as_primitive(spanned, neg, num::ToPrimitive::to_usize)

@@ -127,7 +127,7 @@ impl Unit {
 
     /// Lookup the static object keys by slot, if it exists.
     pub fn lookup_object_keys(&self, slot: usize) -> Option<&[String]> {
-        self.static_object_keys.get(slot).map(|keys| &keys[..])
+        self.static_object_keys.get(slot).map(|value| &**value)
     }
 
     /// Lookup runt-time information for the given type hash.
@@ -163,6 +163,8 @@ pub enum UnitFn {
         call: Call,
         /// The number of arguments the function takes.
         args: usize,
+        /// Number of slots to allocate for the given function call.
+        frame: usize,
     },
     /// An empty constructor of the type identified by the given hash.
     UnitStruct {
@@ -193,20 +195,28 @@ pub enum UnitFn {
 impl fmt::Display for UnitFn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Offset { offset, call, args } => {
-                write!(f, "offset {}, {}, {}", offset, call, args)?;
+            Self::Offset {
+                offset,
+                call,
+                args,
+                frame,
+            } => {
+                write!(
+                    f,
+                    "offset offset={offset}, call={call}, args={args}, frame={frame}"
+                )?;
             }
             Self::UnitStruct { hash } => {
-                write!(f, "unit {}", hash)?;
+                write!(f, "unit {hash}")?;
             }
             Self::TupleStruct { hash, args } => {
-                write!(f, "tuple {}, {}", hash, args)?;
+                write!(f, "tuple {hash}, {args}")?;
             }
             Self::UnitVariant { hash } => {
-                write!(f, "empty-variant {}", hash)?;
+                write!(f, "empty-variant {hash}")?;
             }
             Self::TupleVariant { hash, args } => {
-                write!(f, "tuple-variant {}, {}", hash, args)?;
+                write!(f, "tuple-variant {hash}, {args}")?;
             }
         }
 

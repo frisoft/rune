@@ -3,7 +3,7 @@ use crate::macros;
 use crate::parse;
 use std::fmt;
 
-/// This file has been generated from `assets\tokens.yaml`
+/// This file has been generated from `assets/tokens.yaml`
 /// DO NOT modify by hand!
 
 /// The `abstract` keyword.
@@ -3907,6 +3907,12 @@ macro_rules! T {
     ('}') => {
         $crate::ast::CloseBrace
     };
+    ("<<") => {
+        $crate::ast::OpenEmpty
+    };
+    (">>") => {
+        $crate::ast::CloseEmpty
+    };
     (is not) => {
         $crate::ast::IsNot
     };
@@ -4227,6 +4233,8 @@ macro_rules! K {
     (']') => { $crate::ast::Kind::Close($crate::ast::Delimiter::Bracket) };
     ('{') => { $crate::ast::Kind::Open($crate::ast::Delimiter::Brace) };
     ('}') => { $crate::ast::Kind::Close($crate::ast::Delimiter::Brace) };
+    ("<<") => { $crate::ast::Kind::Open($crate::ast::Delimiter::Empty) };
+    (">>") => { $crate::ast::Kind::Close($crate::ast::Delimiter::Empty) };
     (abstract) => { $crate::ast::Kind::Abstract };
     (alignof) => { $crate::ast::Kind::AlignOf };
     (as) => { $crate::ast::Kind::As };

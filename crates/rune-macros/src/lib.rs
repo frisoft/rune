@@ -48,6 +48,7 @@ extern crate proc_macro;
 mod any;
 mod context;
 mod from_value;
+mod instruction;
 mod instrument;
 mod internals;
 mod opaque;
@@ -266,9 +267,30 @@ pub fn __instrument_ast(
 ) -> proc_macro::TokenStream {
     let internal_call = syn::parse_macro_input!(item as instrument::Expander);
     internal_call
-        .expand()
+        .expand(false)
         .unwrap_or_else(to_compile_errors)
         .into()
+}
+
+/// Internal macro to instrument a function which is threading HIR.
+#[proc_macro_attribute]
+#[doc(hidden)]
+pub fn __instrument_hir(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let internal_call = syn::parse_macro_input!(item as instrument::Expander);
+    internal_call
+        .expand(true)
+        .unwrap_or_else(to_compile_errors)
+        .into()
+}
+
+#[doc(hidden)]
+#[proc_macro_derive(Instruction, attributes(rune))]
+pub fn instruction(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let derive = syn::parse_macro_input!(input as instruction::Derive);
+    derive.expand().unwrap_or_else(to_compile_errors).into()
 }
 
 fn to_compile_errors(errors: Vec<syn::Error>) -> proc_macro2::TokenStream {

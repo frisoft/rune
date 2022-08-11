@@ -361,7 +361,7 @@ pub enum Inst {
         address: Address,
         /// The branch value to compare against.
         branch: i64,
-        /// The offset to jump.
+        /// The offset to jump *if* the branch matches.
         #[rune(label)]
         offset: isize,
     },

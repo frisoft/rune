@@ -102,7 +102,7 @@ impl<'hir> BoundPat<'hir> {
             BoundPatKind::Expr { address, expr } => {
                 expr.compile(cx, Some(address))?.free(cx)?;
                 cx.scopes.free(cx.span, address)?;
-                Ok(PatOutcome::Refutable)
+                Ok(PatOutcome::Irrefutable)
             }
             BoundPatKind::Lit { lit, expr } => {
                 let output = expr.compile(cx, None)?.ensure_address(cx)?;
@@ -156,13 +156,11 @@ impl<'hir> BoundPat<'hir> {
                     output: address,
                 });
 
-                let mut outcome = PatOutcome::Irrefutable;
-
                 for pat in items {
-                    outcome = outcome.combine(pat.compile(cx, label)?);
+                    pat.compile(cx, label)?;
                 }
 
-                Ok(outcome)
+                Ok(PatOutcome::Refutable)
             }
             BoundPatKind::AnonymousTuple {
                 expr,
@@ -181,13 +179,11 @@ impl<'hir> BoundPat<'hir> {
                     output: address,
                 });
 
-                let mut outcome = PatOutcome::Irrefutable;
-
                 for pat in items {
-                    outcome = outcome.combine(pat.compile(cx, label)?);
+                    pat.compile(cx, label)?;
                 }
 
-                Ok(outcome)
+                Ok(PatOutcome::Refutable)
             }
             BoundPatKind::AnonymousObject {
                 expr,
@@ -206,13 +202,11 @@ impl<'hir> BoundPat<'hir> {
                     output: address,
                 });
 
-                let mut outcome = PatOutcome::Irrefutable;
-
                 for pat in items {
-                    outcome = outcome.combine(pat.compile(cx, label)?);
+                    pat.compile(cx, label)?;
                 }
 
-                Ok(outcome)
+                Ok(PatOutcome::Refutable)
             }
             BoundPatKind::TypedSequence {
                 expr,
@@ -251,14 +245,12 @@ impl<'hir> BoundPat<'hir> {
                     }
                 }
 
-                let mut outcome = PatOutcome::Irrefutable;
-
                 for pat in items {
-                    outcome = outcome.combine(pat.compile(cx, label)?);
+                    pat.compile(cx, label)?;
                 }
 
                 address.free(cx)?;
-                Ok(outcome)
+                Ok(PatOutcome::Refutable)
             }
         }
     }

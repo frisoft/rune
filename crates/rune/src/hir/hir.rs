@@ -85,8 +85,8 @@ pub struct PatBinding<'hir> {
     pub span: Span,
     /// The key of an object.
     pub key: &'hir ObjectKey<'hir>,
-    /// What the binding is to.
-    pub pat: &'hir Pat<'hir>,
+    /// The optional pattern being bound to.
+    pub pat: Option<&'hir Pat<'hir>>,
 }
 
 /// An expression.

@@ -455,7 +455,7 @@ fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::Pat) -> Result<hir::Pat<'hir>> 
                 bindings: iter!(ast => cx; &ast.items, |(ast, _)| hir::PatBinding {
                     span: ast.span(),
                     key: alloc!(ast => cx; object_key(cx, &ast.key)?),
-                    pat: alloc!(ast => cx; pat(cx, &ast.pat)?),
+                    pat: option!(ast => cx; &ast.assign, |(_, ast)| pat(cx, ast)?),
                 }),
                 is_open: ast.rest.is_some(),
             })),

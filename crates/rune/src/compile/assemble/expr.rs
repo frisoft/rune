@@ -348,20 +348,6 @@ impl<'hir> Expr<'hir> {
 
                 ExprOutcome::Output(output)
             }
-            ExprKind::Object { slot, args } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.array(args, |cx, address, _| {
-                        cx.push(Inst::Object {
-                            address,
-                            slot,
-                            output,
-                        });
-                        Ok(())
-                    })
-                })?;
-
-                ExprOutcome::Output(address)
-            }
             ExprKind::AssignStructField { lhs, slot, rhs } => {
                 let address = cx.alloc_or(output, |cx, output| {
                     cx.addresses([*lhs, *rhs], [output], |cx, [address, value]| {
@@ -670,11 +656,6 @@ pub(crate) enum ExprKind<'hir> {
     /// An anonymous tuple.
     Tuple {
         items: &'hir [Expr<'hir>],
-    },
-    /// Allocate an object.
-    Object {
-        slot: usize,
-        args: &'hir [Expr<'hir>],
     },
     /// A tuple field access.
     TupleFieldAccess {

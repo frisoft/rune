@@ -209,7 +209,7 @@ pub use self::lit_number::LitNumber;
 pub use self::lit_str::LitStr;
 pub use self::local::Local;
 pub use self::macro_call::MacroCall;
-pub use self::pat::{Pat, PatBinding, PatLit, PatObject, PatPath, PatTuple, PatVec};
+pub use self::pat::{Pat, PatAssign, PatLit, PatObject, PatPath, PatTuple, PatVec};
 pub use self::path::{Path, PathKind, PathSegment, PathSegmentExpr};
 pub use self::span::{ByteIndex, Span};
 pub use self::spanned::{OptionSpanned, Spanned};

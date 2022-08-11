@@ -718,7 +718,7 @@ impl<'a> Query<'a> {
     pub(crate) fn convert_path<'hir>(
         &mut self,
         context: &Context,
-        path: &'hir hir::Path<'hir>,
+        path: &hir::Path<'hir>,
     ) -> Result<Named<'hir>, CompileError> {
         let id = path.id();
 

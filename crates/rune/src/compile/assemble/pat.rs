@@ -1,9 +1,13 @@
 use rune_macros::__instrument_hir as instrument;
 
 use crate::ast::{self, Span};
-use crate::collections::HashMap;
-use crate::compile::assemble::{BoundPat, BoundPatKind, Ctxt, Expr, ExprKind, Result, TypeMatch};
-use crate::compile::{AssemblyAddress, BindingName, CompileError, CompileErrorKind, PrivMeta};
+use crate::collections::{HashMap, HashSet};
+use crate::compile::assemble::{
+    BoundPat, BoundPatKind, Ctxt, Expr, ExprKind, ExprStructKind, Result, TypeMatch,
+};
+use crate::compile::{
+    AssemblyAddress, BindingName, CompileError, CompileErrorKind, PrivMeta, UnitBuilder,
+};
 use crate::hash::Hash;
 use crate::parse::Resolve;
 
@@ -385,6 +389,25 @@ fn bind_pat_object<'hir>(
             }))
         }
         PatObjectKind::Anonymous { slot, is_open } => {
+            // Try a simpler form of pattern matching through syntactical
+            // reassignment.
+            match expr.kind {
+                ExprKind::Struct {
+                    kind: ExprStructKind::Anonymous { slot: expr_slot },
+                    exprs,
+                } if object_keys_match(&cx.q.unit, expr_slot, slot, is_open)
+                    .unwrap_or_default() =>
+                {
+                    let items = iter!(cx; patterns.iter().zip(exprs), |(pat, expr)| {
+                        pat.bind_inner(cx, *expr, removed)?
+                    });
+
+                    expr.scope.free(cx)?;
+                    return Ok(cx.bound_pat(BoundPatKind::IrrefutableSequence { items }));
+                }
+                _ => {}
+            }
+
             let address = cx.scopes.array_index();
 
             cx.scopes.alloc_array_items(patterns.len());
@@ -409,4 +432,25 @@ fn bind_pat_object<'hir>(
             }))
         }
     }
+}
+
+/// Test if object keys match.
+fn object_keys_match(
+    unit: &UnitBuilder,
+    from_slot: usize,
+    to_slot: usize,
+    is_open: bool,
+) -> Option<bool> {
+    let from_keys = unit.get_static_object_keys(from_slot)?;
+    let to_keys = unit.get_static_object_keys(to_slot)?;
+
+    let mut from_keys = from_keys.iter().cloned().collect::<HashSet<_>>();
+
+    for key in to_keys {
+        if !from_keys.remove(key) {
+            return Some(false);
+        }
+    }
+
+    Some(is_open || from_keys.is_empty())
 }

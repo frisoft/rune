@@ -270,7 +270,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     }
 
     /// Convert an [ast::Path] into a [Named] item.
-    pub(crate) fn convert_path(&mut self, path: &'hir hir::Path<'hir>) -> Result<Named<'hir>> {
+    pub(crate) fn convert_path(&mut self, path: &hir::Path<'hir>) -> Result<Named<'hir>> {
         self.q.convert_path(self.context, path)
     }
 
@@ -548,7 +548,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 #[instrument]
 pub(crate) fn closure_from_block<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::Block<'hir>,
+    hir: &hir::Block<'hir>,
     captures: &[CaptureMeta],
 ) -> Result<()> {
     let scope = cx.scopes.push(cx.span, None)?;
@@ -634,7 +634,7 @@ pub(crate) fn closure_from_expr_closure<'hir>(
 #[instrument]
 pub(crate) fn fn_from_item_fn<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::ItemFn<'hir>,
+    hir: &hir::ItemFn<'hir>,
     instance_fn: bool,
 ) -> Result<()> {
     let span = hir.span();
@@ -750,7 +750,7 @@ fn assemble_expr<'hir>(
 #[instrument]
 fn assemble_expr_block<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::ExprBlock<'hir>,
+    hir: &hir::ExprBlock<'hir>,
 ) -> Result<Expr<'hir>> {
     cx.with_span(hir.block.span, |cx| {
         if let hir::ExprBlockKind::Default = hir.kind {
@@ -830,7 +830,7 @@ fn assemble_block<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Block<'hir>) -> Resu
 
 /// Process a pattern binding.
 #[instrument]
-fn assemble_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &'hir hir::Pat<'hir>) -> Result<Pat<'hir>> {
+fn assemble_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Pat<'hir>) -> Result<Pat<'hir>> {
     cx.with_span(hir.span(), |cx| {
         let pat = match hir.kind {
             hir::PatKind::PatPath(hir) => {
@@ -857,11 +857,26 @@ fn assemble_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &'hir hir::Pat<'hir>) -> Res
     })
 }
 
+/// Assemble a binding pattern which is *just* a variable captured from an object.
+#[instrument]
+fn assemble_object_key<'hir>(
+    cx: &mut Ctxt<'_, 'hir>,
+    hir: &hir::ObjectKey<'hir>,
+) -> Result<Pat<'hir>> {
+    match *hir {
+        hir::ObjectKey::LitStr(..) => Err(cx.error(CompileErrorKind::UnsupportedPattern)),
+        hir::ObjectKey::Path(hir) => {
+            let path = alloc!(cx; assemble_pat_path(cx, hir)?);
+            Ok(cx.pat(PatKind::Path { path }))
+        }
+    }
+}
+
 /// Assemble a tuple pattern.
 #[instrument]
 fn assemble_pat_tuple<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::PatItems<'hir>,
+    hir: &hir::PatItems<'hir>,
 ) -> Result<Pat<'hir>> {
     let path = match hir.path {
         Some(hir) => Some(assemble_pat_path(cx, hir)?),
@@ -910,7 +925,7 @@ fn assemble_pat_tuple<'hir>(
 #[instrument]
 fn assemble_pat_object<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::PatObject<'hir>,
+    hir: &hir::PatObject<'hir>,
 ) -> Result<Pat<'hir>> {
     let path = match hir.path {
         Some(hir) => Some(assemble_pat_path(cx, hir)?),
@@ -1002,14 +1017,21 @@ fn assemble_pat_object<'hir>(
         }
     };
 
-    let patterns = iter!(cx; hir.bindings, |binding| assemble_pat(cx, binding.pat)?);
+    let patterns = iter!(cx; hir.bindings, |binding| {
+        if let Some(pat) = binding.pat {
+            assemble_pat(cx, pat)?
+        } else {
+            assemble_object_key(cx, binding.key)?
+        }
+    });
+
     Ok(cx.pat(PatKind::Object { kind, patterns }))
 }
 
 #[instrument]
 fn assemble_pat_path<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::Path<'hir>,
+    hir: &hir::Path<'hir>,
 ) -> Result<PatPath<'hir>> {
     let span = hir.span();
 
@@ -1037,7 +1059,7 @@ fn assemble_pat_path<'hir>(
 #[instrument]
 fn assemble_builtin_template<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::BuiltInTemplate<'hir>,
+    hir: &hir::BuiltInTemplate<'hir>,
 ) -> Result<Expr<'hir>> {
     // Template represents a single literal string.
     if hir
@@ -1070,7 +1092,7 @@ fn assemble_builtin_template<'hir>(
 #[instrument]
 fn assemble_builtin_format<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::BuiltInFormat<'hir>,
+    hir: &hir::BuiltInFormat<'hir>,
 ) -> Result<Expr<'hir>> {
     use crate::runtime::format;
 
@@ -1123,7 +1145,7 @@ fn assemble_builtin_format<'hir>(
 #[instrument]
 fn assemble_expr_closure<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::ExprClosure<'hir>,
+    hir: &hir::ExprClosure<'hir>,
 ) -> Result<Expr<'hir>> {
     let item = cx.q.item_for((cx.span, hir.id))?;
     let hash = cx.q.pool.item_type_hash(item.item);
@@ -1183,7 +1205,7 @@ fn assemble_expr_closure<'hir>(
 #[instrument]
 fn assemble_expr_object<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::ExprObject<'hir>,
+    hir: &hir::ExprObject<'hir>,
 ) -> Result<Expr<'hir>> {
     let mut keys = Vec::new();
     let mut keys_dup = HashMap::new();
@@ -1326,7 +1348,7 @@ fn assemble_expr_object<'hir>(
 #[instrument]
 fn assemble_expr_tuple<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::ExprSeq<'hir>,
+    hir: &hir::ExprSeq<'hir>,
 ) -> Result<Expr<'hir>> {
     let items = iter!(cx; hir.items, |hir| assemble_expr_value(cx, hir)?);
     Ok(cx.expr(ExprKind::Tuple { items }))
@@ -1380,7 +1402,7 @@ fn assemble_expr_assign<'hir>(
 #[instrument]
 fn assemble_expr_field_access<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::ExprFieldAccess<'hir>,
+    hir: &hir::ExprFieldAccess<'hir>,
 ) -> Result<Expr<'hir>> {
     match hir.expr_field {
         hir::ExprField::Path(path) => {
@@ -1511,7 +1533,7 @@ fn assemble_expr_path<'hir>(
 #[instrument]
 fn assemble_expr_binary<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::ExprBinary<'hir>,
+    hir: &hir::ExprBinary<'hir>,
 ) -> Result<Expr<'hir>> {
     let lhs = alloc!(cx; assemble_expr_value(cx, hir.lhs)?);
     let rhs = alloc!(cx; assemble_expr(cx, hir.rhs, rhs_needs_of(&hir.op))?);
@@ -1535,7 +1557,7 @@ fn assemble_expr_binary<'hir>(
 #[instrument]
 fn assemble_expr_let<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::ExprLet<'hir>,
+    hir: &hir::ExprLet<'hir>,
 ) -> Result<Expr<'hir>> {
     let pat = alloc!(cx; assemble_pat(cx, hir.pat)?);
     let expr = alloc!(cx; assemble_expr_value(cx, hir.expr)?);
@@ -1544,10 +1566,7 @@ fn assemble_expr_let<'hir>(
 
 /// Assemble an if statement.
 #[instrument]
-fn assemble_expr_if<'hir>(
-    cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::ExprIf<'hir>,
-) -> Result<Expr<'hir>> {
+fn assemble_expr_if<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::ExprIf<'hir>) -> Result<Expr<'hir>> {
     let count = 1 + hir.expr_else_ifs.len() + if hir.expr_else.is_some() { 1 } else { 0 };
 
     let mut conditions = Conditions::new(cx, count)?;
@@ -1569,7 +1588,7 @@ fn assemble_expr_if<'hir>(
 #[instrument]
 fn assemble_expr_match<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::ExprMatch<'hir>,
+    hir: &hir::ExprMatch<'hir>,
 ) -> Result<Expr<'hir>> {
     let mut matches = Matches::new(cx, hir.branches.len(), hir.expr)?;
 
@@ -1587,7 +1606,7 @@ fn assemble_expr_match<'hir>(
 #[instrument]
 fn assemble_expr_unary<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::ExprUnary<'hir>,
+    hir: &hir::ExprUnary<'hir>,
 ) -> Result<Expr<'hir>> {
     // NB: special unary expressions.
     if let ast::UnOp::BorrowRef { .. } = hir.op {
@@ -1636,7 +1655,7 @@ fn assemble_expr_unary<'hir>(
 #[instrument]
 fn assemble_expr_index<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::ExprIndex<'hir>,
+    hir: &hir::ExprIndex<'hir>,
 ) -> Result<Expr<'hir>> {
     let target = alloc!(cx; assemble_expr_value(cx, hir.target)?);
     let index = alloc!(cx; assemble_expr_value(cx, hir.index)?);
@@ -1647,7 +1666,7 @@ fn assemble_expr_index<'hir>(
 #[instrument]
 fn assemble_expr_break<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::ExprBreakValue<'hir>,
+    hir: &hir::ExprBreakValue<'hir>,
 ) -> Result<Expr<'hir>> {
     let kind = ExprKind::Break {
         value: alloc!(cx; match *hir {
@@ -1765,10 +1784,7 @@ fn assemble_expr_lit<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &'hir ast::Lit) -> Resu
 
 /// Convert a literal number into an expression kind.
 #[instrument]
-fn assemble_lit_number<'hir>(
-    cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir ast::LitNumber,
-) -> Result<Expr<'hir>> {
+fn assemble_lit_number<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &ast::LitNumber) -> Result<Expr<'hir>> {
     let number = hir.resolve(resolve_context!(cx.q))?;
 
     match number {
@@ -1797,7 +1813,7 @@ fn assemble_lit_number<'hir>(
 #[instrument]
 fn assemble_expr_call<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::ExprCall,
+    hir: &hir::ExprCall<'hir>,
 ) -> Result<Expr<'hir>> {
     assemble_expr(cx, hir.expr, Value)?.map(|kind| match kind {
         ExprKind::Address { address, .. } => Ok(ExprKind::CallAddress {
@@ -1982,13 +1998,16 @@ fn assemble_expr_const<'hir>(cx: &mut Ctxt<'_, 'hir>, value: &ConstValue) -> Res
             let mut entries = object.iter().collect::<vec::Vec<_>>();
             entries.sort_by_key(|k| k.0);
 
-            let args = iter!(cx; entries.iter(), |(_, value)| assemble_expr_const(cx, value)?);
+            let exprs = iter!(cx; entries.iter(), |(_, value)| assemble_expr_const(cx, value)?);
 
             let slot =
                 cx.q.unit
                     .new_static_object_keys_iter(cx.span, entries.iter().map(|e| e.0))?;
 
-            ExprKind::Object { slot, args }
+            ExprKind::Struct {
+                kind: ExprStructKind::Anonymous { slot },
+                exprs,
+            }
         }
     };
 
@@ -1999,7 +2018,7 @@ fn assemble_expr_const<'hir>(cx: &mut Ctxt<'_, 'hir>, value: &ConstValue) -> Res
 #[instrument]
 fn assemble_expr_vec<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::ExprSeq<'hir>,
+    hir: &hir::ExprSeq<'hir>,
 ) -> Result<Expr<'hir>> {
     let items = iter!(cx; hir.items, |hir| assemble_expr_value(cx, hir)?);
     Ok(cx.expr(ExprKind::Vec { items }))
@@ -2009,7 +2028,7 @@ fn assemble_expr_vec<'hir>(
 #[instrument]
 fn assemble_expr_range<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::ExprRange<'hir>,
+    hir: &hir::ExprRange<'hir>,
 ) -> Result<Expr<'hir>> {
     let limits = match hir.limits {
         hir::ExprRangeLimits::HalfOpen => InstRangeLimits::HalfOpen,
@@ -2041,7 +2060,7 @@ fn assemble_expr_range<'hir>(
 #[instrument]
 fn assemble_macro_call<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &'hir hir::MacroCall<'hir>,
+    hir: &hir::MacroCall<'hir>,
 ) -> Result<Expr<'hir>> {
     let expr = match hir {
         hir::MacroCall::Template(hir) => assemble_builtin_template(cx, hir)?,

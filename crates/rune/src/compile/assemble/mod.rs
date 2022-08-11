@@ -1799,7 +1799,7 @@ fn assemble_expr_call<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
     hir: &'hir hir::ExprCall,
 ) -> Result<Expr<'hir>> {
-    assemble_expr(cx, hir.expr, Type)?.map(|kind| match kind {
+    assemble_expr(cx, hir.expr, Value)?.map(|kind| match kind {
         ExprKind::Address { address, .. } => Ok(ExprKind::CallAddress {
             address,
             args: iter!(cx; hir.args, |hir| assemble_expr_value(cx, hir)?),

@@ -137,17 +137,14 @@ pub fn block<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::Block) -> Result<hir::Blo
             ));
         }
 
-        let ast = match stmt {
-            ast::Stmt::Local(ast) => {
-                statements.push(BlockStatement::Local(ast));
-                continue;
-            }
+        let stmt = match stmt {
+            ast::Stmt::Local(ast) => BlockStatement::Local(ast),
             ast::Stmt::Expr(ast) => {
                 if ast.needs_semi() {
                     must_be_last = Some(ast.span());
                 }
 
-                ast
+                BlockStatement::Expr(ast)
             }
             ast::Stmt::Semi(ast) => {
                 if !ast.needs_semi() {
@@ -155,7 +152,7 @@ pub fn block<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::Block) -> Result<hir::Blo
                         .uneccessary_semi_colon(cx.source_id, ast.semi_token.span());
                 }
 
-                &ast.expr
+                BlockStatement::Expr(&ast.expr)
             }
             ast::Stmt::Item(item, semi) => {
                 if let Some(semi) = semi {
@@ -169,11 +166,17 @@ pub fn block<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::Block) -> Result<hir::Blo
             }
         };
 
-        statements.extend(tail_expr.replace(ast).map(BlockStatement::Expr));
+        statements.extend(tail_expr.replace(stmt));
     }
 
-    let tail = if let Some(ast) = tail_expr {
-        Some(&*alloc!(ast => cx; expr(cx, ast)?))
+    let tail = if let Some(stmt) = tail_expr {
+        match stmt {
+            BlockStatement::Local(local) => {
+                statements.push(BlockStatement::Local(local));
+                None
+            }
+            BlockStatement::Expr(hir) => Some(&*alloc!(stmt => cx; expr(cx, hir)?)),
+        }
     } else {
         None
     };

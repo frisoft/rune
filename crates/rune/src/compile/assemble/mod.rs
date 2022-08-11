@@ -86,7 +86,9 @@ mod conditions;
 use self::conditions::{ConditionBranch, Conditions};
 
 mod expr;
-use self::expr::{Expr, ExprBreakValue, ExprKind, ExprOutcome, ExprStructKind, ExprUnOp};
+use self::expr::{
+    Expr, ExprBreakValue, ExprKind, ExprOutcome, ExprStructKind, ExprUnOp, SelectBranch,
+};
 
 mod matches;
 use self::matches::{MatchBranch, Matches};
@@ -439,16 +441,21 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     }
 
     /// Allocate space for the specified array.
-    fn array(&mut self, array: &[Expr<'hir>]) -> Result<MaybeAlloc> {
+    fn array<I>(&mut self, expressions: I) -> Result<MaybeAlloc>
+    where
+        I: IntoIterator<Item = Expr<'hir>>,
+    {
         let address = self.scopes.array_index();
+        let mut count = 0;
 
-        for &hir in array {
+        for hir in expressions {
             let output = self.scopes.array_index();
             hir.compile(self, Some(output))?.free(self)?;
             self.scopes.alloc_array_item();
+            count += 1;
         }
 
-        Ok(MaybeAlloc::array(address, array.len()))
+        Ok(MaybeAlloc::array(address, count))
     }
 
     /// Process a maybe addres into a real address, allocating it if necessary.
@@ -742,7 +749,7 @@ fn assemble_expr<'hir>(
             hir::ExprKind::Return(hir) => assemble_expr_return(cx, hir)?,
             hir::ExprKind::Await(hir) => assemble_expr_await(cx, hir)?,
             hir::ExprKind::Try(hir) => assemble_expr_try(cx, hir)?,
-            hir::ExprKind::Select(_) => todo!(),
+            hir::ExprKind::Select(hir) => assemble_select(cx, hir)?,
             hir::ExprKind::Closure(hir) => assemble_expr_closure(cx, hir)?,
             hir::ExprKind::Object(hir) => assemble_expr_object(cx, hir)?,
             hir::ExprKind::Tuple(hir) => assemble_expr_tuple(cx, hir)?,
@@ -1726,6 +1733,31 @@ fn assemble_expr_await<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &'hir hir::Expr) -> R
 fn assemble_expr_try<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &'hir hir::Expr) -> Result<Expr<'hir>> {
     let expr = alloc!(cx; assemble_expr_value(cx, hir)?);
     Ok(cx.expr(ExprKind::Try { expr }))
+}
+
+#[instrument]
+fn assemble_select<'hir>(
+    cx: &mut Ctxt<'_, 'hir>,
+    hir: &hir::ExprSelect<'hir>,
+) -> Result<Expr<'hir>> {
+    let branches = iter!(cx; hir.branches, |hir| {
+        let scope = cx.scopes.push_branch(cx.span, Some(cx.scope))?;
+
+        let pat = assemble_pat(cx, hir.pat)?;
+        let expr = assemble_expr_value(cx, hir.expr)?;
+
+        SelectBranch::new(
+            scope,
+            pat,
+            expr,
+            hir.body,
+        )
+    });
+
+    Ok(cx.expr(ExprKind::Select {
+        branches,
+        default_branch: hir.default_branch,
+    }))
 }
 
 /// Assemble a return expression.

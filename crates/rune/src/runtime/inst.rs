@@ -265,7 +265,7 @@ pub enum Inst {
         #[rune(address)]
         address: Address,
         /// The number of values being selected over.
-        len: usize,
+        count: usize,
         /// The location to store the output of the evaluated select.
         #[rune(address)]
         output: Address,

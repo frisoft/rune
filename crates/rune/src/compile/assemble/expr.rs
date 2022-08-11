@@ -136,7 +136,7 @@ impl<'hir> Expr<'hir> {
             }
             ExprKind::Closure { hash, captures } => {
                 let output = cx.alloc_or(output);
-                let address = cx.array(captures)?.free(cx)?;
+                let address = cx.array(captures.iter().copied())?.free(cx)?;
 
                 cx.push(Inst::Closure {
                     hash,
@@ -301,7 +301,7 @@ impl<'hir> Expr<'hir> {
             }
             ExprKind::Vec { items: args } => {
                 let output = cx.alloc_or(output);
-                let address = cx.array(args)?.free(cx)?;
+                let address = cx.array(args.iter().copied())?.free(cx)?;
 
                 cx.push(Inst::Vec {
                     address,
@@ -356,7 +356,7 @@ impl<'hir> Expr<'hir> {
                         cx.free_iter([a, b, c, d])?;
                     }
                     args => {
-                        let address = cx.array(args)?.free(cx)?;
+                        let address = cx.array(args.iter().copied())?.free(cx)?;
 
                         cx.push(Inst::Tuple {
                             address,
@@ -454,7 +454,7 @@ impl<'hir> Expr<'hir> {
                 args,
             } => {
                 let output = cx.alloc_or(output);
-                let address = cx.array(args)?.free(cx)?;
+                let address = cx.array(args.iter().copied())?.free(cx)?;
 
                 cx.push(Inst::CallFn {
                     function,
@@ -472,7 +472,7 @@ impl<'hir> Expr<'hir> {
             ExprKind::CallExpr { expr, args } => {
                 let output = cx.alloc_or(output);
                 expr.compile(cx, Some(*output))?.free(cx)?;
-                let address = cx.array(args)?.free(cx)?;
+                let address = cx.array(args.iter().copied())?.free(cx)?;
 
                 cx.push(Inst::CallFn {
                     function: *output,
@@ -501,7 +501,7 @@ impl<'hir> Expr<'hir> {
             }
             ExprKind::Struct { kind, exprs } => {
                 let output = cx.alloc_or(output);
-                let address = cx.array(exprs)?.free(cx)?;
+                let address = cx.array(exprs.iter().copied())?.free(cx)?;
 
                 match kind {
                     ExprStructKind::Anonymous { slot } => {
@@ -551,19 +551,11 @@ impl<'hir> Expr<'hir> {
                 cx.free_iter([from, to])?;
                 ExprOutcome::Output(output)
             }
-            ExprKind::StringConcat { exprs } => {
-                let output = cx.alloc_or(output);
-                let address = cx.array(exprs)?.free(cx)?;
-
-                cx.push(Inst::StringConcat {
-                    address,
-                    count: exprs.len(),
-                    size_hint: 0,
-                    output: *output,
-                });
-
-                ExprOutcome::Output(output)
-            }
+            ExprKind::Select {
+                branches,
+                default_branch,
+            } => compile_expr_select(cx, branches, default_branch, output)?,
+            ExprKind::StringConcat { exprs } => compile_string_concat(cx, exprs, output)?,
             ExprKind::Format { spec, expr } => {
                 let output = cx.alloc_or(output);
                 let [address] = cx.addresses([*expr], [*output])?;
@@ -760,6 +752,10 @@ pub(crate) enum ExprKind<'hir> {
         limits: InstRangeLimits,
         to: &'hir Expr<'hir>,
     },
+    Select {
+        branches: &'hir [SelectBranch<'hir>],
+        default_branch: Option<&'hir hir::Expr<'hir>>,
+    },
     StringConcat {
         exprs: &'hir [Expr<'hir>],
     },
@@ -849,6 +845,30 @@ pub(crate) enum ExprStructKind {
     Struct { hash: Hash, slot: usize },
     /// A variant struct with named fields.
     StructVariant { hash: Hash, slot: usize },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SelectBranch<'hir> {
+    scope: ScopeId,
+    pat: Pat<'hir>,
+    expr: Expr<'hir>,
+    body: &'hir hir::Expr<'hir>,
+}
+
+impl<'hir> SelectBranch<'hir> {
+    pub(crate) fn new(
+        scope: ScopeId,
+        pat: Pat<'hir>,
+        expr: Expr<'hir>,
+        body: &'hir hir::Expr<'hir>,
+    ) -> Self {
+        Self {
+            scope,
+            pat,
+            expr,
+            body,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1178,6 +1198,86 @@ fn compile_expr_binary<'hir>(
 
         Ok(ExprOutcome::Output(output))
     }
+}
+
+/// Compile a select statement.
+#[instrument]
+fn compile_expr_select<'hir>(
+    cx: &mut Ctxt<'_, 'hir>,
+    branches: &[SelectBranch<'hir>],
+    default_branch: Option<&'hir hir::Expr<'hir>>,
+    output: Option<AssemblyAddress>,
+) -> Result<ExprOutcome> {
+    let output = cx.alloc_or(output);
+    let branch_output = cx.scopes.alloc();
+
+    let start = cx.new_label("select_start");
+    let end = cx.new_label("select_end");
+    let default_label = cx.new_label("select_default");
+
+    let address = cx.array(branches.iter().map(|b| b.expr))?.free(cx)?;
+
+    cx.push(Inst::Select {
+        address,
+        count: branches.len(),
+        output: *output,
+        branch_output,
+    });
+
+    let mut labels = Vec::new();
+
+    for _ in branches {
+        labels.push(cx.new_label("select_branch"));
+    }
+
+    cx.push(Inst::Jump {
+        label: default_label,
+    });
+
+    for (branch, label) in branches.iter().zip(labels.iter().copied()) {
+        cx.label(label);
+
+        let branch_expr = cx.expr(ExprKind::Address {
+            address: *output,
+            binding: None,
+        });
+
+        cx.with_scope(branch.scope, |cx| {
+            let _ = branch.pat.bind(cx, branch_expr)?.compile(cx, start)?;
+            assemble_expr_value(cx, branch.body)?.compile(cx, Some(*output))?;
+            Ok(())
+        })?;
+
+        cx.push(Inst::Jump { label: end });
+        cx.scopes.pop(cx.span, branch.scope)?;
+    }
+
+    if let Some(hir) = default_branch {
+        assemble_expr_value(cx, hir)?.compile(cx, Some(*output))?;
+    }
+
+    cx.label(end)?;
+    Ok(ExprOutcome::Output(output))
+}
+
+/// Compile a string concat expression.
+#[instrument]
+fn compile_string_concat<'hir>(
+    cx: &mut Ctxt<'_, 'hir>,
+    exprs: &[Expr<'hir>],
+    output: Option<AssemblyAddress>,
+) -> Result<ExprOutcome> {
+    let output = cx.alloc_or(output);
+    let address = cx.array(exprs.iter().copied())?.free(cx)?;
+
+    cx.push(Inst::StringConcat {
+        address,
+        count: exprs.len(),
+        size_hint: 0,
+        output: *output,
+    });
+
+    Ok(ExprOutcome::Output(output))
 }
 
 /// Compile a break expression.
@@ -1518,7 +1618,7 @@ fn compile_expr_call_hash<'hir>(
     output: Option<AssemblyAddress>,
 ) -> Result<ExprOutcome> {
     let output = cx.alloc_or(output);
-    let address = cx.array(args)?.free(cx)?;
+    let address = cx.array(args.iter().copied())?.free(cx)?;
 
     cx.push(Inst::Call {
         hash,

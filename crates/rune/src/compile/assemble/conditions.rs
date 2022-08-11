@@ -1,8 +1,8 @@
 use crate::arena::AllocIter;
 use crate::ast::Span;
 use crate::compile::assemble::{
-    arena_error, arena_slice_write_error, assemble_block, assemble_expr_value, assemble_pat,
-    BoundPat, Ctxt, Expr, ExprKind, PatKind, Result,
+    arena_error, arena_slice_write_error, assemble_expr_value, assemble_pat, Ctxt, Expr, ExprKind,
+    Pat, PatKind, Result,
 };
 use crate::hir;
 use crate::runtime::InstValue;
@@ -10,8 +10,9 @@ use crate::runtime::InstValue;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ConditionBranch<'hir> {
     pub(crate) span: Span,
-    pub(crate) pat: BoundPat<'hir>,
-    pub(crate) body: Expr<'hir>,
+    pub(crate) pat: Pat<'hir>,
+    pub(crate) condition: Expr<'hir>,
+    pub(crate) body: hir::Block<'hir>,
 }
 
 pub(crate) struct Conditions<'hir> {
@@ -63,18 +64,11 @@ impl<'hir> Conditions<'hir> {
             }
         };
 
-        let scope = cx.scopes.push_branch(cx.span, Some(cx.scope))?;
-
-        let (pat, body) = cx.with_scope(scope, |cx| {
-            let pat = cx.with_span(condition.span, |cx| pat.bind(cx, condition))?;
-            let body = assemble_block(cx, body)?.free_scope();
-            Ok((pat, body))
-        })?;
-
         let branch = ConditionBranch {
             span: body.span,
             pat,
-            body,
+            condition,
+            body: *body,
         };
 
         self.branches

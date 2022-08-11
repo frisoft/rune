@@ -882,26 +882,31 @@ fn compile_expr_conditions<'hir>(
         while let Some(branch) = it.next() {
             let first = mem::take(&mut first);
 
-            let (pat_outcome, expr_outcome) = cx.with_span(branch.span, |cx| {
-                let label = if it.peek().is_none() {
-                    end
-                } else {
-                    cx.new_label("condition_branch_end")
-                };
+            let scope = cx.scopes.push_branch(cx.span, Some(cx.scope))?;
 
-                let pat_outcome = branch.pat.compile(cx, label)?;
-                let expr_outcome =
-                    cx.with_state_checkpoint(|cx| branch.body.compile(cx, Some(output)))?;
+            let (pat_outcome, expr_outcome) = cx.with_scope(scope, |cx| {
+                cx.with_span(branch.span, |cx| {
+                    let label = if it.peek().is_none() {
+                        end
+                    } else {
+                        cx.new_label("condition_branch_end")
+                    };
 
-                if matches!(pat_outcome, PatOutcome::Refutable) && end != label {
-                    cx.push(Inst::Jump { label: end });
-                }
+                    let pat_outcome = branch.pat.bind(cx, branch.condition)?.compile(cx, label)?;
+                    let expr_outcome = cx.with_state_checkpoint(|cx| {
+                        assemble_block(cx, &branch.body)?.compile(cx, Some(output))
+                    })?;
 
-                if label != end {
-                    cx.label(label)?;
-                }
+                    if matches!(pat_outcome, PatOutcome::Refutable) && end != label {
+                        cx.push(Inst::Jump { label: end });
+                    }
 
-                Ok((pat_outcome, expr_outcome))
+                    if label != end {
+                        cx.label(label)?;
+                    }
+
+                    Ok((pat_outcome, expr_outcome))
+                })
             })?;
 
             if let PatOutcome::Irrefutable = pat_outcome {
@@ -920,6 +925,7 @@ fn compile_expr_conditions<'hir>(
             }
 
             expr_outcome.free(cx)?;
+            cx.scopes.pop(cx.span, scope)?;
         }
 
         cx.label(end)?;
@@ -955,41 +961,54 @@ fn compile_expr_matches<'hir>(
         while let Some(branch) = it.next() {
             let first = mem::take(&mut first);
 
+            let scope = cx.scopes.push_branch(cx.span, Some(cx.scope))?;
+
             let (pat_outcome, expr_outcome) = cx.with_span(branch.span, |cx| {
-                let label = if it.peek().is_none() {
-                    end
-                } else {
-                    cx.new_label("match_branch_end")
-                };
+                cx.with_scope(scope, |cx| {
+                    let label = if it.peek().is_none() {
+                        end
+                    } else {
+                        cx.new_label("match_branch_end")
+                    };
 
-                let mut pat_outcome = branch.pat.compile(cx, label)?;
-                let expr_outcome = branch.condition.compile(cx, None)?;
-
-                if let ExprOutcome::Output(address) = expr_outcome {
-                    cx.push(Inst::JumpIfNot {
-                        address: *address,
-                        label,
+                    let branch_expr = cx.expr(ExprKind::Address {
+                        binding: None,
+                        address: branch.address,
                     });
-                    pat_outcome = PatOutcome::Refutable;
-                }
 
-                expr_outcome.free(cx)?;
+                    let mut pat_outcome = branch.pat.bind(cx, branch_expr)?.compile(cx, label)?;
 
-                let expr_outcome = cx.with_state_checkpoint(|cx| {
-                    let expr_outcome = branch.body.compile(cx, Some(output))?;
+                    let condition = assemble_expr_value(cx, &branch.condition)?;
+                    let body = assemble_expr_value(cx, &branch.body)?;
 
-                    if matches!(pat_outcome, PatOutcome::Refutable) && end != label {
-                        cx.push(Inst::Jump { label: end });
+                    let expr_outcome = condition.compile(cx, None)?;
+
+                    if let ExprOutcome::Output(address) = expr_outcome {
+                        cx.push(Inst::JumpIfNot {
+                            address: *address,
+                            label,
+                        });
+                        pat_outcome = PatOutcome::Refutable;
                     }
 
-                    Ok(expr_outcome)
-                })?;
+                    expr_outcome.free(cx)?;
 
-                if label != end {
-                    cx.label(label)?;
-                }
+                    let expr_outcome = cx.with_state_checkpoint(|cx| {
+                        let expr_outcome = body.compile(cx, Some(output))?;
 
-                Ok((pat_outcome, expr_outcome))
+                        if matches!(pat_outcome, PatOutcome::Refutable) && end != label {
+                            cx.push(Inst::Jump { label: end });
+                        }
+
+                        Ok(expr_outcome)
+                    })?;
+
+                    if label != end {
+                        cx.label(label)?;
+                    }
+
+                    Ok((pat_outcome, expr_outcome))
+                })
             })?;
 
             if let PatOutcome::Irrefutable = pat_outcome {
@@ -1006,6 +1025,9 @@ fn compile_expr_matches<'hir>(
                     checkpoint = None;
                 }
             }
+
+            expr_outcome.free(cx)?;
+            cx.scopes.pop(branch.span, scope)?;
         }
 
         cx.label(end)?;

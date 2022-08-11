@@ -104,6 +104,13 @@ pub(crate) enum Needs {
     Type,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum AllocKind {
+    Temporary,
+    Allocated,
+    Array(usize),
+}
+
 /// An allocated address that might've been allocated. It has to be freed.
 #[derive(Debug, Clone, Copy)]
 #[must_use]
@@ -112,7 +119,7 @@ pub(crate) struct MaybeAlloc {
     address: AssemblyAddress,
     /// Indicates if the address is temporary or not. If it is, the receiver
     /// must free it.
-    allocated: bool,
+    kind: AllocKind,
 }
 
 impl MaybeAlloc {
@@ -120,7 +127,7 @@ impl MaybeAlloc {
     pub(crate) fn temporary(address: AssemblyAddress) -> Self {
         Self {
             address,
-            allocated: false,
+            kind: AllocKind::Temporary,
         }
     }
 
@@ -128,17 +135,31 @@ impl MaybeAlloc {
     pub(crate) fn allocated(address: AssemblyAddress) -> Self {
         Self {
             address,
-            allocated: true,
+            kind: AllocKind::Allocated,
+        }
+    }
+
+    /// Construct an array address.
+    pub(crate) fn array(address: AssemblyAddress, len: usize) -> Self {
+        Self {
+            address,
+            kind: AllocKind::Array(len),
         }
     }
 
     /// Free the address.
-    fn free(self, cx: &mut Ctxt<'_, '_>) -> Result<()> {
-        if self.allocated {
-            cx.scopes.free(cx.span, self.address)?;
+    fn free(self, cx: &mut Ctxt<'_, '_>) -> Result<AssemblyAddress> {
+        match self.kind {
+            AllocKind::Temporary => {}
+            AllocKind::Allocated => {
+                cx.scopes.free(cx.span, self.address)?;
+            }
+            AllocKind::Array(len) => {
+                cx.scopes.free_array(cx.span, len)?;
+            }
         }
 
-        Ok(())
+        Ok(self.address)
     }
 }
 
@@ -418,10 +439,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     }
 
     /// Allocate space for the specified array.
-    fn array<T, O>(&mut self, array: &[Expr<'hir>], op: T) -> Result<O>
-    where
-        T: FnOnce(&mut Self, AssemblyAddress, usize) -> Result<O>,
-    {
+    fn array(&mut self, array: &[Expr<'hir>]) -> Result<MaybeAlloc> {
         let address = self.scopes.array_index();
 
         for &hir in array {
@@ -430,29 +448,27 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
             self.scopes.alloc_array_item();
         }
 
-        let output = op(self, address, array.len())?;
-        self.scopes.free_array(self.span, array.len())?;
-        Ok(output)
+        Ok(MaybeAlloc::array(address, array.len()))
     }
 
     /// Process a maybe addres into a real address, allocating it if necessary.
-    fn alloc_or<T>(&mut self, address: Option<AssemblyAddress>, op: T) -> Result<MaybeAlloc>
-    where
-        T: FnOnce(&mut Self, AssemblyAddress) -> Result<()>,
-    {
-        let address = match address {
-            Some(address) => MaybeAlloc {
-                address,
-                allocated: false,
-            },
-            None => MaybeAlloc {
-                address: self.scopes.alloc(),
-                allocated: true,
-            },
-        };
+    fn alloc_or(&mut self, address: Option<AssemblyAddress>) -> MaybeAlloc {
+        match address {
+            Some(address) => MaybeAlloc::temporary(address),
+            None => MaybeAlloc::allocated(self.scopes.alloc()),
+        }
+    }
 
-        op(self, address.address)?;
-        Ok(address)
+    /// Free all addresses given.
+    fn free_iter<I>(&mut self, addresses: I) -> Result<()>
+    where
+        I: IntoIterator<Item = MaybeAlloc>,
+    {
+        for address in addresses {
+            address.free(self)?;
+        }
+
+        Ok(())
     }
 
     /// Attempt to allocate a collection of expressions to a collection addresses
@@ -461,37 +477,30 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     /// The caller can also specify `tmp` as a collection of "temporary variables"
     /// that are available for use. Note that this is typically specified as the
     /// output address of an operation.
-    fn addresses<const N: usize, I, T, O>(
+    fn addresses<const N: usize, I>(
         &mut self,
         exprs: [Expr<'hir>; N],
         tmp: I,
-        op: T,
-    ) -> Result<O>
+    ) -> Result<[MaybeAlloc; N]>
     where
         I: IntoIterator<Item = AssemblyAddress>,
-        T: FnOnce(&mut Ctxt<'_, 'hir>, [AssemblyAddress; N]) -> Result<O>,
     {
         let mut used = HashSet::new();
         let mut tmp = tmp.into_iter();
 
         let mut spans = [Span::empty(); N];
-        let mut out = [mem::MaybeUninit::<AssemblyAddress>::uninit(); N];
+        let mut out = [mem::MaybeUninit::<MaybeAlloc>::uninit(); N];
         let mut outcomes = Vec::with_capacity(N);
 
         for ((expr, out), span) in exprs.into_iter().zip(&mut out).zip(&mut spans) {
             *span = expr.span;
             let (address, outcome) = one_address(expr, self, &mut tmp, &mut used)?;
-            out.write(address);
+            out.write(MaybeAlloc::allocated(address));
             outcomes.push(outcome);
         }
 
         // SAFETY: we just initialized the array above.
-        let out = unsafe { array_assume_init(out) };
-        let output = op(self, out)?;
-
-        for (span, address) in spans.into_iter().zip(out) {
-            self.scopes.free(span, address)?;
-        }
+        let output = unsafe { array_assume_init(out) };
 
         for outcome in outcomes {
             outcome.free(self)?;

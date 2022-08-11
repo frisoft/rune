@@ -127,46 +127,43 @@ impl<'hir> Expr<'hir> {
     ) -> Result<ExprOutcome> {
         let outcome = match self.kind {
             ExprKind::Function { hash } => {
-                let output = cx.alloc_or(output, |cx, output| {
-                    cx.push(Inst::LoadFn { hash, output });
-                    Ok(())
-                })?;
-
+                let output = cx.alloc_or(output);
+                cx.push(Inst::LoadFn {
+                    hash,
+                    output: *output,
+                });
                 ExprOutcome::Output(output)
             }
             ExprKind::Closure { hash, captures } => {
-                let output = cx.alloc_or(output, |cx, output| {
-                    cx.array(captures, |cx, address, count| {
-                        cx.push(Inst::Closure {
-                            hash,
-                            address,
-                            count,
-                            output,
-                        });
-                        Ok(())
-                    })
-                })?;
+                let output = cx.alloc_or(output);
+                let address = cx.array(captures)?.free(cx)?;
+
+                cx.push(Inst::Closure {
+                    hash,
+                    address,
+                    count: captures.len(),
+                    output: *output,
+                });
 
                 ExprOutcome::Output(output)
             }
             ExprKind::Empty => ExprOutcome::Empty,
             ExprKind::Return { expr } => {
-                let output = cx.alloc_or(output, |cx, output| {
-                    match expr.kind {
-                        ExprKind::Store {
-                            value: InstValue::Unit,
-                        } => {
-                            cx.push(Inst::ReturnUnit);
-                            expr.scope.free(cx)?;
-                        }
-                        _ => cx.addresses([*expr], [output], |cx, [address]| {
-                            cx.push(Inst::Return { address });
-                            Ok(())
-                        })?,
-                    }
+                let output = cx.alloc_or(output);
 
-                    Ok(())
-                })?;
+                match expr.kind {
+                    ExprKind::Store {
+                        value: InstValue::Unit,
+                    } => {
+                        cx.push(Inst::ReturnUnit);
+                        expr.scope.free(cx)?;
+                    }
+                    _ => {
+                        let [address] = cx.addresses([*expr], [*output])?;
+                        cx.push(Inst::Return { address: *address });
+                        cx.free_iter([address])?;
+                    }
+                }
 
                 output.free(cx)?;
                 ExprOutcome::Unreachable
@@ -195,376 +192,390 @@ impl<'hir> Expr<'hir> {
                     }
                 }
 
-                let address = cx.alloc_or(output, |cx, output| {
-                    let comment = match &binding {
-                        Some(binding) => {
-                            let name = cx.scopes.name(cx.span, binding.name)?;
-                            format!("copy `{}` (scope: {:?})", name, binding.scope)
-                        }
-                        None => format!("copy from anonymous binding"),
-                    };
+                let output = cx.alloc_or(output);
 
-                    cx.push_with_comment(Inst::Copy { address, output }, comment);
-                    Ok(())
-                })?;
+                let comment = match &binding {
+                    Some(binding) => {
+                        let name = cx.scopes.name(cx.span, binding.name)?;
+                        format!("copy `{}` (scope: {:?})", name, binding.scope)
+                    }
+                    None => format!("copy from anonymous binding"),
+                };
 
-                ExprOutcome::Output(address)
+                cx.push_with_comment(
+                    Inst::Copy {
+                        address,
+                        output: *output,
+                    },
+                    comment,
+                );
+                ExprOutcome::Output(output)
             }
             ExprKind::Option { value } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    let variant = match value {
-                        Some(&value) => {
-                            value.compile(cx, Some(output))?.free(cx)?;
-                            InstVariant::Some
-                        }
-                        None => InstVariant::None,
-                    };
+                let output = cx.alloc_or(output);
 
-                    cx.push(Inst::Variant {
-                        address: output,
-                        variant,
-                        output,
-                    });
-                    Ok(())
-                })?;
+                let variant = match value {
+                    Some(&value) => {
+                        value.compile(cx, Some(*output))?.free(cx)?;
+                        InstVariant::Some
+                    }
+                    None => InstVariant::None,
+                };
 
-                ExprOutcome::Output(address)
+                cx.push(Inst::Variant {
+                    address: *output,
+                    variant,
+                    output: *output,
+                });
+
+                ExprOutcome::Output(output)
             }
             ExprKind::Yield { expr } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    match expr {
-                        Some(expr) => {
-                            cx.addresses([*expr], [output], |cx, [address]| {
-                                cx.push(Inst::Yield { address, output });
-                                Ok(())
-                            })?;
-                        }
-                        None => {
-                            cx.push(Inst::YieldUnit { output });
-                        }
+                let output = cx.alloc_or(output);
+
+                match expr {
+                    Some(expr) => {
+                        let [address] = cx.addresses([*expr], [*output])?;
+
+                        cx.push(Inst::Yield {
+                            address: *address,
+                            output: *output,
+                        });
+
+                        cx.free_iter([address])?;
                     }
+                    None => {
+                        cx.push(Inst::YieldUnit { output: *output });
+                    }
+                }
 
-                    Ok(())
-                })?;
-
-                ExprOutcome::Output(address)
+                ExprOutcome::Output(output)
             }
             ExprKind::Await { expr } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.addresses([*expr], [output], |cx, [address]| {
-                        cx.push(Inst::Await { address, output });
-                        Ok(())
-                    })
-                })?;
+                let output = cx.alloc_or(output);
+                let [address] = cx.addresses([*expr], [*output])?;
 
-                ExprOutcome::Output(address)
+                cx.push(Inst::Await {
+                    address: *address,
+                    output: *output,
+                });
+
+                cx.free_iter([address])?;
+                ExprOutcome::Output(output)
             }
             ExprKind::Try { expr } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.addresses([*expr], [output], |cx, [address]| {
-                        cx.push(Inst::Try { address, output });
-                        Ok(())
-                    })
-                })?;
-
-                ExprOutcome::Output(address)
+                let output = cx.alloc_or(output);
+                let [address] = cx.addresses([*expr], [*output])?;
+                cx.push(Inst::Try {
+                    address: *address,
+                    output: *output,
+                });
+                cx.free_iter([address])?;
+                ExprOutcome::Output(output)
             }
             ExprKind::Store { value } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.push(Inst::Store { value, output });
-                    Ok(())
-                })?;
-
-                ExprOutcome::Output(address)
+                let output = cx.alloc_or(output);
+                cx.push(Inst::Store {
+                    value,
+                    output: *output,
+                });
+                ExprOutcome::Output(output)
             }
             ExprKind::String { string } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    let slot = cx.q.unit.new_static_string(cx.span, string)?;
-                    cx.push(Inst::String { slot, output });
-                    Ok(())
-                })?;
-
-                ExprOutcome::Output(address)
+                let output = cx.alloc_or(output);
+                let slot = cx.q.unit.new_static_string(cx.span, string)?;
+                cx.push(Inst::String {
+                    slot,
+                    output: *output,
+                });
+                ExprOutcome::Output(output)
             }
             ExprKind::Bytes { bytes } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    let slot = cx.q.unit.new_static_bytes(cx.span, bytes)?;
-                    cx.push(Inst::Bytes { slot, output });
-                    Ok(())
-                })?;
-
-                ExprOutcome::Output(address)
+                let output = cx.alloc_or(output);
+                let slot = cx.q.unit.new_static_bytes(cx.span, bytes)?;
+                cx.push(Inst::Bytes {
+                    slot,
+                    output: *output,
+                });
+                ExprOutcome::Output(output)
             }
             ExprKind::Vec { items: args } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.array(args, |cx, address, count| {
-                        cx.push(Inst::Vec {
-                            address,
-                            count,
-                            output,
-                        });
-                        Ok(())
-                    })
-                })?;
+                let output = cx.alloc_or(output);
+                let address = cx.array(args)?.free(cx)?;
 
-                ExprOutcome::Output(address)
+                cx.push(Inst::Vec {
+                    address,
+                    count: args.len(),
+                    output: *output,
+                });
+
+                ExprOutcome::Output(output)
             }
             ExprKind::Tuple { items: args } => {
-                let output = cx.alloc_or(output, |cx, output| match args {
-                    &[a] => cx.addresses([a], [output], |cx, [a]| {
-                        cx.push(Inst::Tuple1 { args: [a], output });
-                        Ok(())
-                    }),
-                    &[a, b] => cx.addresses([a, b], [output], |cx, [a, b]| {
+                let output = cx.alloc_or(output);
+
+                match args {
+                    &[a] => {
+                        let [a] = cx.addresses([a], [*output])?;
+
+                        cx.push(Inst::Tuple1 {
+                            args: [*a],
+                            output: *output,
+                        });
+
+                        cx.free_iter([a])?;
+                    }
+                    &[a, b] => {
+                        let [a, b] = cx.addresses([a, b], [*output])?;
+
                         cx.push(Inst::Tuple2 {
-                            args: [a, b],
-                            output,
+                            args: [*a, *b],
+                            output: *output,
                         });
-                        Ok(())
-                    }),
-                    &[a, b, c] => cx.addresses([a, b, c], [output], |cx, [a, b, c]| {
+
+                        cx.free_iter([a, b])?;
+                    }
+                    &[a, b, c] => {
+                        let [a, b, c] = cx.addresses([a, b, c], [*output])?;
+
                         cx.push(Inst::Tuple3 {
-                            args: [a, b, c],
-                            output,
+                            args: [*a, *b, *c],
+                            output: *output,
                         });
-                        Ok(())
-                    }),
-                    &[a, b, c, d] => cx.addresses([a, b, c, d], [output], |cx, [a, b, c, d]| {
+
+                        cx.free_iter([a, b, c])?;
+                    }
+                    &[a, b, c, d] => {
+                        let [a, b, c, d] = cx.addresses([a, b, c, d], [*output])?;
+
                         cx.push(Inst::Tuple4 {
-                            args: [a, b, c, d],
-                            output,
+                            args: [*a, *b, *c, *d],
+                            output: *output,
                         });
-                        Ok(())
-                    }),
-                    args => cx.array(args, |cx, address, count| {
+
+                        cx.free_iter([a, b, c, d])?;
+                    }
+                    args => {
+                        let address = cx.array(args)?.free(cx)?;
+
                         cx.push(Inst::Tuple {
                             address,
-                            count,
-                            output,
+                            count: args.len(),
+                            output: *output,
                         });
-                        Ok(())
-                    }),
-                })?;
+                    }
+                }
 
                 ExprOutcome::Output(output)
             }
             ExprKind::AssignStructField { lhs, slot, rhs } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.addresses([*lhs, *rhs], [output], |cx, [address, value]| {
-                        cx.push(Inst::ObjectIndexSet {
-                            address,
-                            value,
-                            slot,
-                            output,
-                        });
-                        Ok(())
-                    })
-                })?;
+                let output = cx.alloc_or(output);
+                let [address, value] = cx.addresses([*lhs, *rhs], [*output])?;
 
-                ExprOutcome::Output(address)
+                cx.push(Inst::ObjectIndexSet {
+                    address: *address,
+                    value: *value,
+                    slot,
+                    output: *output,
+                });
+
+                cx.free_iter([address, value])?;
+                ExprOutcome::Output(output)
             }
             ExprKind::AssignTupleField { lhs, index, rhs } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.addresses([*lhs, *rhs], [output], |cx, [address, value]| {
-                        cx.push(Inst::TupleIndexSet {
-                            address,
-                            value,
-                            index,
-                            output,
-                        });
-                        Ok(())
-                    })
-                })?;
+                let output = cx.alloc_or(output);
+                let [address, value] = cx.addresses([*lhs, *rhs], [*output])?;
 
-                ExprOutcome::Output(address)
+                cx.push(Inst::TupleIndexSet {
+                    address: *address,
+                    value: *value,
+                    index,
+                    output: *output,
+                });
+
+                cx.free_iter([address, value])?;
+                ExprOutcome::Output(output)
             }
             ExprKind::Meta { meta, needs, named } => {
                 compile_expr_meta(cx, meta, needs, named, output)?
             }
             ExprKind::Unary { op, expr } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.addresses([*expr], [output], |cx, [address]| {
-                        match op {
-                            ExprUnOp::Neg => {
-                                cx.push(Inst::Neg { address, output });
-                            }
-                            ExprUnOp::Not => {
-                                cx.push(Inst::Not { address, output });
-                            }
-                        }
+                let output = cx.alloc_or(output);
+                let [address] = cx.addresses([*expr], [*output])?;
 
-                        Ok(())
-                    })
-                })?;
-                ExprOutcome::Output(address)
+                match op {
+                    ExprUnOp::Neg => {
+                        cx.push(Inst::Neg {
+                            address: *address,
+                            output: *output,
+                        });
+                    }
+                    ExprUnOp::Not => {
+                        cx.push(Inst::Not {
+                            address: *address,
+                            output: *output,
+                        });
+                    }
+                }
+
+                cx.free_iter([address])?;
+                ExprOutcome::Output(output)
             }
             ExprKind::Binary { lhs, op, rhs } => compile_expr_binary(cx, lhs, op, rhs, output)?,
             ExprKind::Loop { hir } => compile_expr_loop(cx, hir, output)?,
             ExprKind::TupleFieldAccess { lhs, index } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.addresses([*lhs], [output], |cx, [address]| {
-                        cx.push(Inst::TupleIndexGet {
-                            address,
-                            index,
-                            output,
-                        });
+                let output = cx.alloc_or(output);
+                let [address] = cx.addresses([*lhs], [*output])?;
 
-                        Ok(())
-                    })
-                })?;
+                cx.push(Inst::TupleIndexGet {
+                    address: *address,
+                    index,
+                    output: *output,
+                });
 
-                ExprOutcome::Output(address)
+                cx.free_iter([address])?;
+                ExprOutcome::Output(output)
             }
             ExprKind::StructFieldAccess { lhs, slot, .. } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.addresses([*lhs], [output], |cx, [address]| {
-                        cx.push(Inst::ObjectIndexGet {
-                            address,
-                            slot,
-                            output,
-                        });
-                        Ok(())
-                    })
-                })?;
+                let output = cx.alloc_or(output);
+                let [address] = cx.addresses([*lhs], [*output])?;
 
-                ExprOutcome::Output(address)
+                cx.push(Inst::ObjectIndexGet {
+                    address: *address,
+                    slot,
+                    output: *output,
+                });
+
+                cx.free_iter([address])?;
+                ExprOutcome::Output(output)
             }
             ExprKind::CallAddress {
                 address: function,
                 args,
             } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.array(args, |cx, address, count| {
-                        cx.push(Inst::CallFn {
-                            function,
-                            address,
-                            count,
-                            output,
-                        });
-                        Ok(())
-                    })
-                })?;
+                let output = cx.alloc_or(output);
+                let address = cx.array(args)?.free(cx)?;
 
-                ExprOutcome::Output(address)
+                cx.push(Inst::CallFn {
+                    function,
+                    address,
+                    count: args.len(),
+                    output: *output,
+                });
+
+                ExprOutcome::Output(output)
             }
             ExprKind::CallHash { hash, args } => compile_expr_call_hash(cx, hash, args, output)?,
             ExprKind::CallInstance { lhs, hash, args } => {
                 compile_expr_call_instance(cx, lhs, hash, args, output)?
             }
             ExprKind::CallExpr { expr, args } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    expr.compile(cx, Some(output))?.free(cx)?;
+                let output = cx.alloc_or(output);
+                expr.compile(cx, Some(*output))?.free(cx)?;
+                let address = cx.array(args)?.free(cx)?;
 
-                    cx.array(args, |cx, address, count| {
-                        cx.push(Inst::CallFn {
-                            function: output,
-                            address,
-                            count,
-                            output,
-                        });
-                        Ok(())
-                    })
-                })?;
+                cx.push(Inst::CallFn {
+                    function: *output,
+                    address,
+                    count: args.len(),
+                    output: *output,
+                });
 
-                ExprOutcome::Output(address)
+                ExprOutcome::Output(output)
             }
             ExprKind::StructFieldAccessGeneric { .. } => {
                 return Err(cx.error(CompileErrorKind::ExpectedExpr));
             }
             ExprKind::Index { target, index } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.addresses([*target, *index], [output], |cx, [address, index]| {
-                        cx.push(Inst::IndexGet {
-                            address,
-                            index,
-                            output,
-                        });
-                        Ok(())
-                    })
-                })?;
+                let output = cx.alloc_or(output);
+                let [address, index] = cx.addresses([*target, *index], [*output])?;
 
-                ExprOutcome::Output(address)
+                cx.push(Inst::IndexGet {
+                    address: *address,
+                    index: *index,
+                    output: *output,
+                });
+
+                cx.free_iter([address, index])?;
+                ExprOutcome::Output(output)
             }
             ExprKind::Struct { kind, exprs } => {
-                let output = cx.alloc_or(output, |cx, output| {
-                    cx.array(exprs, |cx, address, _| {
-                        match kind {
-                            ExprStructKind::Anonymous { slot } => {
-                                cx.push(Inst::Object {
-                                    address,
-                                    slot,
-                                    output,
-                                });
-                            }
-                            ExprStructKind::Unit { hash } => {
-                                cx.push(Inst::UnitStruct { hash, output });
-                            }
-                            ExprStructKind::Struct { hash, slot } => {
-                                cx.push(Inst::Struct {
-                                    hash,
-                                    address,
-                                    slot,
-                                    output,
-                                });
-                            }
-                            ExprStructKind::StructVariant { hash, slot } => {
-                                cx.push(Inst::StructVariant {
-                                    hash,
-                                    address,
-                                    slot,
-                                    output,
-                                });
-                            }
-                        }
+                let output = cx.alloc_or(output);
+                let address = cx.array(exprs)?.free(cx)?;
 
-                        Ok(())
-                    })
-                })?;
+                match kind {
+                    ExprStructKind::Anonymous { slot } => {
+                        cx.push(Inst::Object {
+                            address,
+                            slot,
+                            output: *output,
+                        });
+                    }
+                    ExprStructKind::Unit { hash } => {
+                        cx.push(Inst::UnitStruct {
+                            hash,
+                            output: *output,
+                        });
+                    }
+                    ExprStructKind::Struct { hash, slot } => {
+                        cx.push(Inst::Struct {
+                            hash,
+                            address,
+                            slot,
+                            output: *output,
+                        });
+                    }
+                    ExprStructKind::StructVariant { hash, slot } => {
+                        cx.push(Inst::StructVariant {
+                            hash,
+                            address,
+                            slot,
+                            output: *output,
+                        });
+                    }
+                }
 
                 ExprOutcome::Output(output)
             }
             ExprKind::Range { from, limits, to } => {
-                let output = cx.alloc_or(output, |cx, output| {
-                    cx.addresses([*from, *to], [output], |cx, [from, to]| {
-                        cx.push(Inst::Range {
-                            from,
-                            to,
-                            limits,
-                            output,
-                        });
-                        Ok(())
-                    })
-                })?;
+                let output = cx.alloc_or(output);
+                let [from, to] = cx.addresses([*from, *to], [*output])?;
+
+                cx.push(Inst::Range {
+                    from: *from,
+                    to: *to,
+                    limits,
+                    output: *output,
+                });
+
+                cx.free_iter([from, to])?;
                 ExprOutcome::Output(output)
             }
             ExprKind::StringConcat { exprs } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.array(exprs, |cx, address, count| {
-                        cx.push(Inst::StringConcat {
-                            address,
-                            count,
-                            size_hint: 0,
-                            output,
-                        });
-                        Ok(())
-                    })
-                })?;
+                let output = cx.alloc_or(output);
+                let address = cx.array(exprs)?.free(cx)?;
 
-                ExprOutcome::Output(address)
+                cx.push(Inst::StringConcat {
+                    address,
+                    count: exprs.len(),
+                    size_hint: 0,
+                    output: *output,
+                });
+
+                ExprOutcome::Output(output)
             }
             ExprKind::Format { spec, expr } => {
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.addresses([*expr], [output], |cx, [address]| {
-                        cx.push(Inst::Format {
-                            address,
-                            spec: *spec,
-                            output,
-                        });
-                        Ok(())
-                    })
-                })?;
+                let output = cx.alloc_or(output);
+                let [address] = cx.addresses([*expr], [*output])?;
 
-                ExprOutcome::Output(address)
+                cx.push(Inst::Format {
+                    address: *address,
+                    spec: *spec,
+                    output: *output,
+                });
+
+                cx.free_iter([address])?;
+                ExprOutcome::Output(output)
             }
             ExprKind::Break { value } => {
                 cx.with_scope(self.scope.id, |cx| compile_expr_break(cx, value))?
@@ -853,72 +864,69 @@ fn compile_expr_conditions<'hir>(
     branches: &'hir [ConditionBranch<'hir>],
     output: Option<AssemblyAddress>,
 ) -> Result<ExprOutcome> {
-    let address = cx.alloc_or(output, |cx, output| {
-        let end = cx.new_label("condition_end");
-        let mut checkpoint = Some(cx.state);
+    let output = cx.alloc_or(output);
+    let end = cx.new_label("condition_end");
+    let mut checkpoint = Some(cx.state);
 
-        let mut it = branches.iter().peekable();
-        let mut first = true;
+    let mut it = branches.iter().peekable();
+    let mut first = true;
 
-        while let Some(branch) = it.next() {
-            let first = mem::take(&mut first);
+    while let Some(branch) = it.next() {
+        let first = mem::take(&mut first);
 
-            let scope = cx.scopes.push_branch(cx.span, Some(cx.scope))?;
+        let scope = cx.scopes.push_branch(cx.span, Some(cx.scope))?;
 
-            let (pat_outcome, expr_outcome) = cx.with_scope(scope, |cx| {
-                cx.with_span(branch.span, |cx| {
-                    let label = if it.peek().is_none() {
-                        end
-                    } else {
-                        cx.new_label("condition_branch_end")
-                    };
+        let (pat_outcome, expr_outcome) = cx.with_scope(scope, |cx| {
+            cx.with_span(branch.span, |cx| {
+                let label = if it.peek().is_none() {
+                    end
+                } else {
+                    cx.new_label("condition_branch_end")
+                };
 
-                    let pat_outcome = branch.pat.bind(cx, branch.condition)?.compile(cx, label)?;
-                    let expr_outcome = cx.with_state_checkpoint(|cx| {
-                        assemble_block(cx, &branch.body)?.compile(cx, Some(output))
-                    })?;
+                let pat_outcome = branch.pat.bind(cx, branch.condition)?.compile(cx, label)?;
+                let expr_outcome = cx.with_state_checkpoint(|cx| {
+                    assemble_block(cx, &branch.body)?.compile(cx, Some(*output))
+                })?;
 
-                    if matches!(pat_outcome, PatOutcome::Refutable) && end != label {
-                        cx.push(Inst::Jump { label: end });
-                    }
-
-                    if label != end {
-                        cx.label(label)?;
-                    }
-
-                    Ok((pat_outcome, expr_outcome))
-                })
-            })?;
-
-            if let PatOutcome::Irrefutable = pat_outcome {
-                // NB: End label *might* be used, so before we mark as
-                // unreachable we need to provide it here since the last end
-                // label might otherwise be supressed.
-                cx.label(end)?;
-                cx.state = CtxtState::Unreachable { reported: false };
-
-                // If the *expression* was unreachable and this is the first
-                // (and only reachable) expression mark this control flow as
-                // unreachable as well.
-                if first && matches!(expr_outcome, ExprOutcome::Unreachable) {
-                    checkpoint = None;
+                if matches!(pat_outcome, PatOutcome::Refutable) && end != label {
+                    cx.push(Inst::Jump { label: end });
                 }
+
+                if label != end {
+                    cx.label(label)?;
+                }
+
+                Ok((pat_outcome, expr_outcome))
+            })
+        })?;
+
+        if let PatOutcome::Irrefutable = pat_outcome {
+            // NB: End label *might* be used, so before we mark as
+            // unreachable we need to provide it here since the last end
+            // label might otherwise be supressed.
+            cx.label(end)?;
+            cx.state = CtxtState::Unreachable { reported: false };
+
+            // If the *expression* was unreachable and this is the first
+            // (and only reachable) expression mark this control flow as
+            // unreachable as well.
+            if first && matches!(expr_outcome, ExprOutcome::Unreachable) {
+                checkpoint = None;
             }
-
-            expr_outcome.free(cx)?;
-            cx.scopes.pop(cx.span, scope)?;
         }
 
-        cx.label(end)?;
+        expr_outcome.free(cx)?;
+        cx.scopes.pop(cx.span, scope)?;
+    }
 
-        if let Some(state) = checkpoint {
-            cx.state = state;
-        }
+    cx.label(end)?;
 
-        Ok(())
-    })?;
+    if let Some(state) = checkpoint {
+        cx.state = state;
+    }
 
-    Ok(ExprOutcome::Output(address))
+    Ok(ExprOutcome::Output(output))
 }
 
 /// Compile a match expression.
@@ -930,101 +938,98 @@ fn compile_expr_matches<'hir>(
     branches: &'hir [MatchBranch<'hir>],
     output: Option<AssemblyAddress>,
 ) -> Result<ExprOutcome> {
-    let address = cx.alloc_or(output, |cx, output| {
-        let end = cx.new_label("match_end");
-        let mut checkpoint = Some(cx.state);
+    let output = cx.alloc_or(output);
+    let end = cx.new_label("match_end");
+    let mut checkpoint = Some(cx.state);
 
-        let mut it = branches.iter().peekable();
-        let mut first = true;
+    let mut it = branches.iter().peekable();
+    let mut first = true;
 
-        let match_expr_outcome = expr.compile(cx, Some(address))?;
+    let match_expr_outcome = expr.compile(cx, Some(address))?;
 
-        while let Some(branch) = it.next() {
-            let first = mem::take(&mut first);
+    while let Some(branch) = it.next() {
+        let first = mem::take(&mut first);
 
-            let scope = cx.scopes.push_branch(cx.span, Some(cx.scope))?;
+        let scope = cx.scopes.push_branch(cx.span, Some(cx.scope))?;
 
-            let (pat_outcome, expr_outcome) = cx.with_span(branch.span, |cx| {
-                cx.with_scope(scope, |cx| {
-                    let label = if it.peek().is_none() {
-                        end
-                    } else {
-                        cx.new_label("match_branch_end")
-                    };
+        let (pat_outcome, expr_outcome) = cx.with_span(branch.span, |cx| {
+            cx.with_scope(scope, |cx| {
+                let label = if it.peek().is_none() {
+                    end
+                } else {
+                    cx.new_label("match_branch_end")
+                };
 
-                    let branch_expr = cx.expr(ExprKind::Address {
-                        binding: None,
-                        address: branch.address,
+                let branch_expr = cx.expr(ExprKind::Address {
+                    binding: None,
+                    address: branch.address,
+                });
+
+                let mut pat_outcome = branch.pat.bind(cx, branch_expr)?.compile(cx, label)?;
+
+                let condition = assemble_expr_value(cx, &branch.condition)?;
+                let body = assemble_expr_value(cx, &branch.body)?;
+
+                let expr_outcome = condition.compile(cx, None)?;
+
+                if let ExprOutcome::Output(address) = expr_outcome {
+                    cx.push(Inst::JumpIfNot {
+                        address: *address,
+                        label,
                     });
-
-                    let mut pat_outcome = branch.pat.bind(cx, branch_expr)?.compile(cx, label)?;
-
-                    let condition = assemble_expr_value(cx, &branch.condition)?;
-                    let body = assemble_expr_value(cx, &branch.body)?;
-
-                    let expr_outcome = condition.compile(cx, None)?;
-
-                    if let ExprOutcome::Output(address) = expr_outcome {
-                        cx.push(Inst::JumpIfNot {
-                            address: *address,
-                            label,
-                        });
-                        pat_outcome = PatOutcome::Refutable;
-                    }
-
-                    expr_outcome.free(cx)?;
-
-                    let expr_outcome = cx.with_state_checkpoint(|cx| {
-                        let expr_outcome = body.compile(cx, Some(output))?;
-
-                        if matches!(pat_outcome, PatOutcome::Refutable) && end != label {
-                            cx.push(Inst::Jump { label: end });
-                        }
-
-                        Ok(expr_outcome)
-                    })?;
-
-                    if label != end {
-                        cx.label(label)?;
-                    }
-
-                    Ok((pat_outcome, expr_outcome))
-                })
-            })?;
-
-            if let PatOutcome::Irrefutable = pat_outcome {
-                // NB: End label *might* be used, so before we mark as
-                // unreachable we need to provide it here since the last end
-                // label might otherwise be supressed.
-                cx.label(end)?;
-                cx.state = CtxtState::Unreachable { reported: false };
-
-                // If the *expression* was unreachable and this is the first
-                // (and only reachable) expression mark this control flow as
-                // unreachable as well.
-                if first && matches!(expr_outcome, ExprOutcome::Unreachable) {
-                    checkpoint = None;
+                    pat_outcome = PatOutcome::Refutable;
                 }
+
+                expr_outcome.free(cx)?;
+
+                let expr_outcome = cx.with_state_checkpoint(|cx| {
+                    let expr_outcome = body.compile(cx, Some(*output))?;
+
+                    if matches!(pat_outcome, PatOutcome::Refutable) && end != label {
+                        cx.push(Inst::Jump { label: end });
+                    }
+
+                    Ok(expr_outcome)
+                })?;
+
+                if label != end {
+                    cx.label(label)?;
+                }
+
+                Ok((pat_outcome, expr_outcome))
+            })
+        })?;
+
+        if let PatOutcome::Irrefutable = pat_outcome {
+            // NB: End label *might* be used, so before we mark as
+            // unreachable we need to provide it here since the last end
+            // label might otherwise be supressed.
+            cx.label(end)?;
+            cx.state = CtxtState::Unreachable { reported: false };
+
+            // If the *expression* was unreachable and this is the first
+            // (and only reachable) expression mark this control flow as
+            // unreachable as well.
+            if first && matches!(expr_outcome, ExprOutcome::Unreachable) {
+                checkpoint = None;
             }
-
-            expr_outcome.free(cx)?;
-            cx.scopes.pop(branch.span, scope)?;
         }
 
-        cx.label(end)?;
+        expr_outcome.free(cx)?;
+        cx.scopes.pop(branch.span, scope)?;
+    }
 
-        if let Some(state) = checkpoint {
-            cx.state = state;
-        }
+    cx.label(end)?;
 
-        match_expr_outcome.free(cx)?;
-        // At this point, the match address is guaranteed to no longer be used
-        // since we've assembled all branches which reference it.
-        cx.scopes.free(cx.span, address)?;
-        Ok(())
-    })?;
+    if let Some(state) = checkpoint {
+        cx.state = state;
+    }
 
-    Ok(ExprOutcome::Output(address))
+    match_expr_outcome.free(cx)?;
+    // At this point, the match address is guaranteed to no longer be used
+    // since we've assembled all branches which reference it.
+    cx.scopes.free(cx.span, address)?;
+    Ok(ExprOutcome::Output(output))
 }
 
 /// Assembling of a binary expression.
@@ -1070,14 +1075,18 @@ fn compile_expr_binary<'hir>(
         }
     };
 
-    let address = cx.alloc_or(output, |cx, output| {
-        cx.addresses([*lhs, *rhs], [output], |cx, [a, b]| {
-            cx.push(Inst::Op { op, a, b, output });
-            Ok(())
-        })
-    })?;
+    let output = cx.alloc_or(output);
+    let [a, b] = cx.addresses([*lhs, *rhs], [*output])?;
 
-    return Ok(ExprOutcome::Output(address));
+    cx.push(Inst::Op {
+        op,
+        a: *a,
+        b: *b,
+        output: *output,
+    });
+
+    cx.free_iter([a, b])?;
+    return Ok(ExprOutcome::Output(output));
 
     fn compile_conditional_binop<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
@@ -1086,34 +1095,31 @@ fn compile_expr_binary<'hir>(
         op: ast::BinOp,
         output: Option<AssemblyAddress>,
     ) -> Result<ExprOutcome> {
-        let address = cx.alloc_or(output, |cx, output| {
-            let end_label = cx.new_label("conditional_end");
-            lhs.compile(cx, Some(output))?.free(cx)?;
+        let output = cx.alloc_or(output);
+        let end_label = cx.new_label("conditional_end");
+        lhs.compile(cx, Some(*output))?.free(cx)?;
 
-            match op {
-                ast::BinOp::And(..) => {
-                    cx.push(Inst::JumpIfNot {
-                        address: output,
-                        label: end_label,
-                    });
-                }
-                ast::BinOp::Or(..) => {
-                    cx.push(Inst::JumpIf {
-                        address: output,
-                        label: end_label,
-                    });
-                }
-                op => {
-                    return Err(cx.error(CompileErrorKind::UnsupportedBinaryOp { op }));
-                }
+        match op {
+            ast::BinOp::And(..) => {
+                cx.push(Inst::JumpIfNot {
+                    address: *output,
+                    label: end_label,
+                });
             }
+            ast::BinOp::Or(..) => {
+                cx.push(Inst::JumpIf {
+                    address: *output,
+                    label: end_label,
+                });
+            }
+            op => {
+                return Err(cx.error(CompileErrorKind::UnsupportedBinaryOp { op }));
+            }
+        }
 
-            rhs.compile(cx, Some(output))?.free(cx)?;
-            cx.label(end_label)?;
-            Ok(())
-        })?;
-
-        Ok(ExprOutcome::Output(address))
+        rhs.compile(cx, Some(*output))?.free(cx)?;
+        cx.label(end_label)?;
+        Ok(ExprOutcome::Output(output))
     }
 
     fn compile_assign_binop<'hir>(
@@ -1123,56 +1129,54 @@ fn compile_expr_binary<'hir>(
         op: ast::BinOp,
         output: Option<AssemblyAddress>,
     ) -> Result<ExprOutcome> {
-        let address = cx.alloc_or(output, |cx, output| {
-            let (lhs, rhs, target) = match lhs.kind {
-                ExprKind::Address { address, .. } => {
-                    rhs.compile(cx, Some(output))?.free(cx)?;
-                    (address, output, InstTarget::Offset)
-                }
-                _ => {
-                    return Err(cx.error(CompileErrorKind::UnsupportedBinaryExpr));
-                }
-            };
+        let output = cx.alloc_or(output);
 
-            let op = match op {
-                ast::BinOp::AddAssign(..) => InstAssignOp::Add,
-                ast::BinOp::SubAssign(..) => InstAssignOp::Sub,
-                ast::BinOp::MulAssign(..) => InstAssignOp::Mul,
-                ast::BinOp::DivAssign(..) => InstAssignOp::Div,
-                ast::BinOp::RemAssign(..) => InstAssignOp::Rem,
-                ast::BinOp::BitAndAssign(..) => InstAssignOp::BitAnd,
-                ast::BinOp::BitXorAssign(..) => InstAssignOp::BitXor,
-                ast::BinOp::BitOrAssign(..) => InstAssignOp::BitOr,
-                ast::BinOp::ShlAssign(..) => InstAssignOp::Shl,
-                ast::BinOp::ShrAssign(..) => InstAssignOp::Shr,
-                _ => {
-                    return Err(cx.error(CompileErrorKind::UnsupportedBinaryExpr));
-                }
-            };
+        let (lhs, target) = match lhs.kind {
+            ExprKind::Address { address, .. } => {
+                rhs.compile(cx, Some(*output))?.free(cx)?;
+                (address, InstTarget::Offset)
+            }
+            _ => {
+                return Err(cx.error(CompileErrorKind::UnsupportedBinaryExpr));
+            }
+        };
 
-            let output = cx.scopes.temporary();
+        let op = match op {
+            ast::BinOp::AddAssign(..) => InstAssignOp::Add,
+            ast::BinOp::SubAssign(..) => InstAssignOp::Sub,
+            ast::BinOp::MulAssign(..) => InstAssignOp::Mul,
+            ast::BinOp::DivAssign(..) => InstAssignOp::Div,
+            ast::BinOp::RemAssign(..) => InstAssignOp::Rem,
+            ast::BinOp::BitAndAssign(..) => InstAssignOp::BitAnd,
+            ast::BinOp::BitXorAssign(..) => InstAssignOp::BitXor,
+            ast::BinOp::BitOrAssign(..) => InstAssignOp::BitOr,
+            ast::BinOp::ShlAssign(..) => InstAssignOp::Shl,
+            ast::BinOp::ShrAssign(..) => InstAssignOp::Shr,
+            _ => {
+                return Err(cx.error(CompileErrorKind::UnsupportedBinaryExpr));
+            }
+        };
 
-            cx.push(Inst::Assign {
-                lhs,
-                rhs,
-                target,
-                op,
-                // NB: while an assign operation doesn't output anything, this
-                // might result in a call to an external function which expects
-                // to always have a writable address slot available, regardless
-                // of what it outputs. So we hand it a temporary slot, which is
-                // just an address on the stack which will probably immediately
-                // be used for something else.
-                //
-                // The virtual machine ensures that this address is cleared
-                // immediately after it's been called.
-                output,
-            });
+        let tmp = cx.scopes.temporary();
 
-            Ok(())
-        })?;
+        cx.push(Inst::Assign {
+            lhs,
+            rhs: *output,
+            target,
+            op,
+            // NB: while an assign operation doesn't output anything, this
+            // might result in a call to an external function which expects
+            // to always have a writable address slot available, regardless
+            // of what it outputs. So we hand it a temporary slot, which is
+            // just an address on the stack which will probably immediately
+            // be used for something else.
+            //
+            // The virtual machine ensures that this address is cleared
+            // immediately after it's been called.
+            output: tmp,
+        });
 
-        Ok(ExprOutcome::Output(address))
+        Ok(ExprOutcome::Output(output))
     }
 }
 
@@ -1383,20 +1387,19 @@ fn compile_expr_meta<'hir>(
             } => {
                 named.assert_not_generic()?;
 
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.push_with_comment(
-                        Inst::Call {
-                            hash: *type_hash,
-                            address: output,
-                            count: 0,
-                            output,
-                        },
-                        meta.info(cx.q.pool),
-                    );
-                    Ok(())
-                })?;
+                let output = cx.alloc_or(output);
 
-                ExprOutcome::Output(address)
+                cx.push_with_comment(
+                    Inst::Call {
+                        hash: *type_hash,
+                        address: *output,
+                        count: 0,
+                        output: *output,
+                    },
+                    meta.info(cx.q.pool),
+                );
+
+                ExprOutcome::Output(output)
             }
             PrivMetaKind::Variant {
                 variant: PrivVariantMeta::Tuple(tuple),
@@ -1408,20 +1411,19 @@ fn compile_expr_meta<'hir>(
             } if tuple.args == 0 => {
                 named.assert_not_generic()?;
 
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.push_with_comment(
-                        Inst::Call {
-                            hash: tuple.hash,
-                            address: output,
-                            count: 0,
-                            output,
-                        },
-                        meta.info(cx.q.pool),
-                    );
-                    Ok(())
-                })?;
+                let output = cx.alloc_or(output);
 
-                ExprOutcome::Output(address)
+                cx.push_with_comment(
+                    Inst::Call {
+                        hash: tuple.hash,
+                        address: *output,
+                        count: 0,
+                        output: *output,
+                    },
+                    meta.info(cx.q.pool),
+                );
+
+                ExprOutcome::Output(output)
             }
             PrivMetaKind::Struct {
                 variant: PrivVariantMeta::Tuple(tuple),
@@ -1429,18 +1431,15 @@ fn compile_expr_meta<'hir>(
             } => {
                 named.assert_not_generic()?;
 
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.push_with_comment(
-                        Inst::LoadFn {
-                            hash: tuple.hash,
-                            output,
-                        },
-                        meta.info(cx.q.pool),
-                    );
-                    Ok(())
-                })?;
-
-                ExprOutcome::Output(address)
+                let output = cx.alloc_or(output);
+                cx.push_with_comment(
+                    Inst::LoadFn {
+                        hash: tuple.hash,
+                        output: *output,
+                    },
+                    meta.info(cx.q.pool),
+                );
+                ExprOutcome::Output(output)
             }
             PrivMetaKind::Variant {
                 variant: PrivVariantMeta::Tuple(tuple),
@@ -1448,18 +1447,15 @@ fn compile_expr_meta<'hir>(
             } => {
                 named.assert_not_generic()?;
 
-                let address = cx.alloc_or(output, |cx, output| {
-                    cx.push_with_comment(
-                        Inst::LoadFn {
-                            hash: tuple.hash,
-                            output,
-                        },
-                        meta.info(cx.q.pool),
-                    );
-                    Ok(())
-                })?;
-
-                ExprOutcome::Output(address)
+                let output = cx.alloc_or(output);
+                cx.push_with_comment(
+                    Inst::LoadFn {
+                        hash: tuple.hash,
+                        output: *output,
+                    },
+                    meta.info(cx.q.pool),
+                );
+                ExprOutcome::Output(output)
             }
             PrivMetaKind::Function { type_hash, .. } => {
                 let hash = if let Some((span, generics)) = named.generics {
@@ -1469,11 +1465,14 @@ fn compile_expr_meta<'hir>(
                     *type_hash
                 };
 
-                let output = cx.alloc_or(output, |cx, output| {
-                    cx.push_with_comment(Inst::LoadFn { hash, output }, meta.info(cx.q.pool));
-                    Ok(())
-                })?;
-
+                let output = cx.alloc_or(output);
+                cx.push_with_comment(
+                    Inst::LoadFn {
+                        hash,
+                        output: *output,
+                    },
+                    meta.info(cx.q.pool),
+                );
                 ExprOutcome::Output(output)
             }
             PrivMetaKind::Const { const_value, .. } => {
@@ -1500,14 +1499,11 @@ fn compile_expr_meta<'hir>(
             }
         };
 
-        let output = cx.alloc_or(output, |cx, output| {
-            cx.push(Inst::Store {
-                value: InstValue::Type(type_hash),
-                output,
-            });
-            Ok(())
-        })?;
-
+        let output = cx.alloc_or(output);
+        cx.push(Inst::Store {
+            value: InstValue::Type(type_hash),
+            output: *output,
+        });
         ExprOutcome::Output(output)
     };
 
@@ -1521,17 +1517,15 @@ fn compile_expr_call_hash<'hir>(
     args: &[Expr<'hir>],
     output: Option<AssemblyAddress>,
 ) -> Result<ExprOutcome> {
-    let output = cx.alloc_or(output, |cx, output| {
-        cx.array(args, |cx, address, count| {
-            cx.push(Inst::Call {
-                hash,
-                address,
-                count,
-                output,
-            });
-            Ok(())
-        })
-    })?;
+    let output = cx.alloc_or(output);
+    let address = cx.array(args)?.free(cx)?;
+
+    cx.push(Inst::Call {
+        hash,
+        address,
+        count: args.len(),
+        output: *output,
+    });
 
     Ok(ExprOutcome::Output(output))
 }
@@ -1558,16 +1552,15 @@ fn compile_expr_call_instance<'hir>(
         cx.scopes.alloc_array_item();
     }
 
-    let address = cx.alloc_or(output, |cx, output| {
-        cx.push(Inst::CallInstance {
-            hash,
-            address,
-            count: args.len(),
-            output,
-        });
-        Ok(())
-    })?;
+    let output = cx.alloc_or(output);
+
+    cx.push(Inst::CallInstance {
+        hash,
+        address,
+        count: args.len(),
+        output: *output,
+    });
 
     cx.scopes.free_array(cx.span, args.len())?;
-    Ok(ExprOutcome::Output(address))
+    Ok(ExprOutcome::Output(output))
 }

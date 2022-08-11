@@ -1149,7 +1149,7 @@ fn compile_expr_binary<'hir>(
         }
 
         cx.with_state_checkpoint(|cx| rhs.compile(cx, Some(*output))?.free(cx))?;
-        cx.asm.label(cx.span, end_label)?;
+        cx.label(end_label)?;
         Ok(ExprOutcome::Output(output))
     }
 

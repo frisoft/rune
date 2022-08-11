@@ -263,11 +263,11 @@ impl Protocol {
         hash: Hash::new(0xbffd08b816c24682),
     };
 
-    /// Function used to test if a value is a specific variant.
+    /// Function to test if a tuple matches.
     ///
-    /// Signature: `fn(self, usize) -> bool`.
+    /// Signature: `fn(self, &mut MatchVariantSequence) -> bool`.
     pub const IS_VARIANT: Protocol = Protocol {
         name: "is_variant",
-        hash: Hash::new(0xc030d82bbd4dabe8),
+        hash: Hash::new(0x2ecb8bed29bd243d),
     };
 }

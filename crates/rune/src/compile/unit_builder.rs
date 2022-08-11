@@ -3,21 +3,24 @@
 //! A unit consists of a sequence of instructions, and lookaside tables for
 //! metadata like function locations.
 
+use std::mem;
+use std::sync::Arc;
+
+use thiserror::Error;
+
 use crate::ast::Span;
 use crate::collections::HashMap;
 use crate::compile::{
-    Assembly, AssemblyInst, CompileError, CompileErrorKind, Item, ItemBuf, Location, Pool,
-    PrivMeta, PrivMetaKind, PrivVariantMeta,
+    Assembly, CompileError, CompileErrorKind, Item, ItemBuf, Label, Location, Pool, PrivMeta,
+    PrivMetaKind, PrivVariantMeta, Scopes,
 };
 use crate::query::{QueryError, QueryErrorKind};
 use crate::runtime::debug::{DebugArgs, DebugSignature};
 use crate::runtime::{
-    Call, ConstValue, DebugInfo, DebugInst, Inst, Label, Protocol, Rtti, StaticString, Unit,
-    UnitFn, VariantRtti,
+    Call, ConstValue, DebugInfo, DebugInst, Inst, Protocol, Rtti, StaticString, Unit, UnitFn,
+    VariantRtti,
 };
 use crate::{Context, Diagnostics, Hash, SourceId};
-use std::sync::Arc;
-use thiserror::Error;
 
 /// Errors that can be raised when linking units.
 #[derive(Debug, Error)]
@@ -223,11 +226,7 @@ impl UnitBuilder {
         I: IntoIterator,
         I::Item: AsRef<str>,
     {
-        let current = current
-            .into_iter()
-            .map(|s| s.as_ref().to_owned())
-            .collect::<Box<_>>();
-
+        let current = current.into_iter().map(|s| s.as_ref().to_owned()).collect();
         self.new_static_object_keys(span, current)
     }
 
@@ -256,7 +255,7 @@ impl UnitBuilder {
                     span,
                     CompileErrorKind::StaticObjectKeysHashConflict {
                         hash,
-                        current,
+                        current: current.clone(),
                         existing: existing.clone(),
                     },
                 ));
@@ -541,6 +540,7 @@ impl UnitBuilder {
         item: &Item,
         args: usize,
         assembly: Assembly,
+        scopes: Scopes,
         call: Call,
         debug_args: Box<[Box<str>]>,
     ) -> Result<(), CompileError> {
@@ -548,7 +548,12 @@ impl UnitBuilder {
         let hash = Hash::type_hash(item);
 
         self.functions_rev.insert(offset, hash);
-        let info = UnitFn::Offset { offset, call, args };
+        let info = UnitFn::Offset {
+            offset,
+            call,
+            args,
+            frame: scopes.frame(),
+        };
         let signature = DebugSignature::new(item.to_owned(), DebugArgs::Named(debug_args));
 
         if self.functions.insert(hash, info).is_some() {
@@ -566,8 +571,7 @@ impl UnitBuilder {
         );
 
         self.debug_info_mut().functions.insert(hash, signature);
-
-        self.add_assembly(location, assembly)?;
+        self.add_assembly(location, assembly, scopes)?;
         Ok(())
     }
 
@@ -600,6 +604,7 @@ impl UnitBuilder {
         name: &str,
         args: usize,
         assembly: Assembly,
+        scopes: Scopes,
         call: Call,
         debug_args: Box<[Box<str>]>,
     ) -> Result<(), CompileError> {
@@ -609,7 +614,13 @@ impl UnitBuilder {
         let instance_fn = Hash::instance_function(type_hash, name);
         let hash = Hash::type_hash(item);
 
-        let info = UnitFn::Offset { offset, call, args };
+        let info = UnitFn::Offset {
+            offset,
+            call,
+            args,
+            frame: scopes.frame(),
+        };
+
         let signature = DebugSignature::new(item.to_owned(), DebugArgs::Named(debug_args));
 
         if self.functions.insert(instance_fn, info).is_some() {
@@ -639,7 +650,7 @@ impl UnitBuilder {
             .functions
             .insert(instance_fn, signature);
         self.functions_rev.insert(offset, hash);
-        self.add_assembly(location, assembly)?;
+        self.add_assembly(location, assembly, scopes)?;
         Ok(())
     }
 
@@ -667,57 +678,28 @@ impl UnitBuilder {
     }
 
     /// Translate the given assembly into instructions.
-    fn add_assembly(&mut self, location: Location, assembly: Assembly) -> Result<(), CompileError> {
+    fn add_assembly(
+        &mut self,
+        location: Location,
+        mut assembly: Assembly,
+        scopes: Scopes,
+    ) -> Result<(), CompileError> {
         self.label_count = assembly.label_count;
 
-        self.required_functions.extend(assembly.required_functions);
+        self.required_functions
+            .extend(mem::take(&mut assembly.required_functions));
 
-        for (pos, (inst, span)) in assembly.instructions.into_iter().enumerate() {
+        for (pos, (span, inst)) in mem::take(&mut assembly.instructions)
+            .into_iter()
+            .enumerate()
+        {
             let mut comment = None::<Box<str>>;
             let label = assembly.labels_rev.get(&pos).copied();
 
-            match inst {
-                AssemblyInst::Jump { label } => {
-                    comment = Some(format!("label:{}", label).into());
-                    let offset = translate_offset(span, pos, label, &assembly.labels)?;
-                    self.instructions.push(Inst::Jump { offset });
-                }
-                AssemblyInst::JumpIf { label } => {
-                    comment = Some(format!("label:{}", label).into());
-                    let offset = translate_offset(span, pos, label, &assembly.labels)?;
-                    self.instructions.push(Inst::JumpIf { offset });
-                }
-                AssemblyInst::JumpIfOrPop { label } => {
-                    comment = Some(format!("label:{}", label).into());
-                    let offset = translate_offset(span, pos, label, &assembly.labels)?;
-                    self.instructions.push(Inst::JumpIfOrPop { offset });
-                }
-                AssemblyInst::JumpIfNotOrPop { label } => {
-                    comment = Some(format!("label:{}", label).into());
-                    let offset = translate_offset(span, pos, label, &assembly.labels)?;
-                    self.instructions.push(Inst::JumpIfNotOrPop { offset });
-                }
-                AssemblyInst::JumpIfBranch { branch, label } => {
-                    comment = Some(format!("label:{}", label).into());
-                    let offset = translate_offset(span, pos, label, &assembly.labels)?;
-                    self.instructions
-                        .push(Inst::JumpIfBranch { branch, offset });
-                }
-                AssemblyInst::PopAndJumpIfNot { count, label } => {
-                    comment = Some(format!("label:{}", label).into());
-                    let offset = translate_offset(span, pos, label, &assembly.labels)?;
-                    self.instructions
-                        .push(Inst::PopAndJumpIfNot { count, offset });
-                }
-                AssemblyInst::IterNext { offset, label } => {
-                    comment = Some(format!("label:{}", label).into());
-                    let jump = translate_offset(span, pos, label, &assembly.labels)?;
-                    self.instructions.push(Inst::IterNext { offset, jump });
-                }
-                AssemblyInst::Raw { raw } => {
-                    self.instructions.push(raw);
-                }
-            }
+            let inst = inst.translate(span, &scopes, |label| {
+                translate_offset(span, pos, label, &assembly.labels)
+            })?;
+            self.instructions.push(inst);
 
             if let Some(comments) = assembly.comments.get(&pos) {
                 let actual = comment
@@ -747,18 +729,22 @@ impl UnitBuilder {
             label: Label,
             labels: &HashMap<Label, usize>,
         ) -> Result<isize, CompileError> {
-            let offset = labels
-                .get(&label)
-                .copied()
-                .ok_or_else(|| CompileError::new(span, CompileErrorKind::MissingLabel { label }))?;
+            let offset = labels.get(&label).copied().ok_or_else(|| {
+                CompileError::new(
+                    span,
+                    CompileErrorKind::MissingLabel {
+                        label: label.to_string().into(),
+                    },
+                )
+            })?;
 
             let base = isize::try_from(base)
                 .map_err(|_| CompileError::new(span, CompileErrorKind::BaseOverflow))?;
             let offset = isize::try_from(offset)
                 .map_err(|_| CompileError::new(span, CompileErrorKind::OffsetOverflow))?;
 
-            let (base, _) = base.overflowing_add(1);
-            let (offset, _) = offset.overflowing_sub(base);
+            let base = base.wrapping_add(1);
+            let offset = offset.wrapping_sub(base);
             Ok(offset)
         }
     }

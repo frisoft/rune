@@ -1,12 +1,15 @@
-use crate::runtime::{AnyObjError, RawStr};
 use std::cell::Cell;
 use std::fmt;
 use std::future::Future;
 use std::mem::ManuallyDrop;
 use std::ops;
 use std::pin::Pin;
+use std::ptr;
 use std::task::{Context, Poll};
+
 use thiserror::Error;
+
+use crate::runtime::{AnyObjError, RawStr};
 
 /// Bitflag which if set indicates that the accessed value is an external
 /// reference (exclusive or not).
@@ -192,7 +195,7 @@ impl Access {
         }
 
         self.set(n);
-        Ok(AccessGuard(self))
+        Ok(AccessGuard(Some(self)))
     }
 
     /// Mark that we want exclusive access to the given access token.
@@ -218,7 +221,7 @@ impl Access {
         }
 
         self.set(n.wrapping_add(1));
-        Ok(AccessGuard(self))
+        Ok(AccessGuard(Some(self)))
     }
 
     /// Mark that we want to mark the given access as "taken".
@@ -243,7 +246,9 @@ impl Access {
         }
 
         self.set(TAKEN);
-        Ok(RawTakeGuard { access: self })
+        Ok(RawTakeGuard {
+            access: Some(self.into()),
+        })
     }
 
     /// Release the current access level.
@@ -307,10 +312,18 @@ impl<'a, T: ?Sized> BorrowRef<'a, T> {
     /// ensure that access has been acquired correctly using e.g.
     /// [Access::shared]. Otherwise access can be release incorrectly once
     /// this guard is dropped.
-    pub(crate) fn new(data: &'a T, access: &'a Access) -> Self {
+    pub(crate) const fn new(data: &'a T, access: &'a Access) -> Self {
         Self {
             data,
-            guard: AccessGuard(access),
+            guard: AccessGuard(Some(access)),
+        }
+    }
+
+    /// Construct a reference from static data.
+    pub(crate) fn from_static(data: &'static T) -> Self {
+        Self {
+            data,
+            guard: AccessGuard(None),
         }
     }
 
@@ -384,7 +397,7 @@ where
 
 /// A guard around some specific access access.
 #[repr(transparent)]
-pub struct AccessGuard<'a>(&'a Access);
+pub struct AccessGuard<'a>(Option<&'a Access>);
 
 impl AccessGuard<'_> {
     /// Convert into a raw guard which does not have a lifetime associated with
@@ -395,23 +408,28 @@ impl AccessGuard<'_> {
     /// Since we're losing track of the lifetime, caller must ensure that the
     /// access outlives the guard.
     pub unsafe fn into_raw(self) -> RawAccessGuard {
-        RawAccessGuard(ManuallyDrop::new(self).0)
+        let this = ManuallyDrop::new(self);
+        RawAccessGuard(this.0.map(ptr::NonNull::from))
     }
 }
 
 impl Drop for AccessGuard<'_> {
     fn drop(&mut self) {
-        self.0.release();
+        if let Some(address) = self.0 {
+            address.release();
+        }
     }
 }
 
 /// A raw guard around some level of access.
 #[repr(transparent)]
-pub struct RawAccessGuard(*const Access);
+pub struct RawAccessGuard(Option<ptr::NonNull<Access>>);
 
 impl Drop for RawAccessGuard {
     fn drop(&mut self) {
-        unsafe { (*self.0).release() }
+        if let Some(address) = self.0 {
+            unsafe { address.as_ref().release() }
+        }
     }
 }
 
@@ -420,12 +438,14 @@ impl Drop for RawAccessGuard {
 /// This is created with [Access::take], and must not outlive the [Access]
 /// instance it was created from.
 pub(crate) struct RawTakeGuard {
-    access: *const Access,
+    access: Option<ptr::NonNull<Access>>,
 }
 
 impl Drop for RawTakeGuard {
     fn drop(&mut self) {
-        unsafe { (*self.access).release_take() }
+        if let Some(access) = self.access {
+            unsafe { access.as_ref().release_take() }
+        }
     }
 }
 
@@ -450,7 +470,7 @@ impl<'a, T: ?Sized> BorrowMut<'a, T> {
     pub(crate) unsafe fn new(data: &'a mut T, access: &'a Access) -> Self {
         Self {
             data,
-            guard: AccessGuard(access),
+            guard: AccessGuard(Some(access)),
         }
     }
 

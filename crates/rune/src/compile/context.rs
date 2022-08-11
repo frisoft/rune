@@ -837,8 +837,9 @@ impl Context {
 
         self.install_meta(meta)?;
 
-        let constructor: Arc<FunctionHandler> =
-            Arc::new(move |stack, args| constructor.fn_call(stack, args));
+        let constructor: Arc<FunctionHandler> = Arc::new(move |stack, address, args, output| {
+            constructor.fn_call(stack, address, args, output)
+        });
 
         self.constants.insert(
             Hash::instance_function(type_hash, Protocol::INTO_TYPE_NAME),

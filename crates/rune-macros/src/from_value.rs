@@ -14,7 +14,7 @@ impl Expander {
         &mut self,
         input: &syn::DeriveInput,
         st: &syn::DataStruct,
-    ) -> Option<TokenStream> {
+    ) -> Result<TokenStream, ()> {
         let (expanded, expected) = match &st.fields {
             syn::Fields::Unit => {
                 let value = &self.tokens.value;
@@ -74,7 +74,7 @@ impl Expander {
         let vm_error = &self.tokens.vm_error;
         let from_value = &self.tokens.from_value;
 
-        Some(quote! {
+        Ok(quote! {
             impl #from_value for #ident {
                 fn from_value(value: #value) -> ::std::result::Result<Self, #vm_error> {
                     match value {
@@ -89,7 +89,11 @@ impl Expander {
     }
 
     /// Expand on a struct.
-    fn expand_enum(&mut self, input: &syn::DeriveInput, en: &syn::DataEnum) -> Option<TokenStream> {
+    fn expand_enum(
+        &mut self,
+        input: &syn::DeriveInput,
+        en: &syn::DataEnum,
+    ) -> Result<TokenStream, ()> {
         let mut unit_matches = Vec::new();
         let mut unnamed_matches = Vec::new();
         let mut named_matches = Vec::new();
@@ -165,7 +169,7 @@ impl Expander {
             }
         };
 
-        Some(quote_spanned! { input.span() =>
+        Ok(quote_spanned! { input.span() =>
             impl #from_value for #ident {
                 fn from_value(value: #value) -> ::std::result::Result<Self, #vm_error> {
                     match value {
@@ -182,21 +186,21 @@ impl Expander {
     }
 
     /// Get a field identifier.
-    fn field_ident<'a>(&mut self, field: &'a syn::Field) -> Option<&'a syn::Ident> {
+    fn field_ident<'a>(&mut self, field: &'a syn::Field) -> Result<&'a syn::Ident, ()> {
         match &field.ident {
-            Some(ident) => Some(ident),
+            Some(ident) => Ok(ident),
             None => {
                 self.ctx.errors.push(syn::Error::new_spanned(
                     field,
                     "unnamed fields are not supported",
                 ));
-                None
+                Err(())
             }
         }
     }
 
     /// Expand unnamed fields.
-    fn expand_unnamed(&mut self, unnamed: &syn::FieldsUnnamed) -> Option<TokenStream> {
+    fn expand_unnamed(&mut self, unnamed: &syn::FieldsUnnamed) -> Result<TokenStream, ()> {
         let mut from_values = Vec::new();
 
         for (index, field) in unnamed.unnamed.iter().enumerate() {
@@ -224,11 +228,11 @@ impl Expander {
             });
         }
 
-        Some(quote_spanned!(unnamed.span() => #(#from_values),*))
+        Ok(quote_spanned!(unnamed.span() => #(#from_values),*))
     }
 
     /// Expand named fields.
-    fn expand_named(&mut self, named: &syn::FieldsNamed) -> Option<TokenStream> {
+    fn expand_named(&mut self, named: &syn::FieldsNamed) -> Result<TokenStream, ()> {
         let mut from_values = Vec::new();
 
         for field in &named.named {
@@ -259,7 +263,7 @@ impl Expander {
             });
         }
 
-        Some(quote_spanned!(named.span() => #(#from_values),* ))
+        Ok(quote_spanned!(named.span() => #(#from_values),* ))
     }
 }
 
@@ -267,8 +271,8 @@ pub(super) fn expand(input: &syn::DeriveInput) -> Result<TokenStream, Vec<syn::E
     let mut ctx = Context::new();
 
     let attrs = match ctx.type_attrs(&input.attrs) {
-        Some(attrs) => attrs,
-        None => {
+        Ok(attrs) => attrs,
+        Err(()) => {
             return Err(ctx.errors);
         }
     };
@@ -279,12 +283,12 @@ pub(super) fn expand(input: &syn::DeriveInput) -> Result<TokenStream, Vec<syn::E
 
     match &input.data {
         syn::Data::Struct(st) => {
-            if let Some(expanded) = expander.expand_struct(input, st) {
+            if let Ok(expanded) = expander.expand_struct(input, st) {
                 return Ok(expanded);
             }
         }
         syn::Data::Enum(en) => {
-            if let Some(expanded) = expander.expand_enum(input, en) {
+            if let Ok(expanded) = expander.expand_enum(input, en) {
                 return Ok(expanded);
             }
         }

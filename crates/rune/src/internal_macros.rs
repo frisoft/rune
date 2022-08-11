@@ -16,13 +16,13 @@ macro_rules! error {
 
         impl $error_ty {
             /// Construct a new scope error.
-            pub fn new<S, K>(spanned: S, kind: K) -> Self
+            pub fn new<S, K>(span: S, kind: K) -> Self
             where
                 S: $crate::ast::Spanned,
                 $kind: From<K>,
             {
                 Self {
-                    span: $crate::ast::Spanned::span(&spanned),
+                    span: $crate::ast::Spanned::span(&span),
                     kind: Box::new($kind::from(kind)),
                 }
             }

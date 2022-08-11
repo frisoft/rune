@@ -9,6 +9,7 @@ mod bytes;
 mod call;
 mod const_value;
 pub mod debug;
+mod debug_label;
 mod env;
 pub mod format;
 mod from_value;
@@ -20,7 +21,6 @@ mod guarded_args;
 mod inst;
 mod iterator;
 mod key;
-mod label;
 mod object;
 mod panic;
 mod protocol;
@@ -30,6 +30,7 @@ mod raw_str;
 mod runtime_context;
 mod select;
 mod shared;
+pub mod shims;
 mod stack;
 mod static_string;
 mod static_type;
@@ -60,6 +61,7 @@ pub use self::bytes::Bytes;
 pub use self::call::Call;
 pub use self::const_value::ConstValue;
 pub use self::debug::{DebugInfo, DebugInst};
+pub use self::debug_label::DebugLabel;
 pub use self::format::{Format, FormatSpec};
 pub use self::from_value::{FromValue, UnsafeFromValue};
 pub use self::function::{Function, SyncFunction};
@@ -67,13 +69,13 @@ pub use self::future::Future;
 pub use self::generator::Generator;
 pub use self::generator_state::GeneratorState;
 pub use self::guarded_args::GuardedArgs;
+pub(crate) use self::inst::AssemblyInst;
 pub use self::inst::{
-    Inst, InstAddress, InstAssignOp, InstOp, InstRangeLimits, InstTarget, InstValue, InstVariant,
+    Address, Inst, InstAssignOp, InstOp, InstRangeLimits, InstTarget, InstValue, InstVariant,
     PanicReason, TypeCheck,
 };
 pub use self::iterator::{Iterator, IteratorTrait};
 pub use self::key::Key;
-pub use self::label::{DebugLabel, Label};
 pub use self::object::Object;
 pub use self::panic::Panic;
 pub use self::protocol::Protocol;

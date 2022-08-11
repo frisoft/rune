@@ -16,7 +16,12 @@ pub(crate) struct IrCompiler<'a> {
     pub(crate) q: Query<'a>,
 }
 
-impl IrCompiler<'_> {
+impl<'a> IrCompiler<'a> {
+    /// Construct a new ir compiler.
+    pub(crate) fn new(source_id: SourceId, q: Query<'a>) -> Self {
+        Self { source_id, q }
+    }
+
     /// Resolve the given resolvable value.
     pub(crate) fn resolve<'s, T>(&'s self, value: &T) -> Result<T::Output, IrError>
     where
@@ -345,36 +350,21 @@ pub(crate) fn expr_block(
 pub(crate) fn block(hir: &hir::Block<'_>, c: &mut IrCompiler<'_>) -> Result<ir::IrScope, IrError> {
     let span = hir.span();
 
-    let mut last = None::<(&hir::Expr<'_>, bool)>;
     let mut instructions = Vec::new();
 
     for stmt in hir.statements {
-        let (e, term) = match stmt {
+        match *stmt {
             hir::Stmt::Local(l) => {
-                if let Some((e, _)) = std::mem::take(&mut last) {
-                    instructions.push(expr(e, c)?);
-                }
-
                 instructions.push(local(l, c)?);
-                continue;
             }
-            hir::Stmt::Expr(e) => (e, false),
-            hir::Stmt::Semi(e) => (e, true),
-            hir::Stmt::Item(..) => continue,
-        };
-
-        if let Some((e, _)) = std::mem::replace(&mut last, Some((e, term))) {
-            instructions.push(expr(e, c)?);
+            hir::Stmt::Expr(e) => {
+                instructions.push(expr(e, c)?);
+            }
         }
     }
 
-    let last = if let Some((e, term)) = last {
-        if term {
-            instructions.push(expr(e, c)?);
-            None
-        } else {
-            Some(Box::new(expr(e, c)?))
-        }
+    let tail = if let Some(e) = hir.tail {
+        Some(Box::new(expr(e, c)?))
     } else {
         None
     };
@@ -382,7 +372,7 @@ pub(crate) fn block(hir: &hir::Block<'_>, c: &mut IrCompiler<'_>) -> Result<ir::
     Ok(ir::IrScope {
         span,
         instructions,
-        last,
+        tail,
     })
 }
 
@@ -515,8 +505,8 @@ fn expr_loop(
             None => None,
         },
         condition: match hir.condition {
-            Some(hir) => Some(Box::new(condition(hir, c)?)),
-            None => None,
+            hir::LoopCondition::Condition { condition: hir } => Some(Box::new(condition(hir, c)?)),
+            _ => None,
         },
         body: block(hir.body, c)?,
     })

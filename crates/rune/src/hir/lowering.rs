@@ -1,15 +1,17 @@
+use crate::arena::Arena;
 use crate::ast::{self, Spanned};
+use crate::compile::{CompileError, CompileErrorKind};
 use crate::hir;
-use crate::hir::{HirError, HirErrorKind};
 use crate::query::{self, Query};
+use crate::SourceId;
 
 /// Allocate a single object in the arena.
 macro_rules! alloc {
-    ($ctx:expr, $span:expr; $value:expr) => {
-        $ctx.arena.alloc($value).map_err(|e| {
-            HirError::new(
+    ($span:expr => $cx:expr; $value:expr) => {
+        $cx.arena.alloc($value).map_err(|e| {
+            CompileError::new(
                 $span,
-                HirErrorKind::ArenaAllocError {
+                CompileErrorKind::ArenaAllocError {
                     requested: e.requested,
                 },
             )
@@ -19,10 +21,10 @@ macro_rules! alloc {
 
 /// Unpacks an optional value and allocates it in the arena.
 macro_rules! option {
-    ($ctx:expr, $span:expr; $value:expr, |$pat:pat_param| $closure:expr) => {
+    ($span:expr => $cx:expr; $value:expr, |$pat:pat_param| $closure:expr) => {
         match $value {
             Some($pat) => {
-                Some(&*alloc!($ctx, $span; $closure))
+                Some(&*alloc!($span => $cx; $closure))
             }
             None => {
                 None
@@ -33,15 +35,16 @@ macro_rules! option {
 
 /// Unpacks an iterator value and allocates it in the arena as a slice.
 macro_rules! iter {
-    ($ctx:expr, $span:expr; $iter:expr, |$pat:pat_param| $closure:expr) => {{
+    ($span:expr => $cx:expr; $iter:expr, |$pat:pat_param| $closure:expr) => {{
         let mut it = IntoIterator::into_iter($iter);
+        let span = Spanned::span($span);
 
-        let mut writer = match $ctx.arena.alloc_iter(ExactSizeIterator::len(&it)) {
+        let mut writer = match $cx.arena.alloc_iter(ExactSizeIterator::len(&it)) {
             Ok(writer) => writer,
             Err(e) => {
-                return Err(HirError::new(
-                    $span,
-                    HirErrorKind::ArenaAllocError {
+                return Err(CompileError::new(
+                    span,
+                    CompileErrorKind::ArenaAllocError {
                         requested: e.requested,
                     },
                 ));
@@ -50,9 +53,9 @@ macro_rules! iter {
 
         while let Some($pat) = it.next() {
             if let Err(e) = writer.write($closure) {
-                return Err(HirError::new(
-                    $span,
-                    HirErrorKind::ArenaWriteSliceOutOfBounds { index: e.index },
+                return Err(CompileError::new(
+                    span,
+                    CompileErrorKind::ArenaWriteSliceOutOfBounds { index: e.index },
                 ));
             }
         }
@@ -61,206 +64,284 @@ macro_rules! iter {
     }};
 }
 
-pub struct Ctx<'hir, 'a> {
-    /// Arena used for allocations.
-    arena: &'hir hir::arena::Arena,
+type Result<T> = ::std::result::Result<T, CompileError>;
+
+pub struct Ctxt<'a, 'hir> {
+    /// Source being processed.
+    source_id: SourceId,
+    /// Query system.
     q: Query<'a>,
+    /// Arena used for allocations.
+    arena: &'hir Arena,
 }
 
-impl<'hir, 'a> Ctx<'hir, 'a> {
+impl<'a, 'hir> Ctxt<'a, 'hir> {
     /// Construct a new contctx.
-    pub(crate) fn new(arena: &'hir hir::arena::Arena, query: Query<'a>) -> Self {
-        Self { arena, q: query }
+    pub(crate) fn new(source_id: SourceId, q: Query<'a>, arena: &'hir Arena) -> Self {
+        Self {
+            source_id,
+            q,
+            arena,
+        }
     }
 }
 
 /// Lower a function item.
-pub fn item_fn<'hir>(
-    ctx: &Ctx<'hir, '_>,
-    ast: &ast::ItemFn,
-) -> Result<hir::ItemFn<'hir>, HirError> {
+pub fn item_fn<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::ItemFn) -> Result<hir::ItemFn<'hir>> {
     Ok(hir::ItemFn {
         id: ast.id,
         span: ast.span(),
-        visibility: alloc!(ctx, ast; visibility(ctx, &ast.visibility)?),
-        name: alloc!(ctx, ast; ast.name),
-        args: iter!(ctx, ast; &ast.args, |(ast, _)| fn_arg(ctx, ast)?),
-        body: alloc!(ctx, ast; block(ctx, &ast.body)?),
+        visibility: alloc!(ast => cx; visibility(cx, &ast.visibility)?),
+        name: alloc!(ast => cx; ast.name),
+        args: iter!(ast => cx; &ast.args, |(ast, _)| fn_arg(cx, ast)?),
+        body: alloc!(ast => cx; block(cx, &ast.body)?),
     })
 }
 
 /// Lower a closure expression.
 pub fn expr_closure<'hir>(
-    ctx: &Ctx<'hir, '_>,
+    cx: &mut Ctxt<'_, 'hir>,
     ast: &ast::ExprClosure,
-) -> Result<hir::ExprClosure<'hir>, HirError> {
+) -> Result<hir::ExprClosure<'hir>> {
     Ok(hir::ExprClosure {
         id: ast.id,
         args: match &ast.args {
             ast::ExprClosureArgs::Empty { .. } => &[],
             ast::ExprClosureArgs::List { args, .. } => {
-                iter!(ctx, ast; args, |(ast, _)| fn_arg(ctx, ast)?)
+                iter!(ast => cx; args, |(ast, _)| fn_arg(cx, ast)?)
             }
         },
-        body: alloc!(ctx, ast; expr(ctx, &ast.body)?),
+        body: alloc!(ast => cx; expr(cx, &ast.body)?),
     })
 }
 
+#[derive(Clone, Copy, Spanned)]
+enum BlockStatement<'a> {
+    Local(&'a ast::Local),
+    Expr(&'a ast::Expr),
+}
+
 /// Lower the specified block.
-pub fn block<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Block) -> Result<hir::Block<'hir>, HirError> {
+pub fn block<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::Block) -> Result<hir::Block<'hir>> {
+    let mut tail_expr = None;
+    let mut must_be_last = None;
+    let mut statements = Vec::with_capacity(ast.statements.len());
+
+    for stmt in &ast.statements {
+        if let Some(span) = must_be_last {
+            return Err(CompileError::new(
+                span,
+                CompileErrorKind::ExpectedBlockSemiColon {
+                    followed_span: stmt.span(),
+                },
+            ));
+        }
+
+        let ast = match stmt {
+            ast::Stmt::Local(ast) => {
+                statements.push(BlockStatement::Local(ast));
+                continue;
+            }
+            ast::Stmt::Expr(ast) => {
+                if ast.needs_semi() {
+                    must_be_last = Some(ast.span());
+                }
+
+                ast
+            }
+            ast::Stmt::Semi(ast) => {
+                if !ast.needs_semi() {
+                    cx.q.diagnostics
+                        .uneccessary_semi_colon(cx.source_id, ast.semi_token.span());
+                }
+
+                &ast.expr
+            }
+            ast::Stmt::Item(item, semi) => {
+                if let Some(semi) = semi {
+                    if !item.needs_semi_colon() {
+                        cx.q.diagnostics
+                            .uneccessary_semi_colon(cx.source_id, semi.span());
+                    }
+                }
+
+                continue;
+            }
+        };
+
+        statements.extend(tail_expr.replace(ast).map(BlockStatement::Expr));
+    }
+
+    let tail = if let Some(ast) = tail_expr {
+        Some(&*alloc!(ast => cx; expr(cx, ast)?))
+    } else {
+        None
+    };
+
     Ok(hir::Block {
         id: ast.id,
         span: ast.span(),
-        statements: iter!(ctx, ast; &ast.statements, |ast| stmt(ctx, ast)?),
+        statements: iter!(ast => cx; statements, |ast| block_stmt(cx, ast)?),
+        tail,
+    })
+}
+
+/// Lower a statement
+fn block_stmt<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: BlockStatement<'_>) -> Result<hir::Stmt<'hir>> {
+    Ok(match ast {
+        BlockStatement::Local(ast) => hir::Stmt::Local(alloc!(ast => cx; local(cx, ast)?)),
+        BlockStatement::Expr(ast) => hir::Stmt::Expr(alloc!(ast => cx; expr(cx, ast)?)),
     })
 }
 
 /// Lower an expression.
-pub fn expr<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Expr) -> Result<hir::Expr<'hir>, HirError> {
+pub fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::Expr) -> Result<hir::Expr<'hir>> {
     let kind = match ast {
-        ast::Expr::Path(ast) => hir::ExprKind::Path(alloc!(ctx, ast; path(ctx, ast)?)),
-        ast::Expr::Assign(ast) => hir::ExprKind::Assign(alloc!(ctx, ast; hir::ExprAssign {
-            lhs: alloc!(ctx, ast; expr(ctx, &ast.lhs)?),
-            rhs: alloc!(ctx, ast; expr(ctx, &ast.rhs)?),
+        ast::Expr::Path(ast) => hir::ExprKind::Path(alloc!(ast => cx; path(cx, ast)?)),
+        ast::Expr::Assign(ast) => hir::ExprKind::Assign(alloc!(ast => cx; hir::ExprAssign {
+            lhs: alloc!(ast => cx; expr(cx, &ast.lhs)?),
+            rhs: alloc!(ast => cx; expr(cx, &ast.rhs)?),
         })),
-        // TODO: lower all of these loop constructs to the same loop-like
-        // representation. We only do different ones here right now since it's
-        // easier when refactoring.
-        ast::Expr::While(ast) => hir::ExprKind::Loop(alloc!(ctx, ast; hir::ExprLoop {
-            label: option!(ctx, ast; &ast.label, |(ast, _)| label(ctx, ast)?),
-            condition: Some(alloc!(ctx, ast; condition(ctx, &ast.condition)?)),
-            body: alloc!(ctx, ast; block(ctx, &ast.body)?),
+        ast::Expr::While(ast) => hir::ExprKind::Loop(alloc!(ast => cx; hir::ExprLoop {
+            label: option!(ast => cx; &ast.label, |(ast, _)| label(cx, ast)?),
+            condition: hir::LoopCondition::Condition {
+                condition: alloc!(ast => cx; condition(cx, &ast.condition)?),
+            },
+            body: alloc!(ast => cx; block(cx, &ast.body)?),
         })),
-        ast::Expr::Loop(ast) => hir::ExprKind::Loop(alloc!(ctx, ast; hir::ExprLoop {
-            label: option!(ctx, ast; &ast.label, |(ast, _)| label(ctx, ast)?),
-            condition: None,
-            body: alloc!(ctx, ast; block(ctx, &ast.body)?),
+        ast::Expr::Loop(ast) => hir::ExprKind::Loop(alloc!(ast => cx; hir::ExprLoop {
+            label: option!(ast => cx; &ast.label, |(ast, _)| label(cx, ast)?),
+            condition: hir::LoopCondition::Forever,
+            body: alloc!(ast => cx; block(cx, &ast.body)?),
         })),
-        ast::Expr::For(ast) => hir::ExprKind::For(alloc!(ctx, ast; hir::ExprFor {
-            label: option!(ctx, ast; &ast.label, |(ast, _)| label(ctx, ast)?),
-            binding: alloc!(ctx, ast; pat(ctx, &ast.binding)?),
-            iter: alloc!(ctx, ast; expr(ctx, &ast.iter)?),
-            body: alloc!(ctx, ast; block(ctx, &ast.body)?),
+        ast::Expr::For(ast) => hir::ExprKind::Loop(alloc!(ast => cx; hir::ExprLoop {
+            label: option!(ast => cx; &ast.label, |(ast, _)| label(cx, ast)?),
+            condition: hir::LoopCondition::Iterator {
+                binding: alloc!(ast => cx; pat(cx, &ast.binding)?),
+                iter: alloc!(ast => cx; expr(cx, &ast.iter)?)
+            },
+            body: alloc!(ast => cx; block(cx, &ast.body)?),
         })),
-        ast::Expr::Let(ast) => hir::ExprKind::Let(alloc!(ctx, ast; hir::ExprLet {
-            pat: alloc!(ctx, ast; pat(ctx, &ast.pat)?),
-            expr: alloc!(ctx, ast; expr(ctx, &ast.expr)?),
+        ast::Expr::Let(ast) => hir::ExprKind::Let(alloc!(ast => cx; hir::ExprLet {
+            pat: alloc!(ast => cx; pat(cx, &ast.pat)?),
+            expr: alloc!(ast => cx; expr(cx, &ast.expr)?),
         })),
-        ast::Expr::If(ast) => hir::ExprKind::If(alloc!(ctx, ast; hir::ExprIf {
-            condition: alloc!(ctx, ast; condition(ctx, &ast.condition)?),
-            block: alloc!(ctx, ast; block(ctx, &ast.block)?),
-            expr_else_ifs: iter!(ctx, ast; &ast.expr_else_ifs, |ast| hir::ExprElseIf {
+        ast::Expr::If(ast) => hir::ExprKind::If(alloc!(ast => cx; hir::ExprIf {
+            condition: alloc!(ast => cx; condition(cx, &ast.condition)?),
+            block: alloc!(ast => cx; block(cx, &ast.block)?),
+            expr_else_ifs: iter!(ast => cx; &ast.expr_else_ifs, |ast| hir::ExprElseIf {
                 span: ast.span(),
-                condition: alloc!(ctx, ast; condition(ctx, &ast.condition)?),
-                block: alloc!(ctx, ast; block(ctx, &ast.block)?),
+                condition: alloc!(ast => cx; condition(cx, &ast.condition)?),
+                block: alloc!(ast => cx; block(cx, &ast.block)?),
             }),
-            expr_else: option!(ctx, ast; &ast.expr_else, |ast| hir::ExprElse {
+            expr_else: option!(ast => cx; &ast.expr_else, |ast| hir::ExprElse {
                 span: ast.span(),
-                block: alloc!(ctx, ast; block(ctx, &ast.block)?)
-            }),
-        })),
-        ast::Expr::Match(ast) => hir::ExprKind::Match(alloc!(ctx, ast; hir::ExprMatch {
-            expr: alloc!(ctx, ast; expr(ctx, &ast.expr)?),
-            branches: iter!(ctx, ast; &ast.branches, |(ast, _)| hir::ExprMatchBranch {
-                span: ast.span(),
-                pat: alloc!(ctx, ast; pat(ctx, &ast.pat)?),
-                condition: option!(ctx, ast; &ast.condition, |(_, ast)| expr(ctx, ast)?),
-                body: alloc!(ctx, ast; expr(ctx, &ast.body)?),
+                block: alloc!(ast => cx; block(cx, &ast.block)?)
             }),
         })),
-        ast::Expr::Call(ast) => hir::ExprKind::Call(alloc!(ctx, ast; hir::ExprCall {
+        ast::Expr::Match(ast) => hir::ExprKind::Match(alloc!(ast => cx; hir::ExprMatch {
+            expr: alloc!(ast => cx; expr(cx, &ast.expr)?),
+            branches: iter!(ast => cx; &ast.branches, |(ast, _)| hir::ExprMatchBranch {
+                span: ast.span(),
+                pat: alloc!(ast => cx; pat(cx, &ast.pat)?),
+                condition: option!(ast => cx; &ast.condition, |(_, ast)| expr(cx, ast)?),
+                body: alloc!(ast => cx; expr(cx, &ast.body)?),
+            }),
+        })),
+        ast::Expr::Call(ast) => hir::ExprKind::Call(alloc!(ast => cx; hir::ExprCall {
             id: ast.id,
-            expr: alloc!(ctx, ast; expr(ctx, &ast.expr)?),
-            args: iter!(ctx, ast; &ast.args, |(ast, _)| expr(ctx, ast)?),
+            expr: alloc!(ast => cx; expr(cx, &ast.expr)?),
+            args: iter!(ast => cx; &ast.args, |(ast, _)| expr(cx, ast)?),
         })),
         ast::Expr::FieldAccess(ast) => {
-            hir::ExprKind::FieldAccess(alloc!(ctx, ast; hir::ExprFieldAccess {
-                expr: alloc!(ctx, ast; expr(ctx, &ast.expr)?),
-                expr_field: alloc!(ctx, ast; match &ast.expr_field {
-                    ast::ExprField::Path(ast) => hir::ExprField::Path(alloc!(ctx, ast; path(ctx, ast)?)),
-                    ast::ExprField::LitNumber(ast) => hir::ExprField::LitNumber(alloc!(ctx, ast; *ast)),
+            hir::ExprKind::FieldAccess(alloc!(ast => cx; hir::ExprFieldAccess {
+                expr: alloc!(ast => cx; expr(cx, &ast.expr)?),
+                expr_field: alloc!(ast => cx; match &ast.expr_field {
+                    ast::ExprField::Path(ast) => hir::ExprField::Path(alloc!(ast => cx; path(cx, ast)?)),
+                    ast::ExprField::LitNumber(ast) => hir::ExprField::LitNumber(alloc!(ast => cx; *ast)),
                 }),
             }))
         }
-        ast::Expr::Empty(ast) => hir::ExprKind::Group(alloc!(ctx, ast; expr(ctx, &ast.expr)?)),
-        ast::Expr::Binary(ast) => hir::ExprKind::Binary(alloc!(ctx, ast; hir::ExprBinary {
-            lhs: alloc!(ctx, ast; expr(ctx, &ast.lhs)?),
+        ast::Expr::Empty(ast) => hir::ExprKind::Group(alloc!(ast => cx; expr(cx, &ast.expr)?)),
+        ast::Expr::Binary(ast) => hir::ExprKind::Binary(alloc!(ast => cx; hir::ExprBinary {
+            lhs: alloc!(ast => cx; expr(cx, &ast.lhs)?),
             op: ast.op,
-            rhs: alloc!(ctx, ast; expr(ctx, &ast.rhs)?),
+            rhs: alloc!(ast => cx; expr(cx, &ast.rhs)?),
         })),
-        ast::Expr::Unary(ast) => hir::ExprKind::Unary(alloc!(ctx, ast; hir::ExprUnary {
+        ast::Expr::Unary(ast) => hir::ExprKind::Unary(alloc!(ast => cx; hir::ExprUnary {
             op: ast.op,
-            expr: alloc!(ctx, ast; expr(ctx, &ast.expr)?),
+            expr: alloc!(ast => cx; expr(cx, &ast.expr)?),
         })),
-        ast::Expr::Index(ast) => hir::ExprKind::Index(alloc!(ctx, ast; hir::ExprIndex {
-            target: alloc!(ctx, ast; expr(ctx, &ast.target)?),
-            index: alloc!(ctx, ast; expr(ctx, &ast.index)?),
+        ast::Expr::Index(ast) => hir::ExprKind::Index(alloc!(ast => cx; hir::ExprIndex {
+            target: alloc!(ast => cx; expr(cx, &ast.target)?),
+            index: alloc!(ast => cx; expr(cx, &ast.index)?),
         })),
-        ast::Expr::Block(ast) => hir::ExprKind::Block(alloc!(ctx, ast; expr_block(ctx, ast)?)),
+        ast::Expr::Block(ast) => hir::ExprKind::Block(alloc!(ast => cx; expr_block(cx, ast)?)),
         ast::Expr::Break(ast) => {
-            hir::ExprKind::Break(option!(ctx, ast; ast.expr.as_deref(), |ast| match ast {
-                ast::ExprBreakValue::Expr(ast) => hir::ExprBreakValue::Expr(alloc!(ctx, ast; expr(ctx, ast)?)),
-                ast::ExprBreakValue::Label(ast) => hir::ExprBreakValue::Label(alloc!(ctx, ast; label(ctx, ast)?)),
+            hir::ExprKind::Break(alloc!(ast => cx; match ast.expr.as_deref() {
+                None => hir::ExprBreakValue::None,
+                Some(ast::ExprBreakValue::Expr(ast)) => hir::ExprBreakValue::Expr(alloc!(ast => cx; expr(cx, ast)?)),
+                Some(ast::ExprBreakValue::Label(ast)) => hir::ExprBreakValue::Label(alloc!(ast => cx; label(cx, ast)?)),
             }))
         }
         ast::Expr::Continue(ast) => {
-            hir::ExprKind::Continue(option!(ctx, ast; &ast.label, |ast| label(ctx, ast)?))
+            hir::ExprKind::Continue(option!(ast => cx; &ast.label, |ast| label(cx, ast)?))
         }
         ast::Expr::Yield(ast) => {
-            hir::ExprKind::Yield(option!(ctx, ast; &ast.expr, |ast| expr(ctx, ast)?))
+            hir::ExprKind::Yield(option!(ast => cx; &ast.expr, |ast| expr(cx, ast)?))
         }
         ast::Expr::Return(ast) => {
-            hir::ExprKind::Return(option!(ctx, ast; &ast.expr, |ast| expr(ctx, ast)?))
+            hir::ExprKind::Return(option!(ast => cx; &ast.expr, |ast| expr(cx, ast)?))
         }
-        ast::Expr::Await(ast) => hir::ExprKind::Await(alloc!(ctx, ast; expr(ctx, &ast.expr)?)),
-        ast::Expr::Try(ast) => hir::ExprKind::Try(alloc!(ctx, ast; expr(ctx, &ast.expr)?)),
-        ast::Expr::Select(ast) => hir::ExprKind::Select(alloc!(ctx, ast; hir::ExprSelect {
-            branches: iter!(ctx, ast; &ast.branches, |(ast, _)| {
+        ast::Expr::Await(ast) => hir::ExprKind::Await(alloc!(ast => cx; expr(cx, &ast.expr)?)),
+        ast::Expr::Try(ast) => hir::ExprKind::Try(alloc!(ast => cx; expr(cx, &ast.expr)?)),
+        ast::Expr::Select(ast) => hir::ExprKind::Select(alloc!(ast => cx; hir::ExprSelect {
+            branches: iter!(ast => cx; &ast.branches, |(ast, _)| {
                 match ast {
-                    ast::ExprSelectBranch::Pat(ast) => hir::ExprSelectBranch::Pat(alloc!(ctx, ast; hir::ExprSelectPatBranch {
-                        pat: alloc!(ctx, &ast.pat; pat(ctx, &ast.pat)?),
-                        expr: alloc!(ctx, &ast.expr; expr(ctx, &ast.expr)?),
-                        body: alloc!(ctx, &ast.body; expr(ctx, &ast.body)?),
+                    ast::ExprSelectBranch::Pat(ast) => hir::ExprSelectBranch::Pat(alloc!(ast => cx; hir::ExprSelectPatBranch {
+                        pat: alloc!(&ast.pat => cx; pat(cx, &ast.pat)?),
+                        expr: alloc!(&ast.expr => cx; expr(cx, &ast.expr)?),
+                        body: alloc!(&ast.body => cx; expr(cx, &ast.body)?),
                     })),
-                    ast::ExprSelectBranch::Default(ast) => hir::ExprSelectBranch::Default(alloc!(ctx, &ast.body; expr(ctx, &ast.body)?)),
+                    ast::ExprSelectBranch::Default(ast) => hir::ExprSelectBranch::Default(alloc!(&ast.body => cx; expr(cx, &ast.body)?)),
                 }
             })
         })),
         ast::Expr::Closure(ast) => {
-            hir::ExprKind::Closure(alloc!(ctx, ast; expr_closure(ctx, ast)?))
+            hir::ExprKind::Closure(alloc!(ast => cx; expr_closure(cx, ast)?))
         }
-        ast::Expr::Lit(ast) => hir::ExprKind::Lit(alloc!(ctx, &ast.lit; ast.lit)),
-        ast::Expr::Object(ast) => hir::ExprKind::Object(alloc!(ctx, ast; hir::ExprObject {
-            path: object_ident(ctx, &ast.ident)?,
-            assignments: iter!(ctx, ast; &ast.assignments, |(ast, _)| hir::FieldAssign {
+        ast::Expr::Lit(ast) => hir::ExprKind::Lit(alloc!(&ast.lit => cx; ast.lit)),
+        ast::Expr::Object(ast) => hir::ExprKind::Object(alloc!(ast => cx; hir::ExprObject {
+            path: object_ident(cx, &ast.ident)?,
+            assignments: iter!(ast => cx; &ast.assignments, |(ast, _)| hir::FieldAssign {
                 span: ast.span(),
-                key: alloc!(ctx, ast; object_key(ctx, &ast.key)?),
-                assign: option!(ctx, ast; &ast.assign, |(_, ast)| expr(ctx, ast)?),
+                key: alloc!(ast => cx; object_key(cx, &ast.key)?),
+                assign: option!(ast => cx; &ast.assign, |(_, ast)| expr(cx, ast)?),
             })
         })),
-        ast::Expr::Tuple(ast) => hir::ExprKind::Tuple(alloc!(ctx, ast; hir::ExprSeq {
-            items: iter!(ctx, ast; &ast.items, |(ast, _)| expr(ctx, ast)?),
+        ast::Expr::Tuple(ast) => hir::ExprKind::Tuple(alloc!(ast => cx; hir::ExprSeq {
+            items: iter!(ast => cx; &ast.items, |(ast, _)| expr(cx, ast)?),
         })),
-        ast::Expr::Vec(ast) => hir::ExprKind::Vec(alloc!(ctx, ast; hir::ExprSeq {
-            items: iter!(ctx, ast; &ast.items, |(ast, _)| expr(ctx, ast)?),
+        ast::Expr::Vec(ast) => hir::ExprKind::Vec(alloc!(ast => cx; hir::ExprSeq {
+            items: iter!(ast => cx; &ast.items, |(ast, _)| expr(cx, ast)?),
         })),
-        ast::Expr::Range(ast) => hir::ExprKind::Range(alloc!(ctx, ast; hir::ExprRange {
-            from: option!(ctx, ast; &ast.from, |ast| expr(ctx, ast)?),
+        ast::Expr::Range(ast) => hir::ExprKind::Range(alloc!(ast => cx; hir::ExprRange {
+            from: option!(ast => cx; &ast.from, |ast| expr(cx, ast)?),
             limits: match ast.limits {
                 ast::ExprRangeLimits::HalfOpen(_) => hir::ExprRangeLimits::HalfOpen,
                 ast::ExprRangeLimits::Closed(_) => hir::ExprRangeLimits::Closed,
             },
-            to: option!(ctx, ast; &ast.to, |ast| expr(ctx, ast)?),
+            to: option!(ast => cx; &ast.to, |ast| expr(cx, ast)?),
         })),
-        ast::Expr::Group(ast) => hir::ExprKind::Group(alloc!(ctx, ast; expr(ctx, &ast.expr)?)),
-        ast::Expr::MacroCall(ast) => {
-            hir::ExprKind::MacroCall(alloc!(ctx, ast; match ctx.q.builtin_macro_for(ast)? {
-                query::BuiltInMacro::Template(ast) => hir::MacroCall::Template(alloc!(ctx, ast; hir::BuiltInTemplate {
+        ast::Expr::Group(ast) => hir::ExprKind::Group(alloc!(ast => cx; expr(cx, &ast.expr)?)),
+        ast::Expr::MacroCall(ast) => hir::ExprKind::MacroCall(
+            alloc!(ast => cx; match cx.q.builtin_macro_for(ast)?.clone() {
+                query::BuiltInMacro::Template(ast) => hir::MacroCall::Template(alloc!(ast => cx; hir::BuiltInTemplate {
                     span: ast.span,
                     from_literal: ast.from_literal,
-                    exprs: iter!(ctx, ast; &ast.exprs, |ast| expr(ctx, ast)?),
+                    exprs: iter!(&ast => cx; &ast.exprs, |ast| expr(cx, ast)?),
                 })),
-                query::BuiltInMacro::Format(ast) => hir::MacroCall::Format(alloc!(ctx, ast; hir::BuiltInFormat {
+                query::BuiltInMacro::Format(ast) => hir::MacroCall::Format(alloc!(ast => cx; hir::BuiltInFormat {
                     span: ast.span,
                     fill: ast.fill,
                     align: ast.align,
@@ -268,19 +349,19 @@ pub fn expr<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Expr) -> Result<hir::Expr<'hir
                     precision: ast.precision,
                     flags: ast.flags,
                     format_type: ast.format_type,
-                    value: alloc!(ctx, &ast.value; expr(ctx, &ast.value)?),
+                    value: alloc!(&ast.value => cx; expr(cx, &ast.value)?),
                 })),
-                query::BuiltInMacro::File(ast) => hir::MacroCall::File(alloc!(ctx, ast; hir::BuiltInFile {
+                query::BuiltInMacro::File(ast) => hir::MacroCall::File(alloc!(ast => cx; hir::BuiltInFile {
                     span: ast.span,
                     value: ast.value,
                 })),
-                query::BuiltInMacro::Line(ast) => hir::MacroCall::Line(alloc!(ctx, ast; hir::BuiltInLine {
+                query::BuiltInMacro::Line(ast) => hir::MacroCall::Line(alloc!(ast => cx; hir::BuiltInLine {
                     span: ast.span,
                     value: ast.value,
                 })),
             }
-            ))
-        }
+            ),
+        ),
     };
 
     Ok(hir::Expr {
@@ -291,9 +372,9 @@ pub fn expr<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Expr) -> Result<hir::Expr<'hir
 
 /// Lower a block expression.
 pub fn expr_block<'hir>(
-    ctx: &Ctx<'hir, '_>,
+    cx: &mut Ctxt<'_, 'hir>,
     ast: &ast::ExprBlock,
-) -> Result<hir::ExprBlock<'hir>, HirError> {
+) -> Result<hir::ExprBlock<'hir>> {
     Ok(hir::ExprBlock {
         kind: match (&ast.async_token, &ast.const_token) {
             (Some(..), None) => hir::ExprBlockKind::Async,
@@ -301,15 +382,15 @@ pub fn expr_block<'hir>(
             _ => hir::ExprBlockKind::Default,
         },
         block_move: ast.move_token.is_some(),
-        block: alloc!(ctx, ast; block(ctx, &ast.block)?),
+        block: alloc!(ast => cx; block(cx, &ast.block)?),
     })
 }
 
 /// Visibility covnersion.
 fn visibility<'hir>(
-    ctx: &Ctx<'hir, '_>,
+    cx: &mut Ctxt<'_, 'hir>,
     ast: &ast::Visibility,
-) -> Result<hir::Visibility<'hir>, HirError> {
+) -> Result<hir::Visibility<'hir>> {
     Ok(match ast {
         ast::Visibility::Inherited => hir::Visibility::Inherited,
         ast::Visibility::Public(_) => hir::Visibility::Public,
@@ -317,136 +398,110 @@ fn visibility<'hir>(
         ast::Visibility::Super(_) => hir::Visibility::Super,
         ast::Visibility::SelfValue(_) => hir::Visibility::SelfValue,
         ast::Visibility::In(ast) => {
-            hir::Visibility::In(alloc!(ctx, ast; path(ctx, &ast.restriction.path)?))
+            hir::Visibility::In(alloc!(ast => cx; path(cx, &ast.restriction.path)?))
         }
     })
 }
 
 /// Lower a function argument.
-fn fn_arg<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::FnArg) -> Result<hir::FnArg<'hir>, HirError> {
+fn fn_arg<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::FnArg) -> Result<hir::FnArg<'hir>> {
     Ok(match ast {
         ast::FnArg::SelfValue(ast) => hir::FnArg::SelfValue(ast.span()),
-        ast::FnArg::Pat(ast) => hir::FnArg::Pat(alloc!(ctx, ast; pat(ctx, ast)?)),
+        ast::FnArg::Pat(ast) => hir::FnArg::Pat(alloc!(ast => cx; pat(cx, ast)?)),
     })
 }
 
 /// Lower an assignment.
-fn local<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Local) -> Result<hir::Local<'hir>, HirError> {
+fn local<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::Local) -> Result<hir::Local<'hir>> {
     Ok(hir::Local {
         span: ast.span(),
-        pat: alloc!(ctx, ast; pat(ctx, &ast.pat)?),
-        expr: alloc!(ctx, ast; expr(ctx, &ast.expr)?),
+        pat: alloc!(ast => cx; pat(cx, &ast.pat)?),
+        expr: alloc!(ast => cx; expr(cx, &ast.expr)?),
     })
 }
 
-/// Lower a statement
-fn stmt<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Stmt) -> Result<hir::Stmt<'hir>, HirError> {
-    Ok(match ast {
-        ast::Stmt::Local(ast) => hir::Stmt::Local(alloc!(ctx, ast; local(ctx, ast)?)),
-        ast::Stmt::Expr(ast) => hir::Stmt::Expr(alloc!(ctx, ast; expr(ctx, ast)?)),
-        ast::Stmt::Semi(ast) => hir::Stmt::Semi(alloc!(ctx, ast; expr(ctx, &ast.expr)?)),
-        ast::Stmt::Item(..) => hir::Stmt::Item(ast.span()),
-    })
-}
-
-fn pat<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Pat) -> Result<hir::Pat<'hir>, HirError> {
+fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::Pat) -> Result<hir::Pat<'hir>> {
     Ok(hir::Pat {
         span: ast.span(),
         kind: match ast {
             ast::Pat::PatIgnore(..) => hir::PatKind::PatIgnore,
-            ast::Pat::PatRest(..) => hir::PatKind::PatRest,
             ast::Pat::PatPath(ast) => {
-                hir::PatKind::PatPath(alloc!(ctx, ast; path(ctx, &ast.path)?))
+                hir::PatKind::PatPath(alloc!(ast => cx; path(cx, &ast.path)?))
             }
-            ast::Pat::PatLit(ast) => hir::PatKind::PatLit(alloc!(ctx, ast; expr(ctx, &ast.expr)?)),
+            ast::Pat::PatLit(ast) => hir::PatKind::PatLit(alloc!(ast => cx; expr(cx, &ast.expr)?)),
             ast::Pat::PatVec(ast) => {
-                let items = iter!(ctx, ast; &ast.items, |(ast, _)| pat(ctx, ast)?);
-                let (is_open, count) = pat_items_count(items)?;
+                let items = iter!(ast => cx; &ast.items, |(ast, _)| pat(cx, ast)?);
 
-                hir::PatKind::PatVec(alloc!(ctx, ast; hir::PatItems {
+                hir::PatKind::PatVec(alloc!(ast => cx; hir::PatItems {
                     path: None,
                     items,
-                    is_open,
-                    count,
+                    is_open: ast.rest.is_some(),
                 }))
             }
             ast::Pat::PatTuple(ast) => {
-                let items = iter!(ctx, ast; &ast.items, |(ast, _)| pat(ctx, ast)?);
-                let (is_open, count) = pat_items_count(items)?;
+                let items = iter!(ast => cx; &ast.items, |(ast, _)| pat(cx, ast)?);
 
-                hir::PatKind::PatTuple(alloc!(ctx, ast; hir::PatItems {
-                    path: option!(ctx, ast; &ast.path, |ast| path(ctx, ast)?),
+                hir::PatKind::PatTuple(alloc!(ast => cx; hir::PatItems {
+                    path: option!(ast => cx; &ast.path, |ast| path(cx, ast)?),
                     items,
-                    is_open,
-                    count,
+                    is_open: ast.rest.is_some(),
                 }))
             }
-            ast::Pat::PatObject(ast) => {
-                let items = iter!(ctx, ast; &ast.items, |(ast, _)| pat(ctx, ast)?);
-                let (is_open, count) = pat_items_count(items)?;
-
-                hir::PatKind::PatObject(alloc!(ctx, ast; hir::PatItems {
-                    path: object_ident(ctx, &ast.ident)?,
-                    items,
-                    is_open,
-                    count,
-                }))
-            }
-            ast::Pat::PatBinding(ast) => {
-                hir::PatKind::PatBinding(alloc!(ctx, ast; hir::PatBinding {
-                    key: alloc!(ctx, ast; object_key(ctx, &ast.key)?),
-                    pat: alloc!(ctx, ast; pat(ctx, &ast.pat)?),
-                }))
-            }
+            ast::Pat::PatObject(ast) => hir::PatKind::PatObject(alloc!(ast => cx; hir::PatObject {
+                path: object_ident(cx, &ast.ident)?,
+                bindings: iter!(ast => cx; &ast.items, |(ast, _)| hir::PatBinding {
+                    span: ast.span(),
+                    key: alloc!(ast => cx; object_key(cx, &ast.key)?),
+                    pat: alloc!(ast => cx; pat(cx, &ast.pat)?),
+                }),
+                is_open: ast.rest.is_some(),
+            })),
         },
     })
 }
 
-fn object_key<'hir>(
-    ctx: &Ctx<'hir, '_>,
-    ast: &ast::ObjectKey,
-) -> Result<hir::ObjectKey<'hir>, HirError> {
+fn object_key<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::ObjectKey) -> Result<hir::ObjectKey<'hir>> {
     Ok(match ast {
-        ast::ObjectKey::LitStr(ast) => hir::ObjectKey::LitStr(alloc!(ctx, ast; *ast)),
-        ast::ObjectKey::Path(ast) => hir::ObjectKey::Path(alloc!(ctx, ast; path(ctx, ast)?)),
+        ast::ObjectKey::LitStr(ast) => hir::ObjectKey::LitStr(alloc!(ast => cx; *ast)),
+        ast::ObjectKey::Path(ast) => hir::ObjectKey::Path(alloc!(ast => cx; path(cx, ast)?)),
     })
 }
 
 /// Lower an object identifier to an optional path.
 fn object_ident<'hir>(
-    ctx: &Ctx<'hir, '_>,
+    cx: &mut Ctxt<'_, 'hir>,
     ast: &ast::ObjectIdent,
-) -> Result<Option<&'hir hir::Path<'hir>>, HirError> {
+) -> Result<Option<&'hir hir::Path<'hir>>> {
     Ok(match ast {
         ast::ObjectIdent::Anonymous(_) => None,
-        ast::ObjectIdent::Named(ast) => Some(alloc!(ctx, ast; path(ctx, ast)?)),
+        ast::ObjectIdent::Named(ast) => Some(alloc!(ast => cx; path(cx, ast)?)),
     })
 }
 
 /// Lower the given path.
-pub fn path<'hir>(ctx: &Ctx<'hir, '_>, ast: &ast::Path) -> Result<hir::Path<'hir>, HirError> {
+pub fn path<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::Path) -> Result<hir::Path<'hir>> {
     Ok(hir::Path {
         id: ast.id,
         span: ast.span(),
         global: ast.global.as_ref().map(Spanned::span),
         trailing: ast.trailing.as_ref().map(Spanned::span),
-        first: alloc!(ctx, ast; path_segment(ctx, &ast.first)?),
-        rest: iter!(ctx, ast; &ast.rest, |(_, s)| path_segment(ctx, s)?),
+        first: alloc!(ast => cx; path_segment(cx, &ast.first)?),
+        rest: iter!(ast => cx; &ast.rest, |(_, s)| path_segment(cx, s)?),
     })
 }
 
 fn path_segment<'hir>(
-    ctx: &Ctx<'hir, '_>,
+    cx: &mut Ctxt<'_, 'hir>,
     ast: &ast::PathSegment,
-) -> Result<hir::PathSegment<'hir>, HirError> {
+) -> Result<hir::PathSegment<'hir>> {
     let kind = match ast {
         ast::PathSegment::SelfType(..) => hir::PathSegmentKind::SelfType,
         ast::PathSegment::SelfValue(..) => hir::PathSegmentKind::SelfValue,
-        ast::PathSegment::Ident(ast) => hir::PathSegmentKind::Ident(alloc!(ctx, ast; *ast)),
+        ast::PathSegment::Ident(ast) => hir::PathSegmentKind::Ident(alloc!(ast => cx; *ast)),
         ast::PathSegment::Crate(..) => hir::PathSegmentKind::Crate,
         ast::PathSegment::Super(..) => hir::PathSegmentKind::Super,
         ast::PathSegment::Generics(ast) => {
-            hir::PathSegmentKind::Generics(iter!(ctx, ast; ast, |(e, _)| expr(ctx, &e.expr)?))
+            hir::PathSegmentKind::Generics(iter!(ast => cx; ast, |(e, _)| expr(cx, &e.expr)?))
         }
     };
 
@@ -456,47 +511,19 @@ fn path_segment<'hir>(
     })
 }
 
-fn label<'hir>(_: &Ctx<'hir, '_>, ast: &ast::Label) -> Result<ast::Label, HirError> {
+fn label<'hir>(_: &Ctxt<'_, 'hir>, ast: &ast::Label) -> Result<ast::Label> {
     Ok(ast::Label {
         span: ast.span,
         source: ast.source,
     })
 }
 
-fn condition<'hir>(
-    ctx: &Ctx<'hir, '_>,
-    ast: &ast::Condition,
-) -> Result<hir::Condition<'hir>, HirError> {
+fn condition<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::Condition) -> Result<hir::Condition<'hir>> {
     Ok(match ast {
-        ast::Condition::Expr(ast) => hir::Condition::Expr(alloc!(ctx, ast; expr(ctx, ast)?)),
-        ast::Condition::ExprLet(ast) => hir::Condition::ExprLet(alloc!(ctx, ast; hir::ExprLet {
-            pat: alloc!(ctx, ast; pat(ctx, &ast.pat)?),
-            expr: alloc!(ctx, ast; expr(ctx, &ast.expr)?),
+        ast::Condition::Expr(ast) => hir::Condition::Expr(alloc!(ast => cx; expr(cx, ast)?)),
+        ast::Condition::ExprLet(ast) => hir::Condition::ExprLet(alloc!(ast => cx; hir::ExprLet {
+            pat: alloc!(ast => cx; pat(cx, &ast.pat)?),
+            expr: alloc!(ast => cx; expr(cx, &ast.expr)?),
         })),
     })
-}
-
-/// Test if the given pattern is open or not.
-fn pat_items_count(items: &[hir::Pat<'_>]) -> Result<(bool, usize), HirError> {
-    let mut it = items.iter();
-
-    let (is_open, mut count) = match it.next_back() {
-        Some(pat) => matches!(pat.kind, hir::PatKind::PatRest)
-            .then(|| (true, 0))
-            .unwrap_or((false, 1)),
-        None => return Ok((false, 0)),
-    };
-
-    for pat in it {
-        if let hir::PatKind::PatRest = pat.kind {
-            return Err(HirError::new(
-                pat.span(),
-                HirErrorKind::UnsupportedPatternRest,
-            ));
-        }
-
-        count += 1;
-    }
-
-    Ok((is_open, count))
 }

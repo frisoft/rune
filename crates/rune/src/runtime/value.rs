@@ -1,5 +1,12 @@
+use std::cmp;
+use std::fmt;
+use std::fmt::Write;
+use std::hash;
+use std::mem;
+use std::sync::Arc;
+use std::vec;
+
 use crate::compile::ItemBuf;
-use crate::runtime::vm::CallResult;
 use crate::runtime::{
     AccessKind, AnyObj, Bytes, ConstValue, EnvProtocolCaller, Format, FromValue, Function, Future,
     Generator, GeneratorState, Iterator, Mut, Object, Protocol, ProtocolCaller, Range, RawMut,
@@ -8,12 +15,6 @@ use crate::runtime::{
 };
 use crate::{Any, Hash};
 use serde::{de, ser, Deserialize, Serialize};
-use std::cmp;
-use std::fmt;
-use std::fmt::Write;
-use std::hash;
-use std::sync::Arc;
-use std::vec;
 
 /// A empty with a well-defined type.
 pub struct UnitStruct {
@@ -339,7 +340,7 @@ impl Value {
                 return Ok(write!(s, "{:#04X}", byte));
             }
             value => {
-                let b = Shared::new(std::mem::take(s));
+                let b = Shared::new(mem::take(s));
 
                 let result = caller.call_protocol_fn(
                     Protocol::STRING_DISPLAY,
@@ -348,7 +349,7 @@ impl Value {
                 )?;
 
                 let result = fmt::Result::from_value(result)?;
-                drop(std::mem::replace(s, b.take()?));
+                drop(mem::replace(s, b.take()?));
                 return Ok(result);
             }
         }
@@ -459,7 +460,7 @@ impl Value {
                 write!(s, "{:?}", value)
             }
             value => {
-                let b = Shared::new(std::mem::take(s));
+                let b = Shared::new(mem::take(s));
 
                 let result = caller.call_protocol_fn(
                     Protocol::STRING_DEBUG,
@@ -468,7 +469,7 @@ impl Value {
                 )?;
 
                 let result = fmt::Result::from_value(result)?;
-                drop(std::mem::replace(s, b.take()?));
+                drop(mem::replace(s, b.take()?));
                 return Ok(result);
             }
         };
@@ -583,7 +584,7 @@ impl Value {
     }
 
     /// Construct a typed tuple.
-    pub fn tuple_struct(rtti: Arc<Rtti>, vec: vec::Vec<Value>) -> Self {
+    pub fn tuple_struct(rtti: Arc<Rtti>, vec: Box<[Value]>) -> Self {
         Self::TupleStruct(Shared::new(TupleStruct {
             rtti,
             data: Tuple::from(vec),
@@ -596,7 +597,7 @@ impl Value {
     }
 
     /// Construct a tuple variant.
-    pub fn tuple_variant(rtti: Arc<VariantRtti>, vec: vec::Vec<Value>) -> Self {
+    pub fn tuple_variant(rtti: Arc<VariantRtti>, vec: Box<[Value]>) -> Self {
         Self::Variant(Shared::new(Variant::tuple(rtti, Tuple::from(vec))))
     }
 
@@ -949,7 +950,7 @@ impl Value {
             Self::TupleStruct(tuple) => tuple.borrow_ref()?.type_info(),
             Self::Struct(object) => object.borrow_ref()?.type_info(),
             Self::Variant(empty) => empty.borrow_ref()?.type_info(),
-            Self::Any(any) => TypeInfo::Any(any.borrow_ref()?.type_name()),
+            Self::Any(any) => any.borrow_ref()?.type_info(),
         })
     }
 
@@ -1044,10 +1045,18 @@ impl Value {
                 (Err(a), Err(b)) => return Self::value_ptr_eq(vm, a, b),
                 _ => return Ok(false),
             },
-            (a, b) => match vm.call_instance_fn(a.clone(), Protocol::EQ, (b.clone(),))? {
-                CallResult::Ok(()) => return bool::from_value(vm.stack_mut().pop()?),
-                CallResult::Unsupported(..) => {}
-            },
+            _ => {} // TODO: support instance fn comparison?
+                    /*(a, b) => match vm.call_instance_fn(
+                        a.clone(),
+                        Protocol::EQ,
+                        (b.clone(),),
+                        StackAddress::BASE,
+                    )? {
+                        CallResult::Ok => {
+                            return bool::from_value(mem::take(vm.stack_mut().at_mut(StackAddress::BASE)?))
+                        }
+                        CallResult::Unsupported(..) => {}
+                    },*/
         }
 
         Err(VmError::from(VmErrorKind::UnsupportedBinaryOperation {
@@ -1556,12 +1565,13 @@ impl<'de> de::Visitor<'de> for VmVisitor {
 #[cfg(test)]
 mod tests {
     use super::Value;
+    use std::mem;
 
     #[test]
     fn test_size() {
         // :( - make this 16 bytes again by reducing the size of the Rc.
         assert_eq! {
-            std::mem::size_of::<Value>(),
+            mem::size_of::<Value>(),
             16,
         };
     }

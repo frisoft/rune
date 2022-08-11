@@ -85,7 +85,7 @@ macro_rules! grouped {
 
         impl<T, S> $name<T, S>
         where
-            T: Parse,
+            T: Peek + Parse,
             S: Peek + Parse,
         {
             /// Parse with the first element already specified.
@@ -101,7 +101,7 @@ macro_rules! grouped {
                     let is_end = comma.is_none();
                     $field.push((current, comma));
 
-                    if is_end || parser.peek::<$close>()? {
+                    if is_end || parser.peek::<$close>()? || !parser.peek::<T>()? {
                         break;
                     }
 
@@ -120,7 +120,7 @@ macro_rules! grouped {
 
         impl<T, S> Parse for $name<T, S>
         where
-            T: Parse,
+            T: Peek + Parse,
             S: Peek + Parse,
         {
             fn parse(parser: &mut Parser<'_>) -> Result<Self, ParseError> {
@@ -128,7 +128,7 @@ macro_rules! grouped {
 
                 let mut $field = Vec::new();
 
-                while !parser.peek::<$close>()? {
+                while !parser.peek::<$close>()? && parser.peek::<T>()? {
                     let expr = parser.parse()?;
                     let sep = parser.parse::<Option<S>>()?;
                     let is_end = sep.is_none();

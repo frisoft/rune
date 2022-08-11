@@ -254,6 +254,10 @@ where
 
             *context
         }
+        WarningDiagnosticKind::Unreachable { span, context } => {
+            labels.push(d::Label::primary(this.source_id(), span.range()).with_message("unreachable"));
+            *context
+        }
         WarningDiagnosticKind::LetPatternMightPanic { span, context } => {
             labels.push(
                 d::Label::primary(this.source_id(), span.range())
@@ -489,6 +493,9 @@ where
         notes: &mut Vec<String>,
     ) -> fmt::Result {
         match kind {
+            QueryErrorKind::CompileError { error } => {
+                format_compile_error(this, sources, error_span, error, labels, notes)?;
+            }
             QueryErrorKind::ResolveError { error } => {
                 format_resolve_error(this, sources, error_span, error, labels, notes)?;
             }
@@ -565,8 +572,15 @@ where
         labels: &mut Vec<d::Label<SourceId>>,
         notes: &mut Vec<String>,
     ) -> fmt::Result {
-        if let IrErrorKind::QueryError { error } = kind {
-            format_query_error(this, sources, error_span, error, labels, notes)?;
+        match kind {
+            IrErrorKind::CompileError { error } => {
+                format_compile_error(this, sources, error_span, error, labels, notes)?
+            }
+            IrErrorKind::QueryError { error } => {
+                format_query_error(this, sources, error_span, error, labels, notes)?;
+            }
+            _ => {
+            }
         }
 
         Ok(())

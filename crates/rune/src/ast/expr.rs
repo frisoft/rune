@@ -420,6 +420,7 @@ impl Peek for Expr {
             K!['('] => true,
             K!['['] => true,
             K!['{'] => true,
+            K!["<<"] => true,
             K![number] => true,
             K![char] => true,
             K![byte] => true,
@@ -427,6 +428,7 @@ impl Peek for Expr {
             K![bytestr] => true,
             K!['label] => matches!(p.nth(1), K![:]),
             K![..] => true,
+            K![|] => true,
             _ => false,
         }
     }
@@ -514,7 +516,7 @@ fn base(
         K![if] => Expr::If(ast::ExprIf::parse_with_meta(p, take(attributes))?),
         K![match] => Expr::Match(ast::ExprMatch::parse_with_attributes(p, take(attributes))?),
         K!['['] => Expr::Vec(ast::ExprVec::parse_with_meta(p, take(attributes))?),
-        ast::Kind::Open(ast::Delimiter::Empty) => empty_group(p, take(attributes))?,
+        K!["<<"] => empty_group(p, take(attributes))?,
         K!['('] => paren_group(p, take(attributes))?,
         K!['{'] => Expr::Block(ast::ExprBlock::parse_with_meta(
             p,

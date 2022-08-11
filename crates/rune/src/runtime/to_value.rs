@@ -1,4 +1,6 @@
-use crate::runtime::{AnyObj, Object, Panic, Shared, Value, VmError, VmErrorKind, VmIntegerRepr};
+use crate::runtime::{
+    Address, AnyObj, Object, Panic, Shared, Stack, Value, VmError, VmErrorKind, VmIntegerRepr,
+};
 use crate::Any;
 
 #[doc(inline)]
@@ -38,6 +40,15 @@ pub use rune_macros::ToValue;
 pub trait ToValue: Sized {
     /// Convert into a value.
     fn to_value(self) -> Result<Value, VmError>;
+
+    /// Encode the value onto a stack.
+    #[doc(hidden)]
+    #[inline]
+    fn to_stack(self, stack: &mut Stack, output: Address) -> Result<(), VmError> {
+        let value = self.to_value()?;
+        stack.store(output, value)?;
+        Ok(())
+    }
 }
 
 /// Trait for converting types into values.

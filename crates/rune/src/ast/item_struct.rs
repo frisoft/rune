@@ -123,3 +123,9 @@ pub struct Field {
     /// Name of the field.
     pub name: ast::Ident,
 }
+
+impl Peek for Field {
+    fn peek(p: &mut Peeker<'_>) -> bool {
+        ast::Attribute::peek(p) || ast::Visibility::peek(p) || matches!(p.nth(0), K![ident])
+    }
+}

@@ -377,7 +377,10 @@ where
     let context = match this.kind() {
         WarningDiagnosticKind::NotUsed { span, context } => {
             labels.push(d::Label::primary(this.source_id(), span.range()).with_message("not used"));
-
+            *context
+        }
+        WarningDiagnosticKind::Unreachable { span, context } => {
+            labels.push(d::Label::primary(this.source_id(), span.range()).with_message("unreachable"));
             *context
         }
         WarningDiagnosticKind::LetPatternMightPanic { span, context } => {

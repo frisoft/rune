@@ -1,5 +1,4 @@
 use crate::ast::prelude::*;
-use std::borrow::Cow;
 
 /// An object expression.
 ///
@@ -91,6 +90,12 @@ impl Parse for FieldAssign {
     }
 }
 
+impl Peek for FieldAssign {
+    fn peek(p: &mut Peeker<'_>) -> bool {
+        ObjectKey::peek(p)
+    }
+}
+
 /// Possible literal object keys.
 #[derive(Debug, Clone, PartialEq, Eq, ToTokens, Spanned)]
 #[non_exhaustive]
@@ -123,6 +128,16 @@ impl Parse for ObjectKey {
     }
 }
 
+impl Peek for ObjectKey {
+    fn peek(p: &mut Peeker<'_>) -> bool {
+        match p.nth(0) {
+            K![str] => true,
+            K![ident] => true,
+            _ => false,
+        }
+    }
+}
+
 /// A tag object to help peeking for anonymous object case to help
 /// differentiate anonymous objects and attributes when parsing block
 /// expressions.
@@ -132,25 +147,5 @@ pub(crate) struct AnonExprObject;
 impl Peek for AnonExprObject {
     fn peek(p: &mut Peeker<'_>) -> bool {
         matches!((p.nth(0), p.nth(1)), (K![#], K!['{']))
-    }
-}
-
-impl<'a> Resolve<'a> for ObjectKey {
-    type Output = Cow<'a, str>;
-
-    fn resolve(&self, ctx: ResolveContext<'a>) -> Result<Self::Output, ResolveError> {
-        Ok(match self {
-            Self::LitStr(lit_str) => lit_str.resolve(ctx)?,
-            Self::Path(path) => {
-                let ident = match path.try_as_ident() {
-                    Some(ident) => ident,
-                    None => {
-                        return Err(ResolveError::expected(path, "object key"));
-                    }
-                };
-
-                Cow::Borrowed(ident.resolve(ctx)?)
-            }
-        })
     }
 }

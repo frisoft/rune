@@ -7,8 +7,9 @@ use crate::collections::{HashMap, HashSet};
 use crate::compile::{ContextError, IntoComponent, ItemBuf, Named};
 use crate::macros::{MacroContext, TokenStream};
 use crate::runtime::{
-    ConstValue, FromValue, FunctionHandler, Future, GeneratorState, MacroHandler, Protocol, Stack,
-    StaticType, ToValue, TypeCheck, TypeInfo, TypeOf, UnsafeFromValue, Value, VmError, VmErrorKind,
+    Address, ConstValue, FromValue, FunctionHandler, Future, GeneratorState, MacroHandler,
+    Protocol, Stack, StaticType, ToValue, TypeCheck, TypeInfo, TypeOf, UnsafeFromValue, Value,
+    VmError, VmErrorKind,
 };
 use crate::{Hash, InstFnInfo, InstFnKind, InstFnName};
 use std::fmt;
@@ -72,8 +73,9 @@ impl InternalEnum {
     where
         C: Function<Args>,
     {
-        let constructor: Arc<FunctionHandler> =
-            Arc::new(move |stack, args| constructor.fn_call(stack, args));
+        let constructor: Arc<FunctionHandler> = Arc::new(move |stack, address, args, output| {
+            constructor.fn_call(stack, address, args, output)
+        });
 
         self.variants.push(InternalVariant {
             name,
@@ -492,8 +494,8 @@ impl Module {
             });
         }
 
-        variant.constructor = Some(Arc::new(move |stack, args| {
-            constructor.fn_call(stack, args)
+        variant.constructor = Some(Arc::new(move |stack, address, args, output| {
+            constructor.fn_call(stack, address, args, output)
         }));
 
         Ok(())
@@ -669,7 +671,9 @@ impl Module {
         self.functions.insert(
             name,
             ModuleFn {
-                handler: Arc::new(move |stack, args| f.fn_call(stack, args)),
+                handler: Arc::new(move |stack, address, args, output| {
+                    f.fn_call(stack, address, args, output)
+                }),
                 args: Some(Func::args()),
             },
         );
@@ -768,7 +772,9 @@ impl Module {
         self.functions.insert(
             name,
             ModuleFn {
-                handler: Arc::new(move |stack, args| f.fn_call(stack, args)),
+                handler: Arc::new(move |stack, address, args, output| {
+                    f.fn_call(stack, address, args, output)
+                }),
                 args: Some(Func::args()),
             },
         );
@@ -780,7 +786,7 @@ impl Module {
     /// machine.
     pub fn raw_fn<F, N>(&mut self, name: N, f: F) -> Result<(), ContextError>
     where
-        F: 'static + Fn(&mut Stack, usize) -> Result<(), VmError> + Send + Sync,
+        F: 'static + Fn(&mut Stack, Address, usize, Address) -> Result<(), VmError> + Send + Sync,
         N: IntoIterator,
         N::Item: IntoComponent,
     {
@@ -793,7 +799,9 @@ impl Module {
         self.functions.insert(
             name,
             ModuleFn {
-                handler: Arc::new(move |stack, args| f(stack, args)),
+                handler: Arc::new(move |stack, address, args, output| {
+                    f(stack, address, args, output)
+                }),
                 args: None,
             },
         );
@@ -842,7 +850,8 @@ impl Module {
         Func: InstFn<Args>,
     {
         let name = name.info();
-        let handler: Arc<FunctionHandler> = Arc::new(move |stack, args| f.fn_call(stack, args));
+        let handler: Arc<FunctionHandler> =
+            Arc::new(move |stack, address, args, output| f.fn_call(stack, address, args, output));
         let ty = Func::ty();
         let args = Some(Func::args());
         self.assoc_fn(name, handler, ty, args, AssocKind::Instance)
@@ -860,7 +869,8 @@ impl Module {
         Func: InstFn<Args>,
     {
         let name = name.info();
-        let handler: Arc<FunctionHandler> = Arc::new(move |stack, args| f.fn_call(stack, args));
+        let handler: Arc<FunctionHandler> =
+            Arc::new(move |stack, address, args, output| f.fn_call(stack, address, args, output));
         let ty = Func::ty();
         let args = Some(Func::args());
         self.assoc_fn(name, handler, ty, args, AssocKind::FieldFn(protocol))
@@ -880,7 +890,8 @@ impl Module {
         Func: InstFn<Args>,
     {
         let name = InstFnInfo::index(protocol, index);
-        let handler: Arc<FunctionHandler> = Arc::new(move |stack, args| f.fn_call(stack, args));
+        let handler: Arc<FunctionHandler> =
+            Arc::new(move |stack, address, args, output| f.fn_call(stack, address, args, output));
         let ty = Func::ty();
         let args = Some(Func::args());
         self.assoc_fn(name, handler, ty, args, AssocKind::IndexFn(protocol))
@@ -919,7 +930,8 @@ impl Module {
         Func: AsyncInstFn<Args>,
     {
         let name = name.info();
-        let handler: Arc<FunctionHandler> = Arc::new(move |stack, args| f.fn_call(stack, args));
+        let handler: Arc<FunctionHandler> =
+            Arc::new(move |stack, address, args, output| f.fn_call(stack, address, args, output));
         let ty = Func::ty();
         let args = Some(Func::args());
         self.assoc_fn(name, handler, ty, args, AssocKind::Instance)
@@ -979,7 +991,13 @@ pub trait Function<Args>: 'static + Send + Sync {
     fn args() -> usize;
 
     /// Perform the vm call.
-    fn fn_call(&self, stack: &mut Stack, args: usize) -> Result<(), VmError>;
+    fn fn_call(
+        &self,
+        stack: &mut Stack,
+        address: Address,
+        args: usize,
+        output: Address,
+    ) -> Result<(), VmError>;
 }
 
 /// Trait used to provide the [async_function][Module::async_function] function.
@@ -991,7 +1009,13 @@ pub trait AsyncFunction<Args>: 'static + Send + Sync {
     fn args() -> usize;
 
     /// Perform the vm call.
-    fn fn_call(&self, stack: &mut Stack, args: usize) -> Result<(), VmError>;
+    fn fn_call(
+        &self,
+        stack: &mut Stack,
+        address: Address,
+        args: usize,
+        output: Address,
+    ) -> Result<(), VmError>;
 }
 
 /// Trait used to provide the [inst_fn][Module::inst_fn] function.
@@ -1009,7 +1033,13 @@ pub trait InstFn<Args>: 'static + Send + Sync {
     fn ty() -> AssocType;
 
     /// Perform the vm call.
-    fn fn_call(&self, stack: &mut Stack, args: usize) -> Result<(), VmError>;
+    fn fn_call(
+        &self,
+        stack: &mut Stack,
+        address: Address,
+        args: usize,
+        output: Address,
+    ) -> Result<(), VmError>;
 }
 
 /// Trait used to provide the [async_inst_fn][Module::async_inst_fn] function.
@@ -1027,7 +1057,13 @@ pub trait AsyncInstFn<Args>: 'static + Send + Sync {
     fn ty() -> AssocType;
 
     /// Perform the vm call.
-    fn fn_call(&self, stack: &mut Stack, args: usize) -> Result<(), VmError>;
+    fn fn_call(
+        &self,
+        stack: &mut Stack,
+        address: Address,
+        args: usize,
+        output: Address,
+    ) -> Result<(), VmError>;
 }
 
 macro_rules! impl_register {
@@ -1053,13 +1089,15 @@ macro_rules! impl_register {
                 $count
             }
 
-            fn fn_call(&self, stack: &mut Stack, args: usize) -> Result<(), VmError> {
+            fn fn_call(&self, stack: &mut Stack, address: Address, args: usize, output: Address) -> Result<(), VmError> {
                 impl_register!{@check-args $count, args}
 
                 #[allow(unused_mut)]
-                let mut it = stack.drain($count)?;
+                let mut it = stack.drain_at(address, $count)?;
                 $(let $var = it.next().unwrap();)*
                 drop(it);
+
+                tracing::trace!("call");
 
                 // Safety: We hold a reference to the stack, so we can
                 // guarantee that it won't be modified.
@@ -1074,7 +1112,7 @@ macro_rules! impl_register {
                     ret
                 };
 
-                impl_register!{@return stack, ret, Return}
+                impl_register!(@return output, stack, ret);
                 Ok(())
             }
         }
@@ -1092,13 +1130,15 @@ macro_rules! impl_register {
                 $count
             }
 
-            fn fn_call(&self, stack: &mut Stack, args: usize) -> Result<(), VmError> {
+            fn fn_call(&self, stack: &mut Stack, address: Address, args: usize, output: Address) -> Result<(), VmError> {
                 impl_register!{@check-args $count, args}
 
                 #[allow(unused_mut)]
-                let mut it = stack.drain($count)?;
+                let mut it = stack.drain_at(address, $count)?;
                 $(let $var = it.next().unwrap();)*
                 drop(it);
+
+                tracing::trace!("async call");
 
                 // Safety: Future is owned and will only be called within the
                 // context of the virtual machine, which will provide
@@ -1118,7 +1158,7 @@ macro_rules! impl_register {
                     })
                 };
 
-                impl_register!{@return stack, ret, Return}
+                impl_register!(@return output, stack, ret);
                 Ok(())
             }
         }
@@ -1144,14 +1184,16 @@ macro_rules! impl_register {
                 }
             }
 
-            fn fn_call(&self, stack: &mut Stack, args: usize) -> Result<(), VmError> {
+            fn fn_call(&self, stack: &mut Stack, address: Address, args: usize, output: Address) -> Result<(), VmError> {
                 impl_register!{@check-args ($count + 1), args}
 
                 #[allow(unused_mut)]
-                let mut it = stack.drain($count + 1)?;
+                let mut it = stack.drain_at(address, $count + 1)?;
                 let inst = it.next().unwrap();
                 $(let $var = it.next().unwrap();)*
                 drop(it);
+
+                tracing::trace!(?inst, "instance call");
 
                 // Safety: We hold a reference to the stack, so we can
                 // guarantee that it won't be modified.
@@ -1166,7 +1208,7 @@ macro_rules! impl_register {
                     ret
                 };
 
-                impl_register!{@return stack, ret, Return}
+                impl_register!(@return output, stack, ret);
                 Ok(())
             }
         }
@@ -1193,14 +1235,16 @@ macro_rules! impl_register {
                 }
             }
 
-            fn fn_call(&self, stack: &mut Stack, args: usize) -> Result<(), VmError> {
+            fn fn_call(&self, stack: &mut Stack, address: Address, args: usize, output: Address) -> Result<(), VmError> {
                 impl_register!{@check-args ($count + 1), args}
 
                 #[allow(unused_mut)]
-                let mut it = stack.drain($count + 1)?;
+                let mut it = stack.drain_at(address, $count + 1)?;
                 let inst = it.next().unwrap();
                 $(let $var = it.next().unwrap();)*
                 drop(it);
+
+                tracing::trace!(?inst, "async instance call");
 
                 // Safety: Future is owned and will only be called within the
                 // context of the virtual machine, which will provide
@@ -1220,20 +1264,18 @@ macro_rules! impl_register {
                     })
                 };
 
-                impl_register!{@return stack, ret, Return}
+                impl_register!(@return output, stack, ret);
                 Ok(())
             }
         }
     };
 
-    (@return $stack:ident, $ret:ident, $ty:ty) => {
-        let $ret = match $ret.to_value() {
+    (@return $output:expr, $stack:ident, $ret:ident) => {{
+        match $ret.to_stack($stack, $output) {
             Ok($ret) => $ret,
             Err(e) => return Err(VmError::from(e.unpack_critical()?)),
-        };
-
-        $stack.push($ret);
-    };
+        }
+    }};
 
     // Expand to function variable bindings.
     (@unsafe-vars $count:expr, $($ty:ty, $var:ident, $num:expr,)*) => {

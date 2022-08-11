@@ -417,9 +417,11 @@ macro_rules! assert_warnings {
 /// Assert that the given value matches the provided pattern.
 #[macro_export]
 macro_rules! assert_matches {
-    ($value:expr, $pat:pat) => {
+    ($value:expr, $pat:pat $(=> $block:block)?) => {
         match $value {
-            $pat => (),
+            $pat => {
+                $($block)*
+            },
             other => panic!("expected {}, but was {:?}", stringify!($pat), other),
         }
     };

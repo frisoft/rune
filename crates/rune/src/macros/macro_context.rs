@@ -2,8 +2,7 @@
 
 use std::fmt;
 
-use crate::ast;
-use crate::ast::Span;
+use crate::ast::{self, Span};
 use crate::compile::{
     IrCompiler, IrError, IrEval, IrEvalContext, IrValue, ItemMeta, NoopCompileVisitor, Pool,
     Prelude, UnitBuilder,
@@ -49,6 +48,7 @@ impl<'a> MacroContext<'a> {
         let mut sources = Sources::default();
         let mut pool = Pool::default();
         let mut visitor = NoopCompileVisitor::new();
+        let mut diagnostics = Default::default();
         let mut inner = Default::default();
 
         let mut query = Query::new(
@@ -59,6 +59,7 @@ impl<'a> MacroContext<'a> {
             &mut sources,
             &mut pool,
             &mut visitor,
+            &mut diagnostics,
             &gen,
             &mut inner,
         );
@@ -102,7 +103,7 @@ impl<'a> MacroContext<'a> {
         T: IrEval,
     {
         let mut ctx = IrEvalContext {
-            c: IrCompiler {
+            compiler: IrCompiler {
                 source_id: self.item_meta.location.source_id,
                 q: self.q.borrow(),
             },

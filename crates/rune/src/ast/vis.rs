@@ -18,6 +18,12 @@ pub enum Visibility {
     In(VisibilityRestrict<VisibilityIn>),
 }
 
+impl Peek for Visibility {
+    fn peek(p: &mut Peeker<'_>) -> bool {
+        matches!(p.nth(0), K![pub])
+    }
+}
+
 impl Visibility {
     /// Return `true` if it is the `Inherited` variant
     pub const fn is_inherited(&self) -> bool {
@@ -125,6 +131,12 @@ pub struct VisibilityIn {
     pub in_token: T![in],
     /// The path the restriction applies to.
     pub path: ast::Path,
+}
+
+impl Peek for VisibilityIn {
+    fn peek(p: &mut Peeker<'_>) -> bool {
+        matches!(p.nth(0), K![in])
+    }
 }
 
 /// A restriction to visibility.

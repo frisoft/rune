@@ -16,10 +16,6 @@ pub enum Pat {
     PatTuple(PatTuple),
     /// An object pattern.
     PatObject(PatObject),
-    /// A binding `a: pattern` or `"foo": pattern`.
-    PatBinding(PatBinding),
-    /// The rest pattern `..`.
-    PatRest(PatRest),
 }
 
 /// Parsing a block expression.
@@ -72,18 +68,10 @@ impl Parse for Pat {
                 }));
             }
             K![str] => {
-                return Ok(match p.nth(1)? {
-                    K![:] => Self::PatBinding(PatBinding {
-                        attributes,
-                        key: ast::ObjectKey::LitStr(p.parse()?),
-                        colon: p.parse()?,
-                        pat: p.parse()?,
-                    }),
-                    _ => Self::PatLit(PatLit {
-                        attributes,
-                        expr: Box::new(ast::Expr::from_lit(ast::Lit::Str(p.parse()?))),
-                    }),
-                });
+                return Ok(Self::PatLit(PatLit {
+                    attributes,
+                    expr: Box::new(ast::Expr::from_lit(ast::Lit::Str(p.parse()?))),
+                }));
             }
             K![number] => {
                 return Ok(Self::PatLit(PatLit {
@@ -91,34 +79,35 @@ impl Parse for Pat {
                     expr: Box::new(ast::Expr::from_lit(ast::Lit::Number(p.parse()?))),
                 }));
             }
-            K![..] => {
-                return Ok(Self::PatRest(PatRest {
-                    attributes,
-                    dot_dot: p.parse()?,
-                }))
-            }
             K!['('] => {
                 return Ok({
-                    let _nth = p.nth(1)?;
-
                     Self::PatTuple(PatTuple {
                         attributes,
                         path: None,
-                        items: p.parse()?,
+                        open: p.parse()?,
+                        items: parse_items(p)?,
+                        rest: p.parse()?,
+                        close: p.parse()?,
                     })
                 });
             }
             K!['['] => {
                 return Ok(Self::PatVec(PatVec {
                     attributes,
-                    items: p.parse()?,
+                    open: p.parse()?,
+                    items: parse_items(p)?,
+                    rest: p.parse()?,
+                    close: p.parse()?,
                 }))
             }
             K![#] => {
                 return Ok(Self::PatObject(PatObject {
                     attributes,
                     ident: p.parse()?,
-                    items: p.parse()?,
+                    open: p.parse()?,
+                    items: parse_items(p)?,
+                    rest: p.parse()?,
+                    close: p.parse()?,
                 }))
             }
             K![-] => {
@@ -144,18 +133,18 @@ impl Parse for Pat {
                     K!['('] => Self::PatTuple(PatTuple {
                         attributes,
                         path: Some(path),
-                        items: p.parse()?,
+                        open: p.parse()?,
+                        items: parse_items(p)?,
+                        rest: p.parse()?,
+                        close: p.parse()?,
                     }),
                     K!['{'] => Self::PatObject(PatObject {
                         attributes,
                         ident: ast::ObjectIdent::Named(path),
-                        items: p.parse()?,
-                    }),
-                    K![:] => Self::PatBinding(PatBinding {
-                        attributes,
-                        key: ast::ObjectKey::Path(path),
-                        colon: p.parse()?,
-                        pat: p.parse()?,
+                        open: p.parse()?,
+                        items: parse_items(p)?,
+                        rest: p.parse()?,
+                        close: p.parse()?,
                     }),
                     _ => Self::PatPath(PatPath { attributes, path }),
                 });
@@ -174,13 +163,34 @@ impl Peek for Pat {
             K!['['] => true,
             K![#] => matches!(p.nth(1), K!['{']),
             K![_] => true,
-            K![..] => true,
             K![byte] | K![char] | K![number] | K![str] => true,
             K![true] | K![false] => true,
             K![-] => matches!(p.nth(1), K![number]),
             _ => ast::Path::peek(p),
         }
     }
+}
+
+/// Helper function to parse items.
+fn parse_items<T, S>(p: &mut Parser<'_>) -> Result<Vec<(T, Option<S>)>, ParseError>
+where
+    T: Peek + Parse,
+    S: Peek + Parse,
+{
+    let mut items = Vec::new();
+
+    while p.peek::<T>()? {
+        let expr = p.parse()?;
+        let sep = p.parse::<Option<S>>()?;
+        let is_end = sep.is_none();
+        items.push((expr, sep));
+
+        if is_end {
+            break;
+        }
+    }
+
+    Ok(items)
 }
 
 /// A literal pattern.
@@ -194,17 +204,6 @@ pub struct PatLit {
     pub expr: Box<ast::Expr>,
 }
 
-/// The rest pattern `..` and associated attributes.
-#[derive(Debug, Clone, PartialEq, Eq, ToTokens, Spanned)]
-#[non_exhaustive]
-pub struct PatRest {
-    /// Attribute associated with the rest pattern.
-    #[rune(iter)]
-    pub attributes: Vec<ast::Attribute>,
-    /// The rest token `..`.
-    pub dot_dot: T![..],
-}
-
 /// An array pattern.
 #[derive(Debug, Clone, PartialEq, Eq, ToTokens, Spanned)]
 #[non_exhaustive]
@@ -212,8 +211,16 @@ pub struct PatVec {
     /// Attributes associated with the vector pattern.
     #[rune(iter)]
     pub attributes: Vec<ast::Attribute>,
-    /// Bracketed patterns.
-    pub items: ast::Bracketed<ast::Pat, T![,]>,
+    /// The open bracket.
+    pub open: T!['['],
+    /// Values in the type.
+    #[rune(iter)]
+    pub items: Vec<(Pat, Option<T![,]>)>,
+    /// The rest pattern.
+    #[rune(iter)]
+    pub rest: Option<T![..]>,
+    /// The close bracket.
+    pub close: T![']'],
 }
 
 /// A tuple pattern.
@@ -226,8 +233,15 @@ pub struct PatTuple {
     /// The path, if the tuple is typed.
     #[rune(iter)]
     pub path: Option<ast::Path>,
+    /// The open parenthesis.
+    pub open: T!['('],
     /// The items in the tuple.
-    pub items: ast::Parenthesized<ast::Pat, T![,]>,
+    pub items: Vec<(ast::Pat, Option<T![,]>)>,
+    /// The rest pattern.
+    #[rune(iter)]
+    pub rest: Option<T![..]>,
+    /// The closing parenthesis.
+    pub close: T![')'],
 }
 
 /// An object pattern.
@@ -239,23 +253,33 @@ pub struct PatObject {
     pub attributes: Vec<ast::Attribute>,
     /// The identifier of the object pattern.
     pub ident: ast::ObjectIdent,
+    /// The open brace.
+    pub open: T!['{'],
     /// The fields matched against.
-    pub items: ast::Braced<Pat, T![,]>,
+    pub items: Vec<(PatBinding, Option<T![,]>)>,
+    /// The rest pattern.
+    #[rune(iter)]
+    pub rest: Option<T![..]>,
+    /// The closing brace.
+    pub close: T!['}'],
 }
 
 /// An object item.
 #[derive(Debug, Clone, PartialEq, Eq, ToTokens, Spanned, Parse)]
 #[non_exhaustive]
 pub struct PatBinding {
-    /// Attributes associate with the binding.
-    #[rune(iter)]
-    pub attributes: Vec<ast::Attribute>,
     /// The key of an object.
     pub key: ast::ObjectKey,
     /// The colon separator for the binding.
     pub colon: T![:],
     /// What the binding is to.
     pub pat: Box<ast::Pat>,
+}
+
+impl Peek for PatBinding {
+    fn peek(p: &mut Peeker<'_>) -> bool {
+        ast::ObjectKey::peek(p)
+    }
 }
 
 /// A path pattern.

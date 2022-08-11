@@ -308,7 +308,7 @@ fn eval_ir_scope(
         let _ = eval_ir(ir, interp, used)?;
     }
 
-    let value = if let Some(last) = &ir.last {
+    let value = if let Some(last) = &ir.tail {
         eval_ir(last, interp, used)?
     } else {
         IrValue::Unit

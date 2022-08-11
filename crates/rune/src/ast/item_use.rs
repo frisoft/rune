@@ -60,6 +60,15 @@ pub struct ItemUsePath {
     pub alias: Option<(T![as], ast::Ident)>,
 }
 
+impl Peek for ItemUsePath {
+    fn peek(p: &mut Peeker<'_>) -> bool {
+        match p.nth(0) {
+            K![::] => true,
+            _ => ItemUseSegment::peek(p),
+        }
+    }
+}
+
 /// A use component.
 #[derive(Debug, Clone, PartialEq, Eq, ToTokens, Spanned)]
 #[non_exhaustive]

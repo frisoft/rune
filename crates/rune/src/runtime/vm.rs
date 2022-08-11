@@ -1,12 +1,15 @@
-use crate::runtime::budget;
 use crate::runtime::future::SelectFuture;
+use crate::runtime::key::StringKey;
+use crate::runtime::stack::InterleavedPairMut;
 use crate::runtime::unit::UnitFn;
+use crate::runtime::{budget, Key};
 use crate::runtime::{
-    Args, Awaited, BorrowMut, Bytes, Call, Format, FormatSpec, FromValue, Function, Future,
-    Generator, GuardedArgs, Inst, InstAddress, InstAssignOp, InstOp, InstRangeLimits, InstTarget,
-    InstValue, InstVariant, Object, Panic, Protocol, Range, RangeLimits, RuntimeContext, Select,
-    Shared, Stack, Stream, Struct, Tuple, TypeCheck, Unit, UnitStruct, Value, Variant, VariantData,
-    Vec, VmError, VmErrorKind, VmExecution, VmHalt, VmIntegerRepr, VmSendExecution,
+    Address, AnyObj, Args, Awaited, BorrowMut, BorrowRef, Bytes, Call, Format, FormatSpec,
+    FromValue, Function, Future, Generator, GuardedArgs, Inst, InstAssignOp, InstOp,
+    InstRangeLimits, InstTarget, InstValue, InstVariant, Object, Panic, Protocol, Range,
+    RangeLimits, RuntimeContext, Select, Shared, Stack, StaticString, Stream, Struct, Tuple,
+    TypeCheck, Unit, UnitStruct, UnsafeToValue, Value, Variant, VariantData, Vec, VmError,
+    VmErrorKind, VmExecution, VmHalt, VmIntegerRepr, VmSendExecution,
 };
 use crate::{Hash, IntoTypeHash};
 use std::fmt;
@@ -14,59 +17,84 @@ use std::mem;
 use std::sync::Arc;
 use std::vec;
 
+/// The result of performing a call.
+#[derive(Debug)]
+#[must_use]
+pub(crate) enum CallResult<T> {
+    /// Call successful.
+    Ok(T),
+    /// Call was not supported.
+    Unsupported,
+}
+
+/// Helper impls to get rid of the lifetime associated with BorrowRef if needed.
+impl<T> CallResult<BorrowRef<'_, T>> {
+    /// Return a cloned call result.
+    fn cloned(self) -> CallResult<T>
+    where
+        T: Clone,
+    {
+        match self {
+            CallResult::Ok(value) => CallResult::Ok(value.clone()),
+            CallResult::Unsupported => CallResult::Unsupported,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CallOffset<G> {
+    /// Offset of the registered function.
+    pub(crate) offset: usize,
+    /// The way the function is called.
+    pub(crate) call: Call,
+    /// Stack address to allocate arguments from.
+    pub(crate) address: Address,
+    /// The number of arguments the function takes.
+    pub(crate) args: usize,
+    /// Slots to allocate for the function call.
+    pub(crate) frame: usize,
+    /// Output address to write to.
+    pub(crate) output: Address,
+    /// Guards used in the offset call.
+    pub(crate) guard: G,
+}
+
 /// The result from a dynamic call. Indicates if the attempted operation is
 /// supported.
 #[derive(Debug)]
-pub(crate) enum CallResult<T> {
+#[must_use]
+pub(crate) enum CallResultOrOffset<G> {
     /// Call successful. Return value is on the stack.
-    Ok(T),
+    Ok,
     /// Call failed because function was missing so the method is unsupported.
     /// Contains target value.
-    Unsupported(Value),
+    Unsupported,
+    /// Offset to call.
+    Offset(CallOffset<G>),
 }
 
-enum TargetFallback<'a> {
-    Value(Value, Value),
-    Field(&'a Value, Hash, Value),
-    Index(&'a Value, usize, Value),
-}
-
-enum TargetValue<'a, 'b> {
-    /// Resolved internal target to mutable value.
-    Value(&'a mut Value, Value),
-    /// Fallback to a different kind of operation.
-    Fallback(TargetFallback<'b>),
-}
-
-macro_rules! target_value {
-    ($vm:ident, $target:expr, $guard:ident, $lhs:ident) => {{
-        let rhs = $vm.stack.pop()?;
-
-        match $target {
-            InstTarget::Offset(offset) => TargetValue::Value($vm.stack.at_offset_mut(offset)?, rhs),
-            InstTarget::TupleField(index) => {
-                $lhs = $vm.stack.pop()?;
-
-                if let Some(value) = Vm::try_tuple_like_index_get_mut(&$lhs, index)? {
-                    $guard = value;
-                    TargetValue::Value(&mut *$guard, rhs)
-                } else {
-                    TargetValue::Fallback(TargetFallback::Index(&$lhs, index, rhs))
-                }
-            }
-            InstTarget::Field(field) => {
-                let field = $vm.unit.lookup_string(field)?;
-                $lhs = $vm.stack.pop()?;
-
-                if let Some(value) = Vm::try_object_like_index_get_mut(&$lhs, field)? {
-                    $guard = value;
-                    TargetValue::Value(&mut *$guard, rhs)
-                } else {
-                    TargetValue::Fallback(TargetFallback::Field(&$lhs, field.hash(), rhs))
-                }
+impl<G> CallResultOrOffset<G> {
+    /// Apply the call result to the virtual machine if it resulted in an offset
+    /// call.
+    #[inline]
+    fn or_call_offset_with(self, vm: &mut Vm) -> Result<CallResult<()>, VmError> {
+        match self {
+            CallResultOrOffset::Ok => Ok(CallResult::Ok(())),
+            CallResultOrOffset::Unsupported => Ok(CallResult::Unsupported),
+            CallResultOrOffset::Offset(CallOffset {
+                offset,
+                call,
+                address,
+                args,
+                frame,
+                output,
+                guard: _guard,
+            }) => {
+                vm.call_offset_fn(offset, call, address, args, frame, output)?;
+                Ok(CallResult::Ok(()))
             }
         }
-    }};
+    }
 }
 
 /// A stack which references variables indirectly from a slab.
@@ -169,14 +197,12 @@ impl Vm {
     }
 
     /// Modify the current instruction pointer.
-    pub fn modify_ip(&mut self, offset: isize) -> Result<(), VmError> {
+    pub fn modify_ip(&mut self, offset: isize) {
         self.ip = if offset < 0 {
             self.ip.wrapping_sub(-offset as usize)
         } else {
             self.ip.wrapping_add(offset as usize)
         };
-
-        Ok(())
     }
 
     /// Run the given vm to completion.
@@ -365,6 +391,33 @@ impl Vm {
         Ok(value)
     }
 
+    /// Simplified external helper to call instance function associated with
+    /// this virtual machine.
+    pub(crate) fn call_instance_fn<V, H, A>(
+        &mut self,
+        value: V,
+        hash: H,
+        args: A,
+    ) -> Result<Value, VmError>
+    where
+        V: UnsafeToValue,
+        H: IntoTypeHash,
+        A: GuardedArgs,
+    {
+        let hash = hash.into_type_hash();
+        let output = self.stack.push_with_address(Value::Unit)?;
+
+        if let CallResult::Unsupported = self
+            .context
+            .call_instance_fn(&mut self.stack, &self.unit, value, hash, args, output)?
+            .or_call_offset_with(self)?
+        {
+            return Err(VmError::from(VmErrorKind::MissingFunction { hash }));
+        }
+
+        Ok(mem::take(self.stack.at_mut(output)?))
+    }
+
     /// Update the instruction pointer to match the function matching the given
     /// name and check that the number of argument matches.
     fn set_entrypoint<N>(&mut self, name: N, count: usize) -> Result<(), VmError>
@@ -381,16 +434,17 @@ impl Vm {
             }
         })?;
 
-        let offset = match info {
+        let (offset, frame) = match info {
             // NB: we ignore the calling convention.
             // everything is just async when called externally.
             UnitFn::Offset {
                 offset,
                 args: expected,
+                frame,
                 ..
             } => {
-                Self::check_args(count, expected)?;
-                offset
+                check_args(count, expected)?;
+                (offset, frame)
             }
             _ => {
                 return Err(VmError::from(VmErrorKind::MissingFunction { hash }));
@@ -399,113 +453,9 @@ impl Vm {
 
         self.ip = offset;
         self.stack.clear();
+        self.stack.resize_frame(frame)?;
         self.call_frames.clear();
         Ok(())
-    }
-
-    /// Helper function to call an instance function.
-    #[inline(always)]
-    pub(crate) fn call_instance_fn<H, A>(
-        &mut self,
-        target: Value,
-        hash: H,
-        args: A,
-    ) -> Result<CallResult<()>, VmError>
-    where
-        H: IntoTypeHash,
-        A: GuardedArgs,
-    {
-        let count = args.count();
-        let full_count = args.count() + 1;
-        let type_hash = target.type_hash()?;
-        self.stack.push(target);
-
-        // Safety: We hold onto the guard for the duration of this call.
-        let _guard = unsafe { args.unsafe_into_stack(&mut self.stack)? };
-
-        let hash = Hash::instance_function(type_hash, hash.into_type_hash());
-
-        if let Some(UnitFn::Offset {
-            offset,
-            call,
-            args: expected,
-        }) = self.unit.function(hash)
-        {
-            Self::check_args(full_count, expected)?;
-            self.call_offset_fn(offset, call, full_count)?;
-            return Ok(CallResult::Ok(()));
-        }
-
-        if let Some(handler) = self.context.function(hash) {
-            handler(&mut self.stack, full_count)?;
-            return Ok(CallResult::Ok(()));
-        }
-
-        // Restore the stack!
-        self.stack.popn(count)?;
-        let target = self.stack.pop()?;
-        Ok(CallResult::Unsupported(target))
-    }
-
-    /// Helper to call a field function.
-    #[inline(always)]
-    fn call_field_fn<H, A>(
-        &mut self,
-        protocol: Protocol,
-        target: Value,
-        hash: H,
-        args: A,
-    ) -> Result<CallResult<()>, VmError>
-    where
-        H: IntoTypeHash,
-        A: Args,
-    {
-        let count = args.count();
-        let full_count = count + 1;
-        let hash = Hash::field_fn(protocol, target.type_hash()?, hash.into_type_hash());
-
-        self.stack.push(target);
-        args.into_stack(&mut self.stack)?;
-
-        if let Some(handler) = self.context.function(hash) {
-            handler(&mut self.stack, full_count)?;
-            return Ok(CallResult::Ok(()));
-        }
-
-        // Restore the stack!
-        self.stack.popn(count)?;
-        let target = self.stack.pop()?;
-        Ok(CallResult::Unsupported(target))
-    }
-
-    /// Helper to call an index function.
-    #[inline(always)]
-    fn call_index_fn<A>(
-        &mut self,
-        protocol: Protocol,
-        target: Value,
-        index: usize,
-        args: A,
-    ) -> Result<CallResult<()>, VmError>
-    where
-        A: Args,
-    {
-        let count = args.count();
-        let full_count = count + 1;
-        let hash = Hash::index_fn(protocol, target.type_hash()?, Hash::index(index));
-
-        self.stack.push(target);
-        args.into_stack(&mut self.stack)?;
-
-        if let Some(handler) = self.context.function(hash) {
-            handler(&mut self.stack, full_count)?;
-            return Ok(CallResult::Ok(()));
-        }
-
-        // Restore the stack!
-        self.stack.popn(count)?;
-        let target = self.stack.pop()?;
-        Ok(CallResult::Unsupported(target))
     }
 
     fn internal_boolean_ops(
@@ -513,15 +463,16 @@ impl Vm {
         int_op: fn(i64, i64) -> bool,
         float_op: fn(f64, f64) -> bool,
         op: &'static str,
-        lhs: InstAddress,
-        rhs: InstAddress,
+        lhs: Address,
+        rhs: Address,
+        output: Address,
     ) -> Result<(), VmError> {
-        let rhs = self.stack.address(rhs)?;
-        let lhs = self.stack.address(lhs)?;
+        let rhs = self.stack.at(rhs)?;
+        let lhs = self.stack.at(lhs)?;
 
         let out = match (lhs, rhs) {
-            (Value::Integer(lhs), Value::Integer(rhs)) => int_op(lhs, rhs),
-            (Value::Float(lhs), Value::Float(rhs)) => float_op(lhs, rhs),
+            (Value::Integer(lhs), Value::Integer(rhs)) => int_op(*lhs, *rhs),
+            (Value::Float(lhs), Value::Float(rhs)) => float_op(*lhs, *rhs),
             (lhs, rhs) => {
                 return Err(VmError::from(VmErrorKind::UnsupportedBinaryOperation {
                     op,
@@ -531,7 +482,7 @@ impl Vm {
             }
         };
 
-        self.stack.push(out);
+        self.stack.store(output, out)?;
         Ok(())
     }
 
@@ -539,454 +490,51 @@ impl Vm {
     ///
     /// This will cause the `args` number of elements on the stack to be
     /// associated and accessible to the new call frame.
-    pub(crate) fn push_call_frame(&mut self, ip: usize, args: usize) -> Result<(), VmError> {
-        let stack_top = self.stack.swap_stack_bottom(args)?;
+    #[tracing::instrument(skip(self))]
+    pub(crate) fn push_call_frame(
+        &mut self,
+        ip: usize,
+        address: Address,
+        frame: usize,
+        output: Address,
+    ) -> Result<(), VmError> {
+        let (stack_bottom, stack) = self.stack.replace_stack_frame(address, frame)?;
 
-        self.call_frames.push(CallFrame {
+        let frame = CallFrame {
             ip: self.ip,
-            stack_bottom: stack_top,
-        });
+            stack_bottom,
+            stack,
+            output,
+        };
 
+        tracing::trace!(?frame, "pushing call frame");
+
+        self.call_frames.push(frame);
         self.ip = ip.wrapping_sub(1);
         Ok(())
     }
 
     /// Pop a call frame and return it.
-    fn pop_call_frame(&mut self) -> Result<bool, VmError> {
+    #[tracing::instrument(skip(self))]
+    fn pop_call_frame(&mut self) -> Result<(bool, Address), VmError> {
         let frame = match self.call_frames.pop() {
             Some(frame) => frame,
             None => {
-                self.stack.check_stack_top()?;
-                return Ok(true);
+                self.stack.resize_frame(1)?;
+                return Ok((true, Address::BASE));
             }
         };
 
-        self.stack.pop_stack_top(frame.stack_bottom)?;
+        tracing::trace!(?frame, "popping call frame");
+        self.stack.pop_stack_frame(frame.stack_bottom, frame.stack);
         self.ip = frame.ip;
-        Ok(false)
-    }
-
-    /// Implementation of getting a string index on an object-like type.
-    fn try_object_like_index_get(target: &Value, field: &str) -> Result<Option<Value>, VmError> {
-        let value = match &target {
-            Value::Object(target) => target.borrow_ref()?.get(field).cloned(),
-            Value::Struct(target) => target.borrow_ref()?.get(field).cloned(),
-            Value::Variant(variant) => match variant.borrow_ref()?.data() {
-                VariantData::Struct(target) => target.get(field).cloned(),
-                _ => return Ok(None),
-            },
-            _ => return Ok(None),
-        };
-
-        let value = match value {
-            Some(value) => value,
-            None => {
-                return Err(VmError::from(VmErrorKind::MissingField {
-                    target: target.type_info()?,
-                    field: field.to_owned(),
-                }));
-            }
-        };
-
-        Ok(Some(value))
-    }
-
-    /// Implementation of getting a string index on an object-like type.
-    fn try_tuple_like_index_get(target: &Value, index: usize) -> Result<Option<Value>, VmError> {
-        let value = match target {
-            Value::Unit => None,
-            Value::Tuple(tuple) => tuple.borrow_ref()?.get(index).cloned(),
-            Value::Vec(vec) => vec.borrow_ref()?.get(index).cloned(),
-            Value::Result(result) => {
-                let result = result.borrow_ref()?;
-
-                match &*result {
-                    Ok(value) if index == 0 => Some(value.clone()),
-                    Err(value) if index == 0 => Some(value.clone()),
-                    _ => None,
-                }
-            }
-            Value::Option(option) => {
-                let option = option.borrow_ref()?;
-
-                match &*option {
-                    Some(value) if index == 0 => Some(value.clone()),
-                    _ => None,
-                }
-            }
-            Value::GeneratorState(state) => {
-                use crate::runtime::GeneratorState::*;
-                let state = state.borrow_ref()?;
-
-                match &*state {
-                    Yielded(value) if index == 0 => Some(value.clone()),
-                    Complete(value) if index == 0 => Some(value.clone()),
-                    _ => None,
-                }
-            }
-            Value::TupleStruct(tuple_struct) => {
-                let tuple_struct = tuple_struct.borrow_ref()?;
-                tuple_struct.data().get(index).cloned()
-            }
-            Value::Variant(variant) => {
-                let variant = variant.borrow_ref()?;
-
-                match variant.data() {
-                    VariantData::Tuple(tuple) => tuple.get(index).cloned(),
-                    _ => return Ok(None),
-                }
-            }
-            _ => return Ok(None),
-        };
-
-        let value = match value {
-            Some(value) => value,
-            None => {
-                return Err(VmError::from(VmErrorKind::MissingIndex {
-                    target: target.type_info()?,
-                    index: VmIntegerRepr::from(index),
-                }));
-            }
-        };
-
-        Ok(Some(value))
-    }
-
-    /// Implementation of getting a mutable value out of a tuple-like value.
-    fn try_tuple_like_index_get_mut(
-        target: &Value,
-        index: usize,
-    ) -> Result<Option<BorrowMut<'_, Value>>, VmError> {
-        let value = match target {
-            Value::Unit => None,
-            Value::Tuple(tuple) => {
-                let tuple = tuple.borrow_mut()?;
-
-                BorrowMut::try_map(tuple, |tuple| tuple.get_mut(index))
-            }
-            Value::Vec(vec) => {
-                let vec = vec.borrow_mut()?;
-
-                BorrowMut::try_map(vec, |vec| vec.get_mut(index))
-            }
-            Value::Result(result) => {
-                let result = result.borrow_mut()?;
-
-                BorrowMut::try_map(result, |result| match result {
-                    Ok(value) if index == 0 => Some(value),
-                    Err(value) if index == 0 => Some(value),
-                    _ => None,
-                })
-            }
-            Value::Option(option) => {
-                let option = option.borrow_mut()?;
-
-                BorrowMut::try_map(option, |option| match option {
-                    Some(value) if index == 0 => Some(value),
-                    _ => None,
-                })
-            }
-            Value::GeneratorState(state) => {
-                use crate::runtime::GeneratorState::*;
-                let state = state.borrow_mut()?;
-
-                BorrowMut::try_map(state, |state| match state {
-                    Yielded(value) if index == 0 => Some(value),
-                    Complete(value) if index == 0 => Some(value),
-                    _ => None,
-                })
-            }
-            Value::TupleStruct(tuple_struct) => {
-                let tuple_struct = tuple_struct.borrow_mut()?;
-
-                BorrowMut::try_map(tuple_struct, |tuple_struct| tuple_struct.get_mut(index))
-            }
-            Value::Variant(variant) => {
-                let variant = variant.borrow_mut()?;
-
-                BorrowMut::try_map(variant, |variant| match variant.data_mut() {
-                    VariantData::Tuple(tuple) => tuple.get_mut(index),
-                    _ => None,
-                })
-            }
-            _ => return Ok(None),
-        };
-
-        let value = match value {
-            Some(value) => value,
-            None => {
-                return Err(VmError::from(VmErrorKind::MissingIndex {
-                    target: target.type_info()?,
-                    index: VmIntegerRepr::from(index),
-                }));
-            }
-        };
-
-        Ok(Some(value))
-    }
-
-    /// Implementation of getting a mutable string index on an object-like type.
-    fn try_object_like_index_get_mut<'a>(
-        target: &'a Value,
-        field: &str,
-    ) -> Result<Option<BorrowMut<'a, Value>>, VmError> {
-        let value = match &target {
-            Value::Object(target) => {
-                let target = target.borrow_mut()?;
-                BorrowMut::try_map(target, |target| target.get_mut(field))
-            }
-            Value::Struct(target) => {
-                let target = target.borrow_mut()?;
-                BorrowMut::try_map(target, |target| target.get_mut(field))
-            }
-            Value::Variant(target) => {
-                BorrowMut::try_map(target.borrow_mut()?, |target| match target.data_mut() {
-                    VariantData::Struct(st) => st.get_mut(field),
-                    _ => None,
-                })
-            }
-            _ => return Ok(None),
-        };
-
-        let value = match value {
-            Some(value) => value,
-            None => {
-                return Err(VmError::from(VmErrorKind::MissingField {
-                    target: target.type_info()?,
-                    field: field.to_owned(),
-                }));
-            }
-        };
-
-        Ok(Some(value))
-    }
-
-    /// Implementation of getting a string index on an object-like type.
-    fn try_tuple_like_index_set(
-        target: &Value,
-        index: usize,
-        value: Value,
-    ) -> Result<bool, VmError> {
-        match target {
-            Value::Unit => Ok(false),
-            Value::Tuple(tuple) => {
-                let mut tuple = tuple.borrow_mut()?;
-
-                if let Some(target) = tuple.get_mut(index) {
-                    *target = value;
-                    return Ok(true);
-                }
-
-                Ok(false)
-            }
-            Value::Vec(vec) => {
-                let mut vec = vec.borrow_mut()?;
-
-                if let Some(target) = vec.get_mut(index) {
-                    *target = value;
-                    return Ok(true);
-                }
-
-                Ok(false)
-            }
-            Value::Result(result) => {
-                let mut result = result.borrow_mut()?;
-
-                let target = match &mut *result {
-                    Ok(ok) if index == 0 => ok,
-                    Err(err) if index == 0 => err,
-                    _ => return Ok(false),
-                };
-
-                *target = value;
-                Ok(true)
-            }
-            Value::Option(option) => {
-                let mut option = option.borrow_mut()?;
-
-                let target = match &mut *option {
-                    Some(some) if index == 0 => some,
-                    _ => return Ok(false),
-                };
-
-                *target = value;
-                Ok(true)
-            }
-            Value::TupleStruct(tuple_struct) => {
-                let mut tuple_struct = tuple_struct.borrow_mut()?;
-
-                if let Some(target) = tuple_struct.get_mut(index) {
-                    *target = value;
-                    return Ok(true);
-                }
-
-                Ok(false)
-            }
-            Value::Variant(variant) => {
-                let mut variant = variant.borrow_mut()?;
-
-                if let VariantData::Tuple(data) = variant.data_mut() {
-                    if let Some(target) = data.get_mut(index) {
-                        *target = value;
-                        return Ok(true);
-                    }
-                }
-
-                Ok(false)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    /// Implementation of getting a string index on an object-like type.
-    fn try_object_slot_index_get(
-        &mut self,
-        target: Value,
-        string_slot: usize,
-    ) -> Result<CallResult<Value>, VmError> {
-        let index = self.unit.lookup_string(string_slot)?;
-
-        match target {
-            Value::Object(object) => {
-                let object = object.borrow_ref()?;
-
-                if let Some(value) = object.get(&***index) {
-                    return Ok(CallResult::Ok(value.clone()));
-                }
-            }
-            Value::Struct(typed_object) => {
-                let typed_object = typed_object.borrow_ref()?;
-
-                if let Some(value) = typed_object.get(&***index) {
-                    return Ok(CallResult::Ok(value.clone()));
-                }
-            }
-            Value::Variant(variant) => {
-                let variant = variant.borrow_ref()?;
-
-                if let VariantData::Struct(data) = variant.data() {
-                    if let Some(value) = data.get(&***index) {
-                        return Ok(CallResult::Ok(value.clone()));
-                    }
-                }
-            }
-            target => {
-                let hash = index.hash();
-
-                return Ok(match self.call_field_fn(Protocol::GET, target, hash, ())? {
-                    CallResult::Ok(()) => CallResult::Ok(self.stack.pop()?),
-                    CallResult::Unsupported(target) => CallResult::Unsupported(target),
-                });
-            }
-        }
-
-        Err(VmError::from(VmErrorKind::ObjectIndexMissing {
-            slot: string_slot,
-        }))
-    }
-
-    fn try_object_slot_index_set(
-        &mut self,
-        target: Value,
-        string_slot: usize,
-        value: Value,
-    ) -> Result<CallResult<()>, VmError> {
-        let field = self.unit.lookup_string(string_slot)?;
-
-        Ok(match target {
-            Value::Object(object) => {
-                let mut object = object.borrow_mut()?;
-                object.insert(field.as_str().to_owned(), value);
-                return Ok(CallResult::Ok(()));
-            }
-            Value::Struct(typed_object) => {
-                let mut typed_object = typed_object.borrow_mut()?;
-
-                if let Some(v) = typed_object.get_mut(field.as_str()) {
-                    *v = value;
-                    return Ok(CallResult::Ok(()));
-                }
-
-                return Err(VmError::from(VmErrorKind::MissingField {
-                    field: field.as_str().to_owned(),
-                    target: typed_object.type_info(),
-                }));
-            }
-            Value::Variant(variant) => {
-                let mut variant = variant.borrow_mut()?;
-
-                if let VariantData::Struct(data) = variant.data_mut() {
-                    if let Some(v) = data.get_mut(field.as_str()) {
-                        *v = value;
-                        return Ok(CallResult::Ok(()));
-                    }
-                }
-
-                return Err(VmError::from(VmErrorKind::MissingField {
-                    field: field.as_str().to_owned(),
-                    target: variant.type_info(),
-                }));
-            }
-            target => {
-                let hash = field.hash();
-
-                match self.call_field_fn(Protocol::SET, target, hash, (value,))? {
-                    CallResult::Ok(()) => {
-                        self.stack.pop()?;
-                        CallResult::Ok(())
-                    }
-                    result => result,
-                }
-            }
-        })
-    }
-
-    fn on_tuple<F, O>(&mut self, ty: TypeCheck, value: &Value, f: F) -> Result<Option<O>, VmError>
-    where
-        F: FnOnce(&[Value]) -> O,
-    {
-        use std::slice;
-
-        Ok(match (ty, value) {
-            (TypeCheck::Tuple, Value::Tuple(tuple)) => Some(f(&*tuple.borrow_ref()?)),
-            (TypeCheck::Vec, Value::Vec(vec)) => Some(f(&*vec.borrow_ref()?)),
-            (TypeCheck::Result(v), Value::Result(result)) => {
-                let result = result.borrow_ref()?;
-
-                Some(match (v, &*result) {
-                    (0, Ok(ok)) => f(slice::from_ref(ok)),
-                    (1, Err(err)) => f(slice::from_ref(err)),
-                    _ => return Ok(None),
-                })
-            }
-            (TypeCheck::Option(v), Value::Option(option)) => {
-                let option = option.borrow_ref()?;
-
-                Some(match (v, &*option) {
-                    (0, Some(some)) => f(slice::from_ref(some)),
-                    (1, None) => f(&[]),
-                    _ => return Ok(None),
-                })
-            }
-            (TypeCheck::GeneratorState(v), Value::GeneratorState(state)) => {
-                use crate::runtime::GeneratorState::*;
-                let state = state.borrow_ref()?;
-
-                Some(match (v, &*state) {
-                    (0, Complete(complete)) => f(slice::from_ref(complete)),
-                    (1, Yielded(yielded)) => f(slice::from_ref(yielded)),
-                    _ => return Ok(None),
-                })
-            }
-            (TypeCheck::Unit, Value::Unit) => Some(f(&[])),
-            _ => None,
-        })
+        Ok((false, frame.output))
     }
 
     /// Internal implementation of the instance check.
-    fn test_is_instance(&mut self, lhs: InstAddress, rhs: InstAddress) -> Result<bool, VmError> {
-        let b = self.stack.address(rhs)?;
-        let a = self.stack.address(lhs)?;
+    fn test_is_instance(&mut self, lhs: Address, rhs: Address) -> Result<bool, VmError> {
+        let b = self.stack.at(rhs)?;
+        let a = self.stack.at(lhs)?;
 
         let hash = match b {
             Value::Type(hash) => hash,
@@ -998,18 +546,19 @@ impl Vm {
             }
         };
 
-        Ok(a.type_hash()? == hash)
+        Ok(a.type_hash()? == *hash)
     }
 
     fn internal_boolean_op(
         &mut self,
         bool_op: impl FnOnce(bool, bool) -> bool,
         op: &'static str,
-        lhs: InstAddress,
-        rhs: InstAddress,
+        lhs: Address,
+        rhs: Address,
+        output: Address,
     ) -> Result<(), VmError> {
-        let rhs = self.stack.address(rhs)?;
-        let lhs = self.stack.address(lhs)?;
+        let rhs = self.stack.at(rhs)?.clone();
+        let lhs = self.stack.at(lhs)?.clone();
 
         let out = match (lhs, rhs) {
             (Value::Bool(lhs), Value::Bool(rhs)) => bool_op(lhs, rhs),
@@ -1022,34 +571,58 @@ impl Vm {
             }
         };
 
-        self.stack.push(out);
+        self.stack.store(output, out)?;
         Ok(())
     }
 
     /// Construct a future from calling an async function.
-    fn call_generator_fn(&mut self, offset: usize, args: usize) -> Result<(), VmError> {
-        let stack = self.stack.drain(args)?.collect::<Stack>();
+    fn call_generator_fn(
+        &mut self,
+        offset: usize,
+        address: Address,
+        args: usize,
+        frame: usize,
+        output: Address,
+    ) -> Result<(), VmError> {
+        let mut stack = self.stack.drain_at(address, args)?.collect::<Stack>();
+        stack.resize_frame(frame)?;
         let mut vm = Self::with_stack(self.context.clone(), self.unit.clone(), stack);
         vm.ip = offset;
-        self.stack.push(Generator::new(vm));
+        self.stack.store(output, Generator::new(vm))?;
         Ok(())
     }
 
     /// Construct a stream from calling a function.
-    fn call_stream_fn(&mut self, offset: usize, args: usize) -> Result<(), VmError> {
-        let stack = self.stack.drain(args)?.collect::<Stack>();
+    fn call_stream_fn(
+        &mut self,
+        offset: usize,
+        address: Address,
+        args: usize,
+        frame: usize,
+        output: Address,
+    ) -> Result<(), VmError> {
+        let mut stack = self.stack.drain_at(address, args)?.collect::<Stack>();
+        stack.resize_frame(frame)?;
         let mut vm = Self::with_stack(self.context.clone(), self.unit.clone(), stack);
         vm.ip = offset;
-        self.stack.push(Stream::new(vm));
+        self.stack.store(output, Stream::new(vm))?;
         Ok(())
     }
 
     /// Construct a future from calling a function.
-    fn call_async_fn(&mut self, offset: usize, args: usize) -> Result<(), VmError> {
-        let stack = self.stack.drain(args)?.collect::<Stack>();
+    fn call_async_fn(
+        &mut self,
+        offset: usize,
+        address: Address,
+        args: usize,
+        frame: usize,
+        output: Address,
+    ) -> Result<(), VmError> {
+        let mut stack = self.stack.drain_at(address, args)?.collect::<Stack>();
+        stack.resize_frame(frame)?;
         let mut vm = Self::with_stack(self.context.clone(), self.unit.clone(), stack);
         vm.ip = offset;
-        self.stack.push(Future::new(vm.async_complete()));
+        self.stack.store(output, Future::new(vm.async_complete()))?;
         Ok(())
     }
 
@@ -1058,20 +631,23 @@ impl Vm {
         &mut self,
         offset: usize,
         call: Call,
+        address: Address,
         args: usize,
+        frame: usize,
+        output: Address,
     ) -> Result<(), VmError> {
         match call {
             Call::Async => {
-                self.call_async_fn(offset, args)?;
+                self.call_async_fn(offset, address, args, frame, output)?;
             }
             Call::Immediate => {
-                self.push_call_frame(offset, args)?;
+                self.push_call_frame(offset, address, frame, output)?;
             }
             Call::Stream => {
-                self.call_stream_fn(offset, args)?;
+                self.call_stream_fn(offset, address, args, frame, output)?;
             }
             Call::Generator => {
-                self.call_generator_fn(offset, args)?;
+                self.call_generator_fn(offset, address, args, frame, output)?;
             }
         }
 
@@ -1080,75 +656,36 @@ impl Vm {
 
     fn internal_num_assign(
         &mut self,
+        lhs: Address,
+        rhs: Address,
         target: InstTarget,
         protocol: Protocol,
         error: fn() -> VmErrorKind,
         integer_op: fn(i64, i64) -> Option<i64>,
         float_op: fn(f64, f64) -> f64,
+        output: Address,
     ) -> Result<(), VmError> {
-        let lhs;
-        let mut guard;
-
-        let fallback = match target_value!(self, target, guard, lhs) {
-            TargetValue::Value(lhs, rhs) => match (lhs, rhs) {
+        target_value(
+            self,
+            lhs,
+            rhs,
+            target,
+            protocol,
+            output,
+            |lhs, rhs| match (lhs, rhs) {
                 (Value::Integer(lhs), Value::Integer(rhs)) => {
-                    let out = integer_op(*lhs, rhs).ok_or_else(error)?;
+                    let out = integer_op(*lhs, *rhs).ok_or_else(error)?;
                     *lhs = out;
-                    return Ok(());
+                    Ok(CallResult::Ok(()))
                 }
                 (Value::Float(lhs), Value::Float(rhs)) => {
-                    let out = float_op(*lhs, rhs);
+                    let out = float_op(*lhs, *rhs);
                     *lhs = out;
-                    return Ok(());
+                    Ok(CallResult::Ok(()))
                 }
-                (lhs, rhs) => TargetFallback::Value(lhs.clone(), rhs),
+                _ => Ok(CallResult::Unsupported),
             },
-            TargetValue::Fallback(fallback) => fallback,
-        };
-
-        self.target_fallback(fallback, protocol)
-    }
-
-    /// Execute a fallback operation.
-    fn target_fallback(
-        &mut self,
-        fallback: TargetFallback<'_>,
-        protocol: Protocol,
-    ) -> Result<(), VmError> {
-        match fallback {
-            TargetFallback::Value(lhs, rhs) => {
-                match self.call_instance_fn(lhs, protocol, (&rhs,))? {
-                    CallResult::Ok(()) => <()>::from_value(self.stack.pop()?)?,
-                    CallResult::Unsupported(lhs) => {
-                        return Err(VmError::from(VmErrorKind::UnsupportedBinaryOperation {
-                            op: protocol.name,
-                            lhs: lhs.type_info()?,
-                            rhs: rhs.type_info()?,
-                        }));
-                    }
-                };
-
-                Ok(())
-            }
-            TargetFallback::Field(lhs, hash, rhs) => {
-                if let CallResult::Unsupported(lhs) =
-                    self.call_field_fn(protocol, lhs.clone(), hash, (rhs,))?
-                {
-                    return Err(VmError::from(VmErrorKind::UnsupportedObjectSlotIndexGet {
-                        target: lhs.type_info()?,
-                    }));
-                }
-
-                let value = self.stack.pop()?;
-                <()>::from_value(value)?;
-                Ok(())
-            }
-            TargetFallback::Index(lhs, ..) => {
-                Err(VmError::from(VmErrorKind::UnsupportedTupleIndexGet {
-                    target: lhs.type_info()?,
-                }))
-            }
-        }
+        )
     }
 
     /// Internal impl of a numeric operation.
@@ -1158,33 +695,42 @@ impl Vm {
         error: fn() -> VmErrorKind,
         integer_op: fn(i64, i64) -> Option<i64>,
         float_op: fn(f64, f64) -> f64,
-        lhs: InstAddress,
-        rhs: InstAddress,
+        lhs_address: Address,
+        rhs_address: Address,
+        output: Address,
     ) -> Result<(), VmError> {
-        let rhs = self.stack.address(rhs)?;
-        let lhs = self.stack.address(lhs)?;
+        let rhs = self.stack.at(rhs_address)?;
+        let lhs = self.stack.at(lhs_address)?;
 
-        let (lhs, rhs) = match (lhs, rhs) {
+        match (lhs, rhs) {
             (Value::Integer(lhs), Value::Integer(rhs)) => {
-                self.stack.push(integer_op(lhs, rhs).ok_or_else(error)?);
+                self.stack
+                    .store(output, integer_op(*lhs, *rhs).ok_or_else(error)?)?;
                 return Ok(());
             }
             (Value::Float(lhs), Value::Float(rhs)) => {
-                self.stack.push(float_op(lhs, rhs));
+                self.stack.store(output, float_op(*lhs, *rhs))?;
                 return Ok(());
             }
-            (lhs, rhs) => (lhs, rhs),
-        };
-
-        if let CallResult::Unsupported(lhs) = self.call_instance_fn(lhs, protocol, (&rhs,))? {
-            Err(VmError::from(VmErrorKind::UnsupportedBinaryOperation {
-                op: protocol.name,
-                lhs: lhs.type_info()?,
-                rhs: rhs.type_info()?,
-            }))
-        } else {
-            Ok(())
+            _ => {}
         }
+
+        let lhs = lhs.clone();
+        let rhs = rhs.clone();
+
+        if let CallResult::Ok(()) = self
+            .context
+            .call_instance_fn(&mut self.stack, &self.unit, lhs, protocol, (rhs,), output)?
+            .or_call_offset_with(self)?
+        {
+            return Ok(());
+        }
+
+        Err(VmError::from(VmErrorKind::UnsupportedBinaryOperation {
+            op: protocol.name,
+            lhs: self.stack.at(lhs_address)?.type_info()?,
+            rhs: self.stack.at(rhs_address)?.type_info()?,
+        }))
     }
 
     /// Internal impl of a numeric operation.
@@ -1192,29 +738,44 @@ impl Vm {
         &mut self,
         protocol: Protocol,
         integer_op: fn(i64, i64) -> i64,
-        lhs: InstAddress,
-        rhs: InstAddress,
+        lhs_address: Address,
+        rhs_address: Address,
+        output: Address,
     ) -> Result<(), VmError> {
-        let rhs = self.stack.address(rhs)?;
-        let lhs = self.stack.address(lhs)?;
+        let lhs = self.stack.at(lhs_address)?;
+        let rhs = self.stack.at(rhs_address)?;
 
         let (lhs, rhs) = match (lhs, rhs) {
             (Value::Integer(lhs), Value::Integer(rhs)) => {
-                self.stack.push(integer_op(lhs, rhs));
+                self.stack.store(output, integer_op(*lhs, *rhs))?;
                 return Ok(());
             }
             (lhs, rhs) => (lhs, rhs),
         };
 
-        if let CallResult::Unsupported(lhs) = self.call_instance_fn(lhs, protocol, (&rhs,))? {
-            Err(VmError::from(VmErrorKind::UnsupportedBinaryOperation {
-                op: protocol.name,
-                lhs: lhs.type_info()?,
-                rhs: rhs.type_info()?,
-            }))
-        } else {
-            Ok(())
+        let lhs = lhs.clone();
+        let rhs = rhs.clone();
+
+        if let CallResult::Ok(()) = self
+            .context
+            .call_instance_fn(
+                &mut self.stack,
+                &self.unit,
+                lhs.clone(),
+                protocol,
+                (rhs.clone(),),
+                output,
+            )?
+            .or_call_offset_with(self)?
+        {
+            return Ok(());
         }
+
+        Err(VmError::from(VmErrorKind::UnsupportedBinaryOperation {
+            op: protocol.name,
+            lhs: self.stack.at(lhs_address)?.type_info()?,
+            rhs: self.stack.at(rhs_address)?.type_info()?,
+        }))
     }
 
     /// Internal impl of a numeric operation.
@@ -1223,56 +784,74 @@ impl Vm {
         protocol: Protocol,
         integer_op: fn(i64, i64) -> i64,
         bool_op: fn(bool, bool) -> bool,
-        lhs: InstAddress,
-        rhs: InstAddress,
+        lhs_address: Address,
+        rhs_address: Address,
+        output: Address,
     ) -> Result<(), VmError> {
-        let rhs = self.stack.address(rhs)?;
-        let lhs = self.stack.address(lhs)?;
+        let lhs = self.stack.at(lhs_address)?;
+        let rhs = self.stack.at(rhs_address)?;
 
         let (lhs, rhs) = match (lhs, rhs) {
             (Value::Integer(lhs), Value::Integer(rhs)) => {
-                self.stack.push(integer_op(lhs, rhs));
+                self.stack.store(output, integer_op(*lhs, *rhs))?;
                 return Ok(());
             }
             (Value::Bool(lhs), Value::Bool(rhs)) => {
-                self.stack.push(bool_op(lhs, rhs));
+                self.stack.store(output, bool_op(*lhs, *rhs))?;
                 return Ok(());
             }
             (lhs, rhs) => (lhs, rhs),
         };
 
-        if let CallResult::Unsupported(lhs) = self.call_instance_fn(lhs, protocol, (&rhs,))? {
-            Err(VmError::from(VmErrorKind::UnsupportedBinaryOperation {
-                op: protocol.name,
-                lhs: lhs.type_info()?,
-                rhs: rhs.type_info()?,
-            }))
-        } else {
-            Ok(())
+        let lhs = lhs.clone();
+        let rhs = rhs.clone();
+
+        if let CallResult::Ok(()) = self
+            .context
+            .call_instance_fn(
+                &mut self.stack,
+                &self.unit,
+                lhs.clone(),
+                protocol,
+                (rhs.clone(),),
+                output,
+            )?
+            .or_call_offset_with(self)?
+        {
+            return Ok(());
         }
+
+        Err(VmError::from(VmErrorKind::UnsupportedBinaryOperation {
+            op: protocol.name,
+            lhs: self.stack.at(lhs_address)?.type_info()?,
+            rhs: self.stack.at(rhs_address)?.type_info()?,
+        }))
     }
 
     fn internal_infallible_bitwise_assign(
         &mut self,
+        lhs: Address,
+        rhs: Address,
         target: InstTarget,
         protocol: Protocol,
         integer_op: fn(&mut i64, i64),
+        output: Address,
     ) -> Result<(), VmError> {
-        let lhs;
-        let mut guard;
-
-        let fallback = match target_value!(self, target, guard, lhs) {
-            TargetValue::Value(lhs, rhs) => match (lhs, rhs) {
+        target_value(
+            self,
+            lhs,
+            rhs,
+            target,
+            protocol,
+            output,
+            |lhs, rhs| match (lhs, rhs) {
                 (Value::Integer(lhs), Value::Integer(rhs)) => {
-                    integer_op(lhs, rhs);
-                    return Ok(());
+                    integer_op(lhs, *rhs);
+                    Ok(CallResult::Ok(()))
                 }
-                (lhs, rhs) => TargetFallback::Value(lhs.clone(), rhs),
+                _ => Ok(CallResult::Unsupported),
             },
-            TargetValue::Fallback(fallback) => fallback,
-        };
-
-        self.target_fallback(fallback, protocol)
+        )
     }
 
     fn internal_bitwise(
@@ -1280,79 +859,93 @@ impl Vm {
         protocol: Protocol,
         error: fn() -> VmErrorKind,
         integer_op: fn(i64, i64) -> Option<i64>,
-        lhs: InstAddress,
-        rhs: InstAddress,
+        lhs_address: Address,
+        rhs_address: Address,
+        output: Address,
     ) -> Result<(), VmError> {
-        let rhs = self.stack.address(rhs)?;
-        let lhs = self.stack.address(lhs)?;
+        let lhs = self.stack.at(lhs_address)?;
+        let rhs = self.stack.at(rhs_address)?;
 
-        let (lhs, rhs) = match (lhs, rhs) {
+        match (lhs, rhs) {
             (Value::Integer(lhs), Value::Integer(rhs)) => {
-                self.stack.push(integer_op(lhs, rhs).ok_or_else(error)?);
+                self.stack
+                    .store(output, integer_op(*lhs, *rhs).ok_or_else(error)?)?;
                 return Ok(());
             }
-            (lhs, rhs) => (lhs, rhs),
-        };
-
-        if let CallResult::Unsupported(lhs) = self.call_instance_fn(lhs, protocol, (&rhs,))? {
-            Err(VmError::from(VmErrorKind::UnsupportedBinaryOperation {
-                op: protocol.name,
-                lhs: lhs.type_info()?,
-                rhs: rhs.type_info()?,
-            }))
-        } else {
-            Ok(())
+            _ => {}
         }
+
+        let lhs = lhs.clone();
+        let rhs = lhs.clone();
+
+        if let CallResult::Ok(()) = self
+            .context
+            .call_instance_fn(
+                &mut self.stack,
+                &self.unit,
+                lhs.clone(),
+                protocol,
+                (rhs.clone(),),
+                output,
+            )?
+            .or_call_offset_with(self)?
+        {
+            return Ok(());
+        }
+
+        Err(VmError::from(VmErrorKind::UnsupportedBinaryOperation {
+            op: protocol.name,
+            lhs: self.stack.at(lhs_address)?.type_info()?,
+            rhs: self.stack.at(rhs_address)?.type_info()?,
+        }))
     }
 
     fn internal_bitwise_assign(
         &mut self,
+        lhs: Address,
+        rhs: Address,
         target: InstTarget,
         protocol: Protocol,
         error: fn() -> VmErrorKind,
         integer_op: fn(i64, i64) -> Option<i64>,
+        output: Address,
     ) -> Result<(), VmError> {
-        let lhs;
-        let mut guard;
-
-        let fallback = match target_value!(self, target, guard, lhs) {
-            TargetValue::Value(lhs, rhs) => match (lhs, rhs) {
+        target_value(
+            self,
+            lhs,
+            rhs,
+            target,
+            protocol,
+            output,
+            |lhs, rhs| match (lhs, rhs) {
                 (Value::Integer(lhs), Value::Integer(rhs)) => {
-                    let out = integer_op(*lhs, rhs).ok_or_else(error)?;
+                    let out = integer_op(*lhs, *rhs).ok_or_else(error)?;
                     *lhs = out;
-                    return Ok(());
+                    Ok(CallResult::Ok(()))
                 }
-                (lhs, rhs) => TargetFallback::Value(lhs.clone(), rhs),
+                _ => Ok(CallResult::Unsupported),
             },
-            TargetValue::Fallback(fallback) => fallback,
-        };
-
-        self.target_fallback(fallback, protocol)
-    }
-
-    /// Check that arguments matches expected or raise the appropriate error.
-    fn check_args(args: usize, expected: usize) -> Result<(), VmError> {
-        if args != expected {
-            return Err(VmError::from(VmErrorKind::BadArgumentCount {
-                actual: args,
-                expected,
-            }));
-        }
-
-        Ok(())
+        )
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_await(&mut self) -> Result<Shared<Future>, VmError> {
-        let value = self.stack.pop()?;
+    #[tracing::instrument(skip(self))]
+    fn op_await(&mut self, address: Address) -> Result<Shared<Future>, VmError> {
+        let value = mem::take(self.stack.at_mut(address)?);
         value.into_shared_future()
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_select(&mut self, len: usize) -> Result<Option<Select>, VmError> {
+    #[tracing::instrument(skip(self))]
+    fn op_select(
+        &mut self,
+        address: Address,
+        len: usize,
+        output: Address,
+    ) -> Result<Option<Select>, VmError> {
         let futures = futures_util::stream::FuturesUnordered::new();
 
-        for (branch, value) in self.stack.drain(len)?.enumerate() {
+        for (branch, value) in self.stack.drain_at(address, len)?.enumerate() {
             let future = value.into_shared_future()?.into_mut()?;
 
             if !future.is_completed() {
@@ -1362,134 +955,67 @@ impl Vm {
 
         // NB: nothing to poll.
         if futures.is_empty() {
-            self.stack.push(());
+            self.stack.store(output, ())?;
             return Ok(None);
         }
 
         Ok(Some(Select::new(futures)))
     }
 
-    /// Pop a number of values from the stack.
+    /// Store a specific literal value at the given `output`.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_popn(&mut self, n: usize) -> Result<(), VmError> {
-        self.stack.popn(n)?;
-        Ok(())
-    }
-
-    #[cfg_attr(feature = "bench", inline(never))]
-    fn op_push(&mut self, value: InstValue) -> Result<(), VmError> {
-        self.stack.push(value.into_value());
-        Ok(())
-    }
-
-    #[cfg_attr(feature = "bench", inline(never))]
-    fn op_pop(&mut self) -> Result<(), VmError> {
-        self.stack.pop()?;
-        Ok(())
-    }
-
-    /// pop-and-jump-if-not instruction.
-    #[cfg_attr(feature = "bench", inline(never))]
-    fn op_pop_and_jump_if_not(&mut self, count: usize, offset: isize) -> Result<(), VmError> {
-        if self.stack.pop()?.into_bool()? {
-            return Ok(());
-        }
-
-        self.stack.popn(count)?;
-        self.modify_ip(offset)?;
-        Ok(())
-    }
-
-    /// Pop a number of values from the stack, while preserving the top of the
-    /// stack.
-    #[cfg_attr(feature = "bench", inline(never))]
-    fn op_clean(&mut self, n: usize) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
-        self.op_popn(n)?;
-        self.stack.push(value);
+    #[tracing::instrument(skip(self))]
+    fn op_store(&mut self, value: InstValue, output: Address) -> Result<(), VmError> {
+        *self.stack.at_mut(output)? = value.into_value();
         Ok(())
     }
 
     /// Copy a value from a position relative to the top of the stack, to the
     /// top of the stack.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_copy(&mut self, offset: usize) -> Result<(), VmError> {
-        let value = self.stack.at_offset(offset)?.clone();
-        self.stack.push(value);
+    #[tracing::instrument(skip(self))]
+    fn op_copy(&mut self, address: Address, output: Address) -> Result<(), VmError> {
+        let mut pair = self.stack.interleaved_pair(address, output)?;
+        *pair.second_mut() = pair.first_mut().clone();
         Ok(())
     }
 
     /// Move a value from a position relative to the top of the stack, to the
     /// top of the stack.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_move(&mut self, offset: usize) -> Result<(), VmError> {
-        let value = self.stack.at_offset(offset)?.clone();
-        self.stack.push(value.take()?);
+    #[tracing::instrument(skip(self))]
+    fn op_move(&mut self, address: Address, output: Address) -> Result<(), VmError> {
+        let mut pair = self.stack.interleaved_pair(address, output)?;
+        *pair.second_mut() = mem::take(pair.first_mut());
         Ok(())
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_drop(&mut self, offset: usize) -> Result<(), VmError> {
-        let _ = self.stack.at_offset(offset)?;
-        Ok(())
-    }
-
-    /// Duplicate the value at the top of the stack.
-    #[cfg_attr(feature = "bench", inline(never))]
-    fn op_dup(&mut self) -> Result<(), VmError> {
-        let value = self.stack.last()?.clone();
-        self.stack.push(value);
-        Ok(())
-    }
-
-    /// Copy a value from a position relative to the top of the stack, to the
-    /// top of the stack.
-    #[cfg_attr(feature = "bench", inline(never))]
-    fn op_replace(&mut self, offset: usize) -> Result<(), VmError> {
-        let mut value = self.stack.pop()?;
-        let stack_value = self.stack.at_offset_mut(offset)?;
-        mem::swap(stack_value, &mut value);
+    #[tracing::instrument(skip(self))]
+    fn op_drop(&mut self, address: Address) -> Result<(), VmError> {
+        *self.stack.at_mut(address)? = Value::Unit;
         Ok(())
     }
 
     /// Perform a jump operation.
     #[cfg_attr(feature = "bench", inline(never))]
+    #[tracing::instrument(skip(self))]
     fn op_jump(&mut self, offset: isize) -> Result<(), VmError> {
-        self.modify_ip(offset)?;
+        self.modify_ip(offset);
         Ok(())
     }
 
-    /// Perform a conditional jump operation.
+    /// Jump the given offset if `address` matches the expected value.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_jump_if(&mut self, offset: isize) -> Result<(), VmError> {
-        if self.stack.pop()?.into_bool()? {
-            self.modify_ip(offset)?;
-        }
-
-        Ok(())
-    }
-
-    /// Perform a conditional jump operation. Pops the stack if the jump is
-    /// not performed.
-    #[cfg_attr(feature = "bench", inline(never))]
-    fn op_jump_if_or_pop(&mut self, offset: isize) -> Result<(), VmError> {
-        if self.stack.last()?.as_bool()? {
-            self.modify_ip(offset)?;
-        } else {
-            self.stack.pop()?;
-        }
-
-        Ok(())
-    }
-
-    /// Perform a conditional jump operation. Pops the stack if the jump is
-    /// not performed.
-    #[cfg_attr(feature = "bench", inline(never))]
-    fn op_jump_if_not_or_pop(&mut self, offset: isize) -> Result<(), VmError> {
-        if !self.stack.last()?.as_bool()? {
-            self.modify_ip(offset)?;
-        } else {
-            self.stack.pop()?;
+    #[tracing::instrument(skip(self))]
+    fn op_jump_if(
+        &mut self,
+        address: Address,
+        offset: isize,
+        condition: bool,
+    ) -> Result<(), VmError> {
+        if self.stack.at(address)?.as_bool()? == condition {
+            self.modify_ip(offset);
         }
 
         Ok(())
@@ -1497,11 +1023,19 @@ impl Vm {
 
     /// Perform a branch-conditional jump operation.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_jump_if_branch(&mut self, branch: i64, offset: isize) -> Result<(), VmError> {
-        if let Some(Value::Integer(current)) = self.stack.peek() {
+    #[tracing::instrument(skip(self))]
+    fn op_jump_if_branch(
+        &mut self,
+        address: Address,
+        branch: i64,
+        offset: isize,
+    ) -> Result<(), VmError> {
+        let value = self.stack.at_mut(address)?;
+
+        if let Value::Integer(current) = value {
             if *current == branch {
-                self.modify_ip(offset)?;
-                self.stack.pop()?;
+                *value = Value::Unit;
+                self.modify_ip(offset);
             }
         }
 
@@ -1510,83 +1044,102 @@ impl Vm {
 
     /// Construct a new vec.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_vec(&mut self, count: usize) -> Result<(), VmError> {
-        let vec = Vec::from(self.stack.pop_sequence(count)?);
-        self.stack.push(Shared::new(vec));
+    #[tracing::instrument(skip(self))]
+    fn op_vec(&mut self, address: Address, count: usize, output: Address) -> Result<(), VmError> {
+        let data = self
+            .stack
+            .drain_at(address, count)?
+            .collect::<vec::Vec<_>>();
+        self.stack.store(output, Vec::from(data))?;
         Ok(())
     }
 
     /// Construct a new tuple.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_tuple(&mut self, count: usize) -> Result<(), VmError> {
-        let tuple = self.stack.pop_sequence(count)?;
-        self.stack.push(Tuple::from(tuple));
+    #[tracing::instrument(skip(self))]
+    fn op_tuple(&mut self, address: Address, count: usize, output: Address) -> Result<(), VmError> {
+        let tuple = self.stack.drain_at(address, count)?.collect::<Box<[_]>>();
+        self.stack.store(output, Tuple::from(tuple))?;
         Ok(())
     }
 
     /// Construct a new tuple with a fixed number of arguments.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_tuple_n(&mut self, args: &[InstAddress]) -> Result<(), VmError> {
-        let mut tuple = vec![Value::Unit; args.len()];
+    #[tracing::instrument(skip(self))]
+    fn op_tuple_n(&mut self, args: &[Address], output: Address) -> Result<(), VmError> {
+        let mut tuple = vec::Vec::with_capacity(args.len());
 
-        for (n, arg) in args.iter().enumerate().rev() {
-            tuple[n] = self.stack.address(*arg)?;
+        for arg in args {
+            tuple.push(self.stack.at(*arg)?.clone());
         }
 
-        self.stack.push(Tuple::from(tuple));
+        self.stack.store(output, Tuple::from(tuple))?;
         Ok(())
     }
 
     /// Push the tuple that is on top of the stack.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_push_tuple(&mut self) -> Result<(), VmError> {
-        let tuple = self.stack.pop()?.into_tuple()?;
-        self.stack.extend(tuple.borrow_ref()?.iter().cloned());
+    #[tracing::instrument(skip(self))]
+    fn op_unpack_tuple(&mut self, address: Address, mut base: Address) -> Result<(), VmError> {
+        let tuple = mem::take(self.stack.at_mut(address)?).into_tuple()?;
+
+        for value in tuple.take()?.into_iter() {
+            self.stack.store(base, value)?;
+            base = base.step()?;
+        }
+
         Ok(())
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_not(&mut self) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
+    #[tracing::instrument(skip(self))]
+    fn op_not(&mut self, address: Address, output: Address) -> Result<(), VmError> {
+        let mut pair = self.stack.interleaved_pair(address, output)?;
 
-        let value = match value {
-            Value::Bool(value) => Value::from(!value),
-            Value::Integer(value) => Value::from(!value),
+        let value = match pair.first_mut() {
+            Value::Bool(value) => Value::from(!*value),
+            Value::Integer(value) => Value::from(!*value),
             other => {
-                let operand = other.type_info()?;
                 return Err(VmError::from(VmErrorKind::UnsupportedUnaryOperation {
                     op: "!",
-                    operand,
+                    operand: other.type_info()?,
                 }));
             }
         };
 
-        self.stack.push(value);
+        *pair.second_mut() = value;
         Ok(())
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_neg(&mut self) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
+    #[tracing::instrument(skip(self))]
+    fn op_neg(&mut self, address: Address, output: Address) -> Result<(), VmError> {
+        let mut pair = self.stack.interleaved_pair(address, output)?;
 
-        let value = match value {
-            Value::Float(value) => Value::from(-value),
-            Value::Integer(value) => Value::from(-value),
+        let value = match pair.first_mut() {
+            Value::Float(value) => Value::from(-*value),
+            Value::Integer(value) => Value::from(-*value),
             other => {
-                let operand = other.type_info()?;
                 return Err(VmError::from(VmErrorKind::UnsupportedUnaryOperation {
                     op: "-",
-                    operand,
+                    operand: other.type_info()?,
                 }));
             }
         };
 
-        self.stack.push(value);
+        *pair.second_mut() = value;
         Ok(())
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_op(&mut self, op: InstOp, lhs: InstAddress, rhs: InstAddress) -> Result<(), VmError> {
+    #[tracing::instrument(skip(self))]
+    fn op_op(
+        &mut self,
+        op: InstOp,
+        lhs: Address,
+        rhs: Address,
+        output: Address,
+    ) -> Result<(), VmError> {
         use std::convert::TryFrom as _;
 
         match op {
@@ -1598,6 +1151,7 @@ impl Vm {
                     std::ops::Add::add,
                     lhs,
                     rhs,
+                    output,
                 )?;
             }
             InstOp::Sub => {
@@ -1608,6 +1162,7 @@ impl Vm {
                     std::ops::Sub::sub,
                     lhs,
                     rhs,
+                    output,
                 )?;
             }
             InstOp::Mul => {
@@ -1618,6 +1173,7 @@ impl Vm {
                     std::ops::Mul::mul,
                     lhs,
                     rhs,
+                    output,
                 )?;
             }
             InstOp::Div => {
@@ -1628,6 +1184,7 @@ impl Vm {
                     std::ops::Div::div,
                     lhs,
                     rhs,
+                    output,
                 )?;
             }
             InstOp::Rem => {
@@ -1638,6 +1195,7 @@ impl Vm {
                     std::ops::Rem::rem,
                     lhs,
                     rhs,
+                    output,
                 )?;
             }
             InstOp::BitAnd => {
@@ -1648,6 +1206,7 @@ impl Vm {
                     bool::bitand,
                     lhs,
                     rhs,
+                    output,
                 )?;
             }
             InstOp::BitXor => {
@@ -1658,6 +1217,7 @@ impl Vm {
                     bool::bitxor,
                     lhs,
                     rhs,
+                    output,
                 )?;
             }
             InstOp::BitOr => {
@@ -1668,6 +1228,7 @@ impl Vm {
                     bool::bitor,
                     lhs,
                     rhs,
+                    output,
                 )?;
             }
             InstOp::Shl => {
@@ -1677,48 +1238,55 @@ impl Vm {
                     |a, b| a.checked_shl(u32::try_from(b).ok()?),
                     lhs,
                     rhs,
+                    output,
                 )?;
             }
             InstOp::Shr => {
-                self.internal_infallible_bitwise(Protocol::SHR, std::ops::Shr::shr, lhs, rhs)?;
+                self.internal_infallible_bitwise(
+                    Protocol::SHR,
+                    std::ops::Shr::shr,
+                    lhs,
+                    rhs,
+                    output,
+                )?;
             }
             InstOp::Gt => {
-                self.internal_boolean_ops(|a, b| a > b, |a, b| a > b, ">", lhs, rhs)?;
+                self.internal_boolean_ops(|a, b| a > b, |a, b| a > b, ">", lhs, rhs, output)?;
             }
             InstOp::Gte => {
-                self.internal_boolean_ops(|a, b| a >= b, |a, b| a >= b, ">=", lhs, rhs)?;
+                self.internal_boolean_ops(|a, b| a >= b, |a, b| a >= b, ">=", lhs, rhs, output)?;
             }
             InstOp::Lt => {
-                self.internal_boolean_ops(|a, b| a < b, |a, b| a < b, "<", lhs, rhs)?;
+                self.internal_boolean_ops(|a, b| a < b, |a, b| a < b, "<", lhs, rhs, output)?;
             }
             InstOp::Lte => {
-                self.internal_boolean_ops(|a, b| a <= b, |a, b| a <= b, "<=", lhs, rhs)?;
+                self.internal_boolean_ops(|a, b| a <= b, |a, b| a <= b, "<=", lhs, rhs, output)?;
             }
             InstOp::Eq => {
-                let rhs = self.stack.address(rhs)?;
-                let lhs = self.stack.address(lhs)?;
+                let rhs = self.stack.at(rhs)?.clone();
+                let lhs = self.stack.at(lhs)?.clone();
                 let test = Value::value_ptr_eq(self, &lhs, &rhs)?;
-                self.stack.push(test);
+                self.stack.store(output, test)?;
             }
             InstOp::Neq => {
-                let rhs = self.stack.address(rhs)?;
-                let lhs = self.stack.address(lhs)?;
+                let rhs = self.stack.at(rhs)?.clone();
+                let lhs = self.stack.at(lhs)?.clone();
                 let test = Value::value_ptr_eq(self, &lhs, &rhs)?;
-                self.stack.push(!test);
+                self.stack.store(output, !test)?;
             }
             InstOp::And => {
-                self.internal_boolean_op(|a, b| a && b, "&&", lhs, rhs)?;
+                self.internal_boolean_op(|a, b| a && b, "&&", lhs, rhs, output)?;
             }
             InstOp::Or => {
-                self.internal_boolean_op(|a, b| a || b, "||", lhs, rhs)?;
+                self.internal_boolean_op(|a, b| a || b, "||", lhs, rhs, output)?;
             }
             InstOp::Is => {
                 let is_instance = self.test_is_instance(lhs, rhs)?;
-                self.stack.push(is_instance);
+                self.stack.store(output, is_instance)?;
             }
             InstOp::IsNot => {
                 let is_instance = self.test_is_instance(lhs, rhs)?;
-                self.stack.push(!is_instance);
+                self.stack.store(output, !is_instance)?;
             }
         }
 
@@ -1726,89 +1294,127 @@ impl Vm {
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_assign(&mut self, target: InstTarget, op: InstAssignOp) -> Result<(), VmError> {
+    #[tracing::instrument(skip(self))]
+    fn op_assign(
+        &mut self,
+        lhs: Address,
+        rhs: Address,
+        target: InstTarget,
+        op: InstAssignOp,
+        output: Address,
+    ) -> Result<(), VmError> {
         use std::convert::TryFrom as _;
 
         match op {
             InstAssignOp::Add => {
                 self.internal_num_assign(
+                    lhs,
+                    rhs,
                     target,
                     Protocol::ADD_ASSIGN,
                     || VmErrorKind::Overflow,
                     i64::checked_add,
                     std::ops::Add::add,
+                    output,
                 )?;
             }
             InstAssignOp::Sub => {
                 self.internal_num_assign(
+                    lhs,
+                    rhs,
                     target,
                     Protocol::SUB_ASSIGN,
                     || VmErrorKind::Underflow,
                     i64::checked_sub,
                     std::ops::Sub::sub,
+                    output,
                 )?;
             }
             InstAssignOp::Mul => {
                 self.internal_num_assign(
+                    lhs,
+                    rhs,
                     target,
                     Protocol::MUL_ASSIGN,
                     || VmErrorKind::Overflow,
                     i64::checked_mul,
                     std::ops::Mul::mul,
+                    output,
                 )?;
             }
             InstAssignOp::Div => {
                 self.internal_num_assign(
+                    lhs,
+                    rhs,
                     target,
                     Protocol::DIV_ASSIGN,
                     || VmErrorKind::DivideByZero,
                     i64::checked_div,
                     std::ops::Div::div,
+                    output,
                 )?;
             }
             InstAssignOp::Rem => {
                 self.internal_num_assign(
+                    lhs,
+                    rhs,
                     target,
                     Protocol::REM_ASSIGN,
                     || VmErrorKind::DivideByZero,
                     i64::checked_rem,
                     std::ops::Rem::rem,
+                    output,
                 )?;
             }
             InstAssignOp::BitAnd => {
                 self.internal_infallible_bitwise_assign(
+                    lhs,
+                    rhs,
                     target,
                     Protocol::BIT_AND_ASSIGN,
                     std::ops::BitAndAssign::bitand_assign,
+                    output,
                 )?;
             }
             InstAssignOp::BitXor => {
                 self.internal_infallible_bitwise_assign(
+                    lhs,
+                    rhs,
                     target,
                     Protocol::BIT_XOR_ASSIGN,
                     std::ops::BitXorAssign::bitxor_assign,
+                    output,
                 )?;
             }
             InstAssignOp::BitOr => {
                 self.internal_infallible_bitwise_assign(
+                    lhs,
+                    rhs,
                     target,
                     Protocol::BIT_OR_ASSIGN,
                     std::ops::BitOrAssign::bitor_assign,
+                    output,
                 )?;
             }
             InstAssignOp::Shl => {
                 self.internal_bitwise_assign(
+                    lhs,
+                    rhs,
                     target,
                     Protocol::SHL_ASSIGN,
                     || VmErrorKind::Overflow,
                     |a, b| a.checked_shl(u32::try_from(b).ok()?),
+                    output,
                 )?;
             }
             InstAssignOp::Shr => {
                 self.internal_infallible_bitwise_assign(
+                    lhs,
+                    rhs,
                     target,
                     Protocol::SHR_ASSIGN,
                     std::ops::ShrAssign::shr_assign,
+                    output,
                 )?;
             }
         }
@@ -1818,14 +1424,55 @@ impl Vm {
 
     /// Perform an index set operation.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_index_set(&mut self) -> Result<(), VmError> {
-        let index = self.stack.pop()?;
-        let target = self.stack.pop()?;
-        let value = self.stack.pop()?;
+    #[tracing::instrument(skip(self))]
+    fn op_index_set(
+        &mut self,
+        address: Address,
+        index: Address,
+        value: Address,
+        output: Address,
+    ) -> Result<(), VmError> {
+        {
+            let target = self.stack.at(address)?;
+            let index = self.stack.at(index)?;
+            let value = self.stack.at(value)?;
 
-        // This is a useful pattern.
-        #[allow(clippy::never_loop)]
-        loop {
+            if let CallResult::Ok(()) = builtin(target, index, value)? {
+                return Ok(());
+            }
+
+            let target = target.clone();
+            let index = index.clone();
+            let value = value.clone();
+
+            if let CallResult::Ok(()) = self
+                .context
+                .call_instance_fn(
+                    &mut self.stack,
+                    &self.unit,
+                    target,
+                    Protocol::INDEX_SET,
+                    (index, value),
+                    output,
+                )?
+                .or_call_offset_with(self)?
+            {
+                return Ok(());
+            }
+        }
+
+        return Err(VmError::from(VmErrorKind::UnsupportedIndexSet {
+            target: self.stack.at(address)?.type_info()?,
+            index: self.stack.at(index)?.type_info()?,
+            value: self.stack.at(value)?.type_info()?,
+        }));
+
+        /// Built-in implementation of index set.
+        fn builtin(
+            target: &Value,
+            index: &Value,
+            value: &Value,
+        ) -> Result<CallResult<()>, VmError> {
             // NB: local storage for string.
             let local_field;
 
@@ -1835,304 +1482,498 @@ impl Vm {
                     local_field.as_str()
                 }
                 Value::StaticString(string) => string.as_ref(),
-                _ => break,
+                _ => return Ok(CallResult::Unsupported),
             };
 
             match &target {
                 Value::Object(object) => {
                     let mut object = object.borrow_mut()?;
-                    object.insert(field.to_owned(), value);
-                    return Ok(());
+                    object.insert(field.to_owned(), value.clone());
+                    Ok(CallResult::Ok(()))
                 }
                 Value::Struct(typed_object) => {
                     let mut typed_object = typed_object.borrow_mut()?;
 
                     if let Some(v) = typed_object.get_mut(field) {
-                        *v = value;
-                        return Ok(());
+                        *v = value.clone();
+                        return Ok(CallResult::Ok(()));
                     }
 
-                    return Err(VmError::from(VmErrorKind::MissingField {
+                    Err(VmError::from(VmErrorKind::MissingField {
                         field: field.to_owned(),
                         target: typed_object.type_info(),
-                    }));
+                    }))
                 }
                 Value::Variant(variant) => {
                     let mut variant = variant.borrow_mut()?;
 
                     if let VariantData::Struct(st) = variant.data_mut() {
                         if let Some(v) = st.get_mut(field) {
-                            *v = value;
-                            return Ok(());
+                            *v = value.clone();
+                            return Ok(CallResult::Ok(()));
                         }
+
+                        return Err(VmError::from(VmErrorKind::MissingField {
+                            field: field.to_owned(),
+                            target: variant.type_info(),
+                        }));
                     }
 
-                    return Err(VmError::from(VmErrorKind::MissingField {
-                        field: field.to_owned(),
-                        target: variant.type_info(),
-                    }));
+                    Ok(CallResult::Unsupported)
                 }
-                _ => {
-                    break;
-                }
+                _ => Ok(CallResult::Unsupported),
             }
-        }
-
-        if let CallResult::Unsupported(target) =
-            self.call_instance_fn(target, Protocol::INDEX_SET, (&index, &value))?
-        {
-            Err(VmError::from(VmErrorKind::UnsupportedIndexSet {
-                target: target.type_info()?,
-                index: index.type_info()?,
-                value: value.type_info()?,
-            }))
-        } else {
-            // Calling index set should not produce a value on the stack, but all
-            // handler functions to produce a value. So pop it here.
-            <()>::from_value(self.stack.pop()?)?;
-            Ok(())
         }
     }
 
     #[inline]
-    fn op_return_internal(&mut self, return_value: Value, clean: usize) -> Result<bool, VmError> {
-        if clean > 0 {
-            self.stack.popn(clean)?;
-        }
-
-        let exit = self.pop_call_frame()?;
-        self.stack.push(return_value);
+    #[tracing::instrument(skip(self))]
+    fn op_return_internal(&mut self, return_value: Value) -> Result<bool, VmError> {
+        let (exit, output) = self.pop_call_frame()?;
+        self.stack.store(output, return_value)?;
         Ok(exit)
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_return(&mut self, address: InstAddress, clean: usize) -> Result<bool, VmError> {
-        let return_value = self.stack.address(address)?;
-        self.op_return_internal(return_value, clean)
+    #[tracing::instrument(skip(self))]
+    fn op_return(&mut self, address: Address) -> Result<bool, VmError> {
+        let return_value = mem::take(self.stack.at_mut(address)?);
+        self.op_return_internal(return_value)
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
+    #[tracing::instrument(skip(self))]
     fn op_return_unit(&mut self) -> Result<bool, VmError> {
-        let exit = self.pop_call_frame()?;
-        self.stack.push(());
+        let (exit, output) = self.pop_call_frame()?;
+        self.stack.store(output, ())?;
         Ok(exit)
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_load_instance_fn(&mut self, hash: Hash) -> Result<(), VmError> {
-        let instance = self.stack.pop()?;
-        let ty = instance.type_hash()?;
-        let hash = Hash::instance_function(ty, hash);
-        self.stack.push(Value::Type(hash));
+    #[tracing::instrument(skip(self))]
+    fn op_load_instance_fn(
+        &mut self,
+        address: Address,
+        hash: Hash,
+        output: Address,
+    ) -> Result<(), VmError> {
+        let mut pair = self.stack.interleaved_pair(address, output)?;
+        let type_hash = pair.first_mut().type_hash()?;
+        let hash = Hash::instance_function(type_hash, hash);
+        *pair.second_mut() = Value::Type(hash);
         Ok(())
     }
 
     /// Perform an index get operation.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_index_get(&mut self, target: InstAddress, index: InstAddress) -> Result<(), VmError> {
-        let index = self.stack.address(index)?;
-        let target = self.stack.address_ref(target)?;
+    #[tracing::instrument(skip(self))]
+    fn op_index_get(
+        &mut self,
+        address: Address,
+        index_address: Address,
+        output: Address,
+    ) -> Result<(), VmError> {
+        let target = self.stack.at(address)?;
+        let index = self.stack.at(index_address)?;
 
-        match &index {
-            Value::String(string) => {
-                let string_ref = string.borrow_ref()?;
-
-                if let Some(value) = Self::try_object_like_index_get(&target, string_ref.as_str())?
-                {
-                    self.stack.push(value);
-                    return Ok(());
-                }
-            }
-            Value::StaticString(string) => {
-                if let Some(value) = Self::try_object_like_index_get(&target, string.as_ref())? {
-                    self.stack.push(value);
-                    return Ok(());
-                }
-            }
-            Value::Integer(index) => {
-                use std::convert::TryInto as _;
-
-                let index = match (*index).try_into() {
-                    Ok(index) => index,
-                    Err(..) => {
-                        return Err(VmError::from(VmErrorKind::MissingIndex {
-                            target: target.type_info()?,
-                            index: VmIntegerRepr::from(*index),
-                        }));
-                    }
-                };
-
-                if let Some(value) = Self::try_tuple_like_index_get(&target, index)? {
-                    self.stack.push(value);
-                    return Ok(());
-                }
-            }
-            _ => (),
+        if let CallResult::Ok(value) = builtin(target, index)? {
+            self.stack.store(output, value)?;
+            return Ok(());
         }
 
-        let target = target.into_owned();
+        let target = self.stack.at(address)?.clone();
+        let index = self.stack.at(index_address)?.clone();
 
-        if let CallResult::Unsupported(target) =
-            self.call_instance_fn(target, Protocol::INDEX_GET, (&index,))?
+        if let CallResult::Ok(()) = self
+            .context
+            .call_instance_fn(
+                &mut self.stack,
+                &self.unit,
+                target,
+                Protocol::INDEX_GET,
+                (index,),
+                output,
+            )?
+            .or_call_offset_with(self)?
         {
-            Err(VmError::from(VmErrorKind::UnsupportedIndexGet {
-                target: target.type_info()?,
-                index: index.type_info()?,
-            }))
-        } else {
-            Ok(())
+            return Ok(());
+        }
+
+        return Err(VmError::from(VmErrorKind::UnsupportedIndexGet {
+            target: self.stack.at(address)?.type_info()?,
+            index: self.stack.at(index_address)?.type_info()?,
+        }));
+
+        fn builtin<'a>(target: &'a Value, index: &Value) -> Result<CallResult<Value>, VmError> {
+            match index {
+                Value::String(string) => {
+                    let string_ref = string.borrow_ref()?;
+                    Ok(try_object_like_index_get(target, string_ref.as_str())?.cloned())
+                }
+                Value::StaticString(string) => {
+                    Ok(try_object_like_index_get(target, string.as_ref())?.cloned())
+                }
+                Value::Integer(index) => {
+                    use std::convert::TryInto as _;
+
+                    let index = match (*index).try_into() {
+                        Ok(index) => index,
+                        Err(..) => {
+                            return Err(VmError::from(VmErrorKind::MissingIndex {
+                                target: target.type_info()?,
+                                index: VmIntegerRepr::from(*index),
+                            }));
+                        }
+                    };
+
+                    Ok(try_tuple_like_index_get(target, index)?.cloned())
+                }
+                _ => Ok(CallResult::Unsupported),
+            }
         }
     }
 
     /// Perform an index get operation specialized for tuples.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_tuple_index_get(&mut self, index: usize) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
-
-        if let Some(value) = Self::try_tuple_like_index_get(&value, index)? {
-            self.stack.push(value);
-            return Ok(());
-        }
-
-        if let CallResult::Unsupported(value) =
-            self.call_index_fn(Protocol::GET, value, index, ())?
+    #[tracing::instrument(skip(self))]
+    fn op_tuple_index_get(
+        &mut self,
+        address: Address,
+        index: usize,
+        output: Address,
+    ) -> Result<(), VmError> {
         {
-            return Err(VmError::from(VmErrorKind::UnsupportedTupleIndexGet {
-                target: value.type_info()?,
-            }));
+            let value = {
+                let value = self.stack.at(address)?;
+                try_tuple_like_index_get(value, index)?.cloned()
+            };
+
+            if let CallResult::Ok(value) = value {
+                self.stack.store(output, value)?;
+                return Ok(());
+            }
         }
 
-        // NB: should leave a value on the stack.
-        Ok(())
-    }
+        let value = self.stack.at(address)?.clone();
 
-    /// Perform an index get operation specialized for tuples.
-    #[cfg_attr(feature = "bench", inline(never))]
-    fn op_tuple_index_set(&mut self, index: usize) -> Result<(), VmError> {
-        let tuple = self.stack.pop()?;
-        let value = self.stack.pop()?;
-
-        if Self::try_tuple_like_index_set(&tuple, index, value)? {
+        if let CallResult::Ok(()) = self
+            .context
+            .call_index_fn(
+                &mut self.stack,
+                Protocol::GET,
+                value.clone(),
+                index,
+                (),
+                output,
+            )?
+            .or_call_offset_with(self)?
+        {
             return Ok(());
         }
 
-        Err(VmError::from(VmErrorKind::UnsupportedTupleIndexSet {
-            target: tuple.type_info()?,
+        Err(VmError::from(VmErrorKind::UnsupportedTupleIndexGet {
+            target: self.stack.at(address)?.type_info()?,
         }))
     }
 
     /// Perform an index get operation specialized for tuples.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_tuple_index_get_at(&mut self, offset: usize, index: usize) -> Result<(), VmError> {
-        let value = self.stack.at_offset(offset)?;
+    #[tracing::instrument(skip(self))]
+    fn op_tuple_index_set(
+        &mut self,
+        address: Address,
+        value: Address,
+        index: usize,
+        output: Address,
+    ) -> Result<(), VmError> {
+        let mut pair = self.stack.interleaved_pair(address, value)?;
 
-        if let Some(value) = Self::try_tuple_like_index_get(value, index)? {
-            self.stack.push(value);
+        if builtin(&mut pair, index)? {
             return Ok(());
         }
 
-        let value = value.clone();
+        let target = pair.first_mut().clone();
+        let value = pair.second_mut().clone();
 
-        if let CallResult::Unsupported(value) =
-            self.call_index_fn(Protocol::GET, value, index, ())?
+        if let CallResult::Ok(()) = self
+            .context
+            .call_index_fn(
+                &mut self.stack,
+                Protocol::SET,
+                target,
+                index,
+                (value,),
+                output,
+            )?
+            .or_call_offset_with(self)?
         {
-            return Err(VmError::from(VmErrorKind::UnsupportedTupleIndexGet {
-                target: value.type_info()?,
-            }));
+            return Ok(());
+        };
+
+        return Err(VmError::from(VmErrorKind::UnsupportedTupleIndexSet {
+            target: self.stack.at(address)?.type_info()?,
+        }));
+
+        /// Built-in implementation of getting a string index on an
+        /// object-like type.
+        fn builtin(pair: &mut InterleavedPairMut<'_>, index: usize) -> Result<bool, VmError> {
+            match mem::take(pair.first_mut()) {
+                Value::Unit => Ok(false),
+                Value::Tuple(tuple) => {
+                    let mut tuple = tuple.borrow_mut()?;
+
+                    if let Some(target) = tuple.get_mut(index) {
+                        *target = mem::take(pair.second_mut());
+                        return Ok(true);
+                    }
+
+                    Ok(false)
+                }
+                Value::Vec(vec) => {
+                    let mut vec = vec.borrow_mut()?;
+
+                    if let Some(target) = vec.get_mut(index) {
+                        *target = mem::take(pair.second_mut());
+                        return Ok(true);
+                    }
+
+                    Ok(false)
+                }
+                Value::Result(result) => {
+                    let mut result = result.borrow_mut()?;
+
+                    let target = match &mut *result {
+                        Ok(ok) if index == 0 => ok,
+                        Err(err) if index == 0 => err,
+                        _ => return Ok(false),
+                    };
+
+                    *target = mem::take(pair.second_mut());
+                    Ok(true)
+                }
+                Value::Option(option) => {
+                    let mut option = option.borrow_mut()?;
+
+                    let target = match &mut *option {
+                        Some(some) if index == 0 => some,
+                        _ => return Ok(false),
+                    };
+
+                    *target = mem::take(pair.second_mut());
+                    Ok(true)
+                }
+                Value::TupleStruct(tuple_struct) => {
+                    let mut tuple_struct = tuple_struct.borrow_mut()?;
+
+                    if let Some(target) = tuple_struct.get_mut(index) {
+                        *target = mem::take(pair.second_mut());
+                        return Ok(true);
+                    }
+
+                    Ok(false)
+                }
+                Value::Variant(variant) => {
+                    let mut variant = variant.borrow_mut()?;
+
+                    if let VariantData::Tuple(data) = variant.data_mut() {
+                        if let Some(target) = data.get_mut(index) {
+                            *target = mem::take(pair.second_mut());
+                            return Ok(true);
+                        }
+                    }
+
+                    Ok(false)
+                }
+                _ => Ok(false),
+            }
         }
-
-        Ok(())
-    }
-
-    #[cfg_attr(feature = "bench", inline(never))]
-    fn op_eq_bool(&mut self, boolean: bool) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
-
-        self.stack.push(match value {
-            Value::Bool(actual) => actual == boolean,
-            _ => false,
-        });
-
-        Ok(())
     }
 
     /// Perform a specialized index get operation on an object.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_object_index_get(&mut self, string_slot: usize) -> Result<(), VmError> {
-        let target = self.stack.pop()?;
+    #[tracing::instrument(skip(self))]
+    fn op_object_index_get(
+        &mut self,
+        address: Address,
+        field_slot: usize,
+        output: Address,
+    ) -> Result<(), VmError> {
+        let target = self.stack.at(address)?;
+        let index = self.unit.lookup_string(field_slot)?;
 
-        match self.try_object_slot_index_get(target, string_slot)? {
-            CallResult::Ok(value) => {
-                self.stack.push(value);
-                Ok(())
+        if let CallResult::Ok(value) = builtin(target, index)? {
+            match value {
+                Some(value) => {
+                    let value = value.clone();
+                    self.stack.store(output, value)?;
+                    return Ok(());
+                }
+                None => {
+                    return Err(VmError::from(VmErrorKind::MissingIndexKey {
+                        target: target.type_info()?,
+                        index: Key::String(StringKey::StaticString(index.clone())),
+                    }));
+                }
             }
-            CallResult::Unsupported(target) => {
-                Err(VmError::from(VmErrorKind::UnsupportedObjectSlotIndexGet {
-                    target: target.type_info()?,
-                }))
+        }
+
+        let hash = index.hash();
+        let target = target.clone();
+
+        if let CallResult::Ok(()) =
+            self.context
+                .call_field_fn(&mut self.stack, Protocol::GET, target, hash, (), output)?
+        {
+            return Ok(());
+        }
+
+        return Err(VmError::from(VmErrorKind::UnsupportedObjectSlotIndexGet {
+            target: self.stack.at(address)?.type_info()?,
+        }));
+
+        /// Built-in implementation of the operation.
+        fn builtin(target: &Value, index: &str) -> Result<CallResult<Option<Value>>, VmError> {
+            match target {
+                Value::Object(object) => {
+                    Ok(CallResult::Ok(object.borrow_ref()?.get(index).cloned()))
+                }
+                Value::Struct(typed_object) => Ok(CallResult::Ok(
+                    typed_object.borrow_ref()?.get(index).cloned(),
+                )),
+                Value::Variant(variant) => {
+                    let output =
+                        BorrowRef::try_map(variant.borrow_ref()?, |value| match value.data() {
+                            VariantData::Struct(data) => Some(data),
+                            _ => None,
+                        });
+
+                    if let Some(output) = output {
+                        return Ok(CallResult::Ok(output.get(index).cloned()));
+                    }
+
+                    Ok(CallResult::Unsupported)
+                }
+                _ => Ok(CallResult::Unsupported),
             }
         }
     }
 
     /// Perform a specialized index set operation on an object.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_object_index_set(&mut self, string_slot: usize) -> Result<(), VmError> {
-        let target = self.stack.pop()?;
-        let value = self.stack.pop()?;
+    #[tracing::instrument(skip(self))]
+    fn op_object_index_set(
+        &mut self,
+        address: Address,
+        field_slot: usize,
+        value_address: Address,
+        output: Address,
+    ) -> Result<(), VmError> {
+        let (target, value) = self.stack.pair(address, value_address)?;
+        let field = self.unit.lookup_string(field_slot)?;
 
-        if let CallResult::Unsupported(target) =
-            self.try_object_slot_index_set(target, string_slot, value)?
-        {
-            Err(VmError::from(VmErrorKind::UnsupportedObjectSlotIndexSet {
-                target: target.type_info()?,
-            }))
-        } else {
-            Ok(())
+        if let CallResult::Ok(()) = builtin(target, field, value)? {
+            return Ok(());
+        };
+
+        let hash = field.hash();
+        let target = target.clone();
+        let value = value.clone();
+
+        if let CallResult::Ok(()) = self.context.call_field_fn(
+            &mut self.stack,
+            Protocol::SET,
+            target,
+            hash,
+            (value,),
+            output,
+        )? {
+            return Ok(());
         }
-    }
 
-    /// Perform a specialized index get operation on an object.
-    #[cfg_attr(feature = "bench", inline(never))]
-    fn op_object_index_get_at(&mut self, offset: usize, string_slot: usize) -> Result<(), VmError> {
-        let target = self.stack.at_offset(offset)?.clone();
+        return Err(VmError::from(VmErrorKind::UnsupportedObjectSlotIndexSet {
+            target: self.stack.at(address)?.type_info()?,
+        }));
 
-        match self.try_object_slot_index_get(target, string_slot)? {
-            CallResult::Ok(value) => {
-                self.stack.push(value);
-                Ok(())
-            }
-            CallResult::Unsupported(target) => {
-                Err(VmError::from(VmErrorKind::UnsupportedObjectSlotIndexGet {
-                    target: target.type_info()?,
-                }))
+        /// Built-in implementation of the operation.
+        fn builtin(
+            target: &mut Value,
+            field: &StaticString,
+            value: &Value,
+        ) -> Result<CallResult<()>, VmError> {
+            match target {
+                Value::Object(object) => {
+                    let mut object = object.borrow_mut()?;
+                    object.insert(field.as_str().to_owned(), value.clone());
+                    Ok(CallResult::Ok(()))
+                }
+                Value::Struct(typed_object) => {
+                    let mut typed_object = typed_object.borrow_mut()?;
+
+                    if let Some(v) = typed_object.get_mut(field.as_str()) {
+                        *v = value.clone();
+                        return Ok(CallResult::Ok(()));
+                    }
+
+                    Err(VmError::from(VmErrorKind::MissingField {
+                        field: field.as_str().to_owned(),
+                        target: typed_object.type_info(),
+                    }))
+                }
+                Value::Variant(variant) => {
+                    let mut variant = variant.borrow_mut()?;
+
+                    if let VariantData::Struct(data) = variant.data_mut() {
+                        if let Some(v) = data.get_mut(field.as_str()) {
+                            *v = value.clone();
+                            return Ok(CallResult::Ok(()));
+                        }
+
+                        return Err(VmError::from(VmErrorKind::MissingField {
+                            field: field.as_str().to_owned(),
+                            target: variant.type_info(),
+                        }));
+                    }
+
+                    Ok(CallResult::Unsupported)
+                }
+                _ => Ok(CallResult::Unsupported),
             }
         }
     }
 
     /// Operation to allocate an object.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_object(&mut self, slot: usize) -> Result<(), VmError> {
+    #[tracing::instrument(skip(self))]
+    fn op_object(&mut self, address: Address, slot: usize, output: Address) -> Result<(), VmError> {
         let keys = self
             .unit
             .lookup_object_keys(slot)
             .ok_or(VmErrorKind::MissingStaticObjectKeys { slot })?;
 
         let mut object = Object::with_capacity(keys.len());
-        let values = self.stack.drain(keys.len())?;
+        let values = self.stack.drain_at(address, keys.len())?;
 
         for (key, value) in keys.iter().zip(values) {
             object.insert(key.clone(), value);
         }
 
-        self.stack.push(Shared::new(object));
+        self.stack.store(output, Shared::new(object))?;
         Ok(())
     }
 
     /// Operation to allocate an object.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_range(&mut self, limits: InstRangeLimits) -> Result<(), VmError> {
-        let end = Option::<Value>::from_value(self.stack.pop()?)?;
-        let start = Option::<Value>::from_value(self.stack.pop()?)?;
+    #[tracing::instrument(skip(self))]
+    fn op_range(
+        &mut self,
+        from: Address,
+        to: Address,
+        limits: InstRangeLimits,
+        output: Address,
+    ) -> Result<(), VmError> {
+        let mut pair = self.stack.interleaved_pair(from, to)?;
+        let start = Option::<Value>::from_value(mem::take(pair.first_mut()))?;
+        let end = Option::<Value>::from_value(mem::take(pair.second_mut()))?;
 
         let limits = match limits {
             InstRangeLimits::HalfOpen => RangeLimits::HalfOpen,
@@ -2140,25 +1981,34 @@ impl Vm {
         };
 
         let range = Range::new(start, end, limits);
-        self.stack.push(Shared::new(range));
+        self.stack.store(output, Shared::new(range))?;
         Ok(())
     }
 
     /// Operation to allocate an empty struct.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_empty_struct(&mut self, hash: Hash) -> Result<(), VmError> {
+    #[tracing::instrument(skip(self))]
+    fn op_empty_struct(&mut self, hash: Hash, output: Address) -> Result<(), VmError> {
         let rtti = self
             .unit
             .lookup_rtti(hash)
             .ok_or(VmErrorKind::MissingRtti { hash })?;
 
-        self.stack.push(UnitStruct { rtti: rtti.clone() });
+        self.stack
+            .store(output, UnitStruct { rtti: rtti.clone() })?;
         Ok(())
     }
 
     /// Operation to allocate an object struct.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_struct(&mut self, hash: Hash, slot: usize) -> Result<(), VmError> {
+    #[tracing::instrument(skip(self))]
+    fn op_struct(
+        &mut self,
+        hash: Hash,
+        address: Address,
+        slot: usize,
+        output: Address,
+    ) -> Result<(), VmError> {
         let keys = self
             .unit
             .lookup_object_keys(slot)
@@ -2169,36 +2019,47 @@ impl Vm {
             .lookup_rtti(hash)
             .ok_or(VmErrorKind::MissingRtti { hash })?;
 
-        let values = self.stack.drain(keys.len())?;
+        let values = self.stack.drain_at(address, keys.len())?;
         let mut data = Object::with_capacity(keys.len());
 
         for (key, value) in keys.iter().zip(values) {
             data.insert(key.clone(), value);
         }
 
-        self.stack.push(Struct {
-            rtti: rtti.clone(),
-            data,
-        });
+        self.stack.store(
+            output,
+            Struct {
+                rtti: rtti.clone(),
+                data,
+            },
+        )?;
 
         Ok(())
     }
 
     /// Operation to allocate an object.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_unit_variant(&mut self, hash: Hash) -> Result<(), VmError> {
+    #[tracing::instrument(skip(self))]
+    fn op_unit_variant(&mut self, hash: Hash, output: Address) -> Result<(), VmError> {
         let rtti = self
             .unit
             .lookup_variant_rtti(hash)
             .ok_or(VmErrorKind::MissingVariantRtti { hash })?;
 
-        self.stack.push(Variant::unit(rtti.clone()));
+        self.stack.store(output, Variant::unit(rtti.clone()))?;
         Ok(())
     }
 
     /// Operation to allocate an object variant.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_object_variant(&mut self, hash: Hash, slot: usize) -> Result<(), VmError> {
+    #[tracing::instrument(skip(self))]
+    fn op_struct_variant(
+        &mut self,
+        hash: Hash,
+        address: Address,
+        slot: usize,
+        output: Address,
+    ) -> Result<(), VmError> {
         let keys = self
             .unit
             .lookup_object_keys(slot)
@@ -2210,79 +2071,118 @@ impl Vm {
             .ok_or(VmErrorKind::MissingVariantRtti { hash })?;
 
         let mut data = Object::with_capacity(keys.len());
-        let values = self.stack.drain(keys.len())?;
+        let values = self.stack.drain_at(address, keys.len())?;
 
         for (key, value) in keys.iter().zip(values) {
             data.insert(key.clone(), value);
         }
 
-        self.stack.push(Variant::struct_(rtti.clone(), data));
+        self.stack
+            .store(output, Variant::struct_(rtti.clone(), data))?;
         Ok(())
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_string(&mut self, slot: usize) -> Result<(), VmError> {
+    #[tracing::instrument(skip(self))]
+    fn op_string(&mut self, slot: usize, output: Address) -> Result<(), VmError> {
         let string = self.unit.lookup_string(slot)?;
-        self.stack.push(string.clone());
+        self.stack.store(output, string.clone())?;
         Ok(())
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_bytes(&mut self, slot: usize) -> Result<(), VmError> {
+    #[tracing::instrument(skip(self))]
+    fn op_bytes(&mut self, slot: usize, output: Address) -> Result<(), VmError> {
         let bytes = self.unit.lookup_bytes(slot)?.to_owned();
-        self.stack.push(Bytes::from_vec(bytes));
+        self.stack.store(output, Bytes::from_vec(bytes))?;
         Ok(())
     }
 
     /// Optimize operation to perform string concatenation.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_string_concat(&mut self, len: usize, size_hint: usize) -> Result<(), VmError> {
-        let values = self.stack.drain(len)?.collect::<vec::Vec<_>>();
-
+    #[tracing::instrument(skip(self))]
+    fn op_string_concat(
+        &mut self,
+        mut address: Address,
+        count: usize,
+        size_hint: usize,
+        output: Address,
+    ) -> Result<(), VmError> {
         let mut out = String::with_capacity(size_hint);
         let mut buf = String::with_capacity(16);
 
-        for value in values {
+        for _ in 0..count {
+            let value = mem::take(self.stack.at_mut(address)?);
+
             if let Err(fmt::Error) = value.string_display_with(&mut out, &mut buf, &mut *self)? {
                 return Err(VmError::from(VmErrorKind::FormatError));
             }
+
+            address = address.step()?;
         }
 
-        self.stack.push(out);
+        self.stack.store(output, out)?;
         Ok(())
     }
 
     /// Push a format specification onto the stack.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_format(&mut self, spec: FormatSpec) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
-        self.stack.push(Format { value, spec });
+    #[tracing::instrument(skip(self))]
+    fn op_format(
+        &mut self,
+        value: Address,
+        spec: FormatSpec,
+        output: Address,
+    ) -> Result<(), VmError> {
+        let mut pair = self.stack.interleaved_pair(value, output)?;
+
+        *pair.second_mut() = Value::from(Format {
+            value: pair.first_mut().clone(),
+            spec,
+        });
+
         Ok(())
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_is_unit(&mut self) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
-        self.stack.push(matches!(value, Value::Unit));
+    #[tracing::instrument(skip(self))]
+    fn op_match_value(
+        &mut self,
+        address: Address,
+        value: InstValue,
+        offset: isize,
+    ) -> Result<(), VmError> {
+        let matches = match (self.stack.at(address)?, value) {
+            (Value::Unit, InstValue::Unit) => true,
+            (Value::Bool(a), InstValue::Bool(b)) => *a == b,
+            (Value::Byte(a), InstValue::Byte(b)) => *a == b,
+            (Value::Char(a), InstValue::Char(b)) => *a == b,
+            (Value::Integer(a), InstValue::Integer(b)) => *a == b,
+            (Value::Float(a), InstValue::Float(b)) => *a == b,
+            (Value::Type(a), InstValue::Type(b)) => *a == b,
+            _ => false,
+        };
+
+        if !matches {
+            self.modify_ip(offset);
+        }
+
         Ok(())
     }
 
     /// Perform the try operation on the given stack location.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_try(
-        &mut self,
-        address: InstAddress,
-        clean: usize,
-        preserve: bool,
-    ) -> Result<bool, VmError> {
-        let return_value = self.stack.address(address)?;
+    #[tracing::instrument(skip(self))]
+    fn op_try(&mut self, address: Address, output: Address) -> Result<bool, VmError> {
+        let mut pair = self.stack.interleaved_pair(address, output)?;
+        let return_value = pair.first_mut();
 
-        let unwrapped_value = match &return_value {
+        let unwrapped = match return_value {
             Value::Result(result) => match &*result.borrow_ref()? {
                 Result::Ok(value) => Some(value.clone()),
                 Result::Err(..) => None,
             },
-            Value::Option(option) => (*option.borrow_ref()?).clone(),
+            Value::Option(option) => option.borrow_ref()?.as_ref().cloned(),
             other => {
                 return Err(VmError::from(VmErrorKind::UnsupportedTryOperand {
                     actual: other.type_info()?,
@@ -2290,60 +2190,26 @@ impl Vm {
             }
         };
 
-        if let Some(value) = unwrapped_value {
-            if preserve {
-                self.stack.push(value);
-            }
-
-            Ok(false)
-        } else {
-            self.op_return_internal(return_value, clean)
+        if let Some(value) = unwrapped {
+            self.stack.store(output, value)?;
+            return Ok(false);
         }
-    }
 
-    #[cfg_attr(feature = "bench", inline(never))]
-    fn op_eq_byte(&mut self, byte: u8) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
-
-        self.stack.push(match value {
-            Value::Byte(actual) => actual == byte,
-            _ => false,
-        });
-
-        Ok(())
-    }
-
-    #[cfg_attr(feature = "bench", inline(never))]
-    fn op_eq_character(&mut self, character: char) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
-
-        self.stack.push(match value {
-            Value::Char(actual) => actual == character,
-            _ => false,
-        });
-
-        Ok(())
-    }
-
-    #[cfg_attr(feature = "bench", inline(never))]
-    fn op_eq_integer(&mut self, integer: i64) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
-
-        self.stack.push(match value {
-            Value::Integer(actual) => actual == integer,
-            _ => false,
-        });
-
-        Ok(())
+        let return_value = mem::take(return_value);
+        self.op_return_internal(return_value)
     }
 
     /// Test if the top of stack is equal to the string at the given static
     /// string slot.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_eq_string(&mut self, slot: usize) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
-
-        let equal = match value {
+    #[tracing::instrument(skip(self))]
+    fn op_match_string(
+        &mut self,
+        address: Address,
+        slot: usize,
+        offset: isize,
+    ) -> Result<(), VmError> {
+        let equal = match self.stack.at(address)? {
             Value::String(actual) => {
                 let string = self.unit.lookup_string(slot)?;
                 let actual = actual.borrow_ref()?;
@@ -2351,91 +2217,134 @@ impl Vm {
             }
             Value::StaticString(actual) => {
                 let string = self.unit.lookup_string(slot)?;
-                **actual == ***string
+                ***actual == ***string
             }
             _ => false,
         };
 
-        self.stack.push(Value::Bool(equal));
+        if !equal {
+            self.modify_ip(offset);
+        }
+
         Ok(())
     }
 
     /// Test if the top of stack is equal to the string at the given static
     /// bytes slot.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_eq_bytes(&mut self, slot: usize) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
-
-        let equal = match value {
-            Value::Bytes(actual) => {
-                let bytes = self.unit.lookup_bytes(slot)?;
-                let actual = actual.borrow_ref()?;
-                *actual == *bytes
-            }
+    #[tracing::instrument(skip(self))]
+    fn op_match_bytes(
+        &mut self,
+        address: Address,
+        slot: usize,
+        offset: isize,
+    ) -> Result<(), VmError> {
+        let equal = match self.stack.at(address)? {
+            Value::Bytes(actual) => *actual.borrow_ref()? == *self.unit.lookup_bytes(slot)?,
             _ => false,
         };
 
-        self.stack.push(Value::Bool(equal));
+        if !equal {
+            self.modify_ip(offset);
+        }
+
         Ok(())
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_match_sequence(&mut self, ty: TypeCheck, len: usize, exact: bool) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
+    #[tracing::instrument(skip(self))]
+    fn op_match_type(
+        &mut self,
+        address: Address,
+        type_hash: Hash,
+        offset: isize,
+    ) -> Result<(), VmError> {
+        if self.stack.at(address)?.type_hash()? != type_hash {
+            self.modify_ip(offset);
+        }
 
-        let result = self.on_tuple(ty, &value, move |tuple| {
-            if exact {
-                tuple.len() == len
-            } else {
-                tuple.len() >= len
-            }
-        })?;
-
-        self.stack.push(Value::Bool(result.unwrap_or_default()));
         Ok(())
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_match_type(&mut self, hash: Hash) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
-        let is_match = value.type_hash()? == hash;
-        self.stack.push(is_match);
-        Ok(())
-    }
-
-    #[cfg_attr(feature = "bench", inline(never))]
+    #[tracing::instrument(skip(self))]
     fn op_match_variant(
         &mut self,
-        enum_hash: Hash,
+        address: Address,
         variant_hash: Hash,
+        enum_hash: Hash,
         index: usize,
+        offset: isize,
+        output: Address,
     ) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
+        match self.stack.at(address)?.clone() {
+            Value::Variant(variant) => {
+                let variant = variant.borrow_ref()?;
 
-        let is_match = match &value {
-            Value::Variant(variant) => variant.borrow_ref()?.rtti().hash == variant_hash,
-            Value::Any(any) => {
-                let hash = any.borrow_ref()?.type_hash();
-
-                if hash == enum_hash {
-                    match self.call_instance_fn(value, Protocol::IS_VARIANT, (index,))? {
-                        CallResult::Ok(()) => self.stack.pop()?.as_bool()?,
-                        CallResult::Unsupported(..) => false,
-                    }
-                } else {
-                    false
+                if variant.rtti().hash != variant_hash {
+                    self.modify_ip(offset);
                 }
             }
-            _ => false,
-        };
+            Value::Any(any) => {
+                if any.borrow_ref()?.type_hash() != enum_hash {
+                    self.modify_ip(offset);
+                }
 
-        self.stack.push(is_match);
+                if matches!(
+                    self.call_is_variant(&any, index, output)?,
+                    CallResult::Unsupported | CallResult::Ok(false)
+                ) {
+                    self.modify_ip(offset);
+                }
+            }
+            _ => {
+                self.modify_ip(offset);
+            }
+        }
+
         Ok(())
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_match_builtin(&mut self, type_check: TypeCheck) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
+    #[tracing::instrument(skip(self))]
+    fn op_match_sequence(
+        &mut self,
+        address: Address,
+        ty: TypeCheck,
+        len: usize,
+        exact: bool,
+        offset: isize,
+        output: Address,
+    ) -> Result<(), VmError> {
+        let value = self.stack.at(address)?.clone();
+
+        match self.on_tuple(ty, &value)? {
+            Some(tuple) => match tuple.get(..len) {
+                Some(values) if !exact || exact && tuple.len() == len => {
+                    self.stack.write_at(output, values.iter().cloned())?;
+                }
+                _ => {
+                    self.modify_ip(offset);
+                }
+            },
+            None => {
+                self.modify_ip(offset);
+                return Ok(());
+            }
+        };
+
+        Ok(())
+    }
+
+    #[cfg_attr(feature = "bench", inline(never))]
+    #[tracing::instrument(skip(self))]
+    fn op_match_builtin(
+        &mut self,
+        address: Address,
+        type_check: TypeCheck,
+        offset: isize,
+    ) -> Result<(), VmError> {
+        let value = self.stack.at(address)?;
 
         let is_match = match (type_check, value) {
             (TypeCheck::Tuple, Value::Tuple(..)) => true,
@@ -2472,36 +2381,49 @@ impl Vm {
             _ => false,
         };
 
-        self.stack.push(is_match);
+        if !is_match {
+            self.modify_ip(offset);
+        }
+
         Ok(())
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_match_object(&mut self, slot: usize, exact: bool) -> Result<(), VmError> {
-        let value = self.stack.pop()?;
-
-        let is_match = match value {
+    #[tracing::instrument(skip(self))]
+    fn op_match_object(
+        &mut self,
+        address: Address,
+        slot: usize,
+        exact: bool,
+        offset: isize,
+        output: Address,
+    ) -> Result<(), VmError> {
+        match self.stack.at(address)?.clone() {
             Value::Object(object) => {
+                let object = object.borrow_ref()?;
+
                 let keys = self
                     .unit
                     .lookup_object_keys(slot)
                     .ok_or(VmErrorKind::MissingStaticObjectKeys { slot })?;
 
-                let object = object.borrow_ref()?;
-                test(&*object, keys, exact)
+                if !test(&*object, keys, exact) {
+                    self.modify_ip(offset);
+                    return Ok(());
+                }
+
+                let values = keys.iter().flat_map(|key| Some(object.get(key)?.clone()));
+                self.stack.write_at(output, values)?;
             }
-            _ => false,
+            _ => {
+                self.modify_ip(offset);
+            }
         };
 
-        self.stack.push(is_match);
         return Ok(());
 
         fn test(object: &Object, keys: &[String], exact: bool) -> bool {
-            if exact {
-                if object.len() != keys.len() {
-                    return false;
-                }
-            } else if object.len() < keys.len() {
+            if exact && object.len() != keys.len() || object.len() < keys.len() {
                 return false;
             }
 
@@ -2517,39 +2439,54 @@ impl Vm {
 
     /// Push the given variant onto the stack.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_variant(&mut self, variant: InstVariant) -> Result<(), VmError> {
-        match variant {
+    #[tracing::instrument(skip(self))]
+    fn op_variant(
+        &mut self,
+        address: Address,
+        variant: InstVariant,
+        output: Address,
+    ) -> Result<(), VmError> {
+        // TODO: address is unused for InstVariant::None.
+        let mut pair = self.stack.interleaved_pair(address, output)?;
+
+        let value = match variant {
             InstVariant::Some => {
-                let some = self.stack.pop()?;
-                self.stack.push(Value::Option(Shared::new(Some(some))));
+                let some = mem::take(pair.first_mut());
+                Value::Option(Shared::new(Some(some)))
             }
-            InstVariant::None => {
-                self.stack.push(Value::Option(Shared::new(None)));
-            }
+            InstVariant::None => Value::Option(Shared::new(None)),
             InstVariant::Ok => {
-                let some = self.stack.pop()?;
-                self.stack.push(Value::Result(Shared::new(Ok(some))));
+                let some = mem::take(pair.first_mut());
+                Value::Result(Shared::new(Ok(some)))
             }
             InstVariant::Err => {
-                let some = self.stack.pop()?;
-                self.stack.push(Value::Result(Shared::new(Err(some))));
+                let some = mem::take(pair.first_mut());
+                Value::Result(Shared::new(Err(some)))
             }
-        }
+        };
 
+        *pair.second_mut() = value;
         Ok(())
     }
 
     /// Load a function as a value onto the stack.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_load_fn(&mut self, hash: Hash) -> Result<(), VmError> {
+    #[tracing::instrument(skip(self))]
+    fn op_load_fn(&mut self, hash: Hash, output: Address) -> Result<(), VmError> {
         let function = match self.unit.function(hash) {
             Some(info) => match info {
-                UnitFn::Offset { offset, call, args } => Function::from_vm_offset(
+                UnitFn::Offset {
+                    offset,
+                    call,
+                    args,
+                    frame,
+                } => Function::from_vm_offset(
                     self.context.clone(),
                     self.unit.clone(),
                     offset,
                     call,
                     args,
+                    frame,
                     hash,
                 ),
                 UnitFn::UnitStruct { hash } => {
@@ -2595,24 +2532,36 @@ impl Vm {
             }
         };
 
-        self.stack.push(Value::Function(Shared::new(function)));
+        *self.stack.at_mut(output)? = Value::Function(Shared::new(function));
         Ok(())
     }
 
     /// Construct a closure on the top of the stack.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_closure(&mut self, hash: Hash, count: usize) -> Result<(), VmError> {
+    #[tracing::instrument(skip(self))]
+    fn op_closure(
+        &mut self,
+        hash: Hash,
+        address: Address,
+        count: usize,
+        output: Address,
+    ) -> Result<(), VmError> {
         let info = self
             .unit
             .function(hash)
             .ok_or(VmErrorKind::MissingFunction { hash })?;
 
-        let (offset, call, args) = match info {
-            UnitFn::Offset { offset, call, args } => (offset, call, args),
+        let (offset, call, args, frame) = match info {
+            UnitFn::Offset {
+                offset,
+                call,
+                args,
+                frame,
+            } => (offset, call, args, frame),
             _ => return Err(VmError::from(VmErrorKind::MissingFunction { hash })),
         };
 
-        let environment = self.stack.pop_sequence(count)?.into_boxed_slice();
+        let environment = self.stack.drain_at(address, count)?.collect();
 
         let function = Function::from_vm_closure(
             self.context.clone(),
@@ -2620,83 +2569,95 @@ impl Vm {
             offset,
             call,
             args,
+            frame,
             environment,
             hash,
         );
 
-        self.stack.push(Value::Function(Shared::new(function)));
+        *self.stack.at_mut(output)? = Value::Function(Shared::new(function));
         Ok(())
     }
 
     /// Implementation of a function call.
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_call(&mut self, hash: Hash, args: usize) -> Result<(), VmError> {
+    #[tracing::instrument(skip(self))]
+    fn op_call(
+        &mut self,
+        hash: Hash,
+        address: Address,
+        count: usize,
+        output: Address,
+    ) -> Result<(), VmError> {
         match self.unit.function(hash) {
             Some(info) => match info {
                 UnitFn::Offset {
                     offset,
                     call,
                     args: expected,
+                    frame,
                 } => {
-                    Self::check_args(args, expected)?;
-                    self.call_offset_fn(offset, call, args)?;
+                    check_args(count, expected)?;
+                    self.call_offset_fn(offset, call, address, count, frame, output)?;
                 }
                 UnitFn::UnitStruct { hash } => {
-                    Self::check_args(args, 0)?;
+                    check_args(count, 0)?;
 
                     let rtti = self
                         .unit
                         .lookup_rtti(hash)
                         .ok_or(VmErrorKind::MissingRtti { hash })?;
 
-                    self.stack.push(Value::unit_struct(rtti.clone()));
+                    self.stack.store(output, Value::unit_struct(rtti.clone()))?;
                 }
                 UnitFn::TupleStruct {
                     hash,
                     args: expected,
                 } => {
-                    Self::check_args(args, expected)?;
-                    let tuple = self.stack.pop_sequence(args)?;
+                    check_args(count, expected)?;
+                    let tuple = self.stack.drain_at(address, count)?.collect();
 
                     let rtti = self
                         .unit
                         .lookup_rtti(hash)
                         .ok_or(VmErrorKind::MissingRtti { hash })?;
 
-                    self.stack.push(Value::tuple_struct(rtti.clone(), tuple));
+                    self.stack
+                        .store(output, Value::tuple_struct(rtti.clone(), tuple))?;
                 }
                 UnitFn::TupleVariant {
                     hash,
                     args: expected,
                 } => {
-                    Self::check_args(args, expected)?;
+                    check_args(count, expected)?;
 
                     let rtti = self
                         .unit
                         .lookup_variant_rtti(hash)
                         .ok_or(VmErrorKind::MissingVariantRtti { hash })?;
 
-                    let tuple = self.stack.pop_sequence(args)?;
-                    self.stack.push(Value::tuple_variant(rtti.clone(), tuple));
+                    let tuple = self.stack.drain_at(address, count)?.collect();
+                    self.stack
+                        .store(output, Value::tuple_variant(rtti.clone(), tuple))?;
                 }
                 UnitFn::UnitVariant { hash } => {
-                    Self::check_args(args, 0)?;
+                    check_args(count, 0)?;
 
                     let rtti = self
                         .unit
                         .lookup_variant_rtti(hash)
                         .ok_or(VmErrorKind::MissingVariantRtti { hash })?;
 
-                    self.stack.push(Value::unit_variant(rtti.clone()));
+                    self.stack
+                        .store(output, Value::unit_variant(rtti.clone()))?;
                 }
             },
             None => {
-                let handler = self
+                if !self
                     .context
-                    .function(hash)
-                    .ok_or(VmErrorKind::MissingFunction { hash })?;
-
-                handler(&mut self.stack, args)?;
+                    .fn_call(hash, &mut self.stack, address, count, output)?
+                {
+                    return Err(VmError::from(VmErrorKind::MissingFunction { hash }));
+                }
             }
         }
 
@@ -2704,44 +2665,60 @@ impl Vm {
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_call_instance(&mut self, hash: Hash, args: usize) -> Result<(), VmError> {
-        // NB: +1 to include the instance itself.
-        let args = args + 1;
-        let instance = self.stack.at_offset_from_top(args)?;
-        let type_hash = instance.type_hash()?;
+    #[tracing::instrument(skip(self))]
+    fn op_call_instance(
+        &mut self,
+        hash: Hash,
+        address: Address,
+        count: usize,
+        output: Address,
+    ) -> Result<(), VmError> {
+        let count = count + 1;
+        let type_hash = self.stack.at(address)?.type_hash()?;
         let hash = Hash::instance_function(type_hash, hash);
+        let unit_fn = self.unit.function(hash);
 
         if let Some(UnitFn::Offset {
             offset,
             call,
             args: expected,
-        }) = self.unit.function(hash)
+            frame,
+        }) = unit_fn
         {
-            Self::check_args(args, expected)?;
-            self.call_offset_fn(offset, call, args)?;
+            check_args(count, expected)?;
+            self.call_offset_fn(offset, call, address, count, frame, output)?;
             return Ok(());
         }
 
-        if let Some(handler) = self.context.function(hash) {
-            handler(&mut self.stack, args)?;
-            return Ok(());
+        if !self
+            .context
+            .fn_call(hash, &mut self.stack, address, count, output)?
+        {
+            return Err(VmError::from(VmErrorKind::MissingInstanceFunction {
+                instance: self.stack.at(Address::BASE)?.type_info()?,
+                hash,
+            }));
         }
 
-        Err(VmError::from(VmErrorKind::MissingInstanceFunction {
-            instance: instance.type_info()?,
-            hash,
-        }))
+        Ok(())
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_call_fn(&mut self, args: usize) -> Result<Option<VmHalt>, VmError> {
-        let function = self.stack.pop()?;
+    #[tracing::instrument(skip(self))]
+    fn op_call_fn(
+        &mut self,
+        function: Address,
+        address: Address,
+        count: usize,
+        output: Address,
+    ) -> Result<Option<VmHalt>, VmError> {
+        let function = self.stack.at(function)?;
 
         let hash = match function {
-            Value::Type(hash) => hash,
-            Value::Function(function) => {
-                let function = function.into_ref()?;
-                return function.call_with_vm(self, args);
+            Value::Type(hash) => *hash,
+            Value::Function(ref function) => {
+                let function = function.clone().into_ref()?;
+                return function.call_with_vm(self, address, count, output);
             }
             actual => {
                 let actual_type = actual.type_info()?;
@@ -2751,24 +2728,37 @@ impl Vm {
             }
         };
 
-        self.op_call(hash, args)?;
+        self.op_call(hash, address, count, output)?;
         Ok(None)
     }
 
     #[cfg_attr(feature = "bench", inline(never))]
-    fn op_iter_next(&mut self, offset: usize, jump: isize) -> Result<(), VmError> {
-        let value = self.stack.at_offset_mut(offset)?;
+    #[tracing::instrument(skip(self))]
+    fn op_iter_next(
+        &mut self,
+        address: Address,
+        offset: isize,
+        output: Address,
+    ) -> Result<(), VmError> {
+        let iterator = self.stack.at(address)?;
 
-        let some = match value {
-            Value::Option(option) => {
-                let option = option.borrow_ref()?.clone();
+        let value = match iterator {
+            Value::Iterator(iterator) => iterator.borrow_mut()?.next()?,
+            Value::Any(any) => {
+                let any = any.clone();
 
-                match option {
-                    Some(some) => some,
-                    None => {
-                        self.modify_ip(jump)?;
-                        return Ok(());
-                    }
+                if let CallResult::Unsupported = self.call_next(&any, output)? {
+                    return Err(VmError::from(VmErrorKind::UnsupportedIterNextOperand {
+                        actual: any.borrow_ref()?.type_info(),
+                    }));
+                }
+
+                match &*mem::take(self.stack.at_mut(output)?)
+                    .into_option()?
+                    .borrow_ref()?
+                {
+                    Some(some) => Some(some.clone()),
+                    None => None,
                 }
             }
             other => {
@@ -2778,7 +2768,15 @@ impl Vm {
             }
         };
 
-        *value = some;
+        match value {
+            Some(value) => {
+                *self.stack.at_mut(output)? = value;
+            }
+            None => {
+                self.modify_ip(offset);
+            }
+        }
+
         Ok(())
     }
 
@@ -2823,6 +2821,7 @@ impl Vm {
     }
 
     /// Evaluate a single instruction.
+    #[tracing::instrument(skip(self))]
     pub(crate) fn run(&mut self) -> Result<VmHalt, VmError> {
         // NB: set up environment so that native function can access context and
         // unit.
@@ -2841,55 +2840,100 @@ impl Vm {
             tracing::trace!("{}: {}", self.ip, inst);
 
             match inst {
-                Inst::Not => {
-                    self.op_not()?;
+                Inst::Not { address, output } => {
+                    self.op_not(address, output)?;
                 }
-                Inst::Neg => {
-                    self.op_neg()?;
+                Inst::Neg { address, output } => {
+                    self.op_neg(address, output)?;
                 }
-                Inst::Closure { hash, count } => {
-                    self.op_closure(hash, count)?;
+                Inst::Closure {
+                    hash,
+                    address,
+                    count,
+                    output,
+                } => {
+                    self.op_closure(hash, address, count, output)?;
                 }
-                Inst::Call { hash, args } => {
-                    self.op_call(hash, args)?;
+                Inst::Call {
+                    hash,
+                    address,
+                    count,
+                    output,
+                } => {
+                    self.op_call(hash, address, count, output)?;
                 }
-                Inst::CallInstance { hash, args } => {
-                    self.op_call_instance(hash, args)?;
+                Inst::CallInstance {
+                    hash,
+                    address,
+                    count,
+                    output,
+                } => {
+                    self.op_call_instance(hash, address, count, output)?;
                 }
-                Inst::CallFn { args } => {
-                    if let Some(reason) = self.op_call_fn(args)? {
+                Inst::CallFn {
+                    function,
+                    address,
+                    count,
+                    output,
+                } => {
+                    if let Some(reason) = self.op_call_fn(function, address, count, output)? {
                         return Ok(reason);
                     }
                 }
-                Inst::LoadInstanceFn { hash } => {
-                    self.op_load_instance_fn(hash)?;
+                Inst::LoadInstanceFn {
+                    address,
+                    hash,
+                    output,
+                } => {
+                    self.op_load_instance_fn(address, hash, output)?;
                 }
-                Inst::IndexGet { target, index } => {
-                    self.op_index_get(target, index)?;
+                Inst::IndexGet {
+                    address,
+                    index,
+                    output,
+                } => {
+                    self.op_index_get(address, index, output)?;
                 }
-                Inst::TupleIndexGet { index } => {
-                    self.op_tuple_index_get(index)?;
+                Inst::TupleIndexGet {
+                    address,
+                    index,
+                    output,
+                } => {
+                    self.op_tuple_index_get(address, index, output)?;
                 }
-                Inst::TupleIndexSet { index } => {
-                    self.op_tuple_index_set(index)?;
+                Inst::TupleIndexSet {
+                    address,
+                    value,
+                    index,
+                    output,
+                } => {
+                    self.op_tuple_index_set(address, value, index, output)?;
                 }
-                Inst::TupleIndexGetAt { offset, index } => {
-                    self.op_tuple_index_get_at(offset, index)?;
+                Inst::ObjectIndexGet {
+                    address,
+                    slot,
+                    output,
+                } => {
+                    self.op_object_index_get(address, slot, output)?;
                 }
-                Inst::ObjectIndexGet { slot } => {
-                    self.op_object_index_get(slot)?;
+                Inst::ObjectIndexSet {
+                    address,
+                    slot,
+                    value,
+                    output,
+                } => {
+                    self.op_object_index_set(address, slot, value, output)?;
                 }
-                Inst::ObjectIndexSet { slot } => {
-                    self.op_object_index_set(slot)?;
+                Inst::IndexSet {
+                    address,
+                    index,
+                    value,
+                    output,
+                } => {
+                    self.op_index_set(address, index, value, output)?;
                 }
-                Inst::ObjectIndexGetAt { offset, slot } => {
-                    self.op_object_index_get_at(offset, slot)?;
-                }
-                Inst::IndexSet => {
-                    self.op_index_set()?;
-                }
-                Inst::Return { address, clean } => {
-                    if self.op_return(address, clean)? {
+                Inst::Return { address } => {
+                    if self.op_return(address)? {
                         self.advance();
                         return Ok(VmHalt::Exited);
                     }
@@ -2900,190 +2944,251 @@ impl Vm {
                         return Ok(VmHalt::Exited);
                     }
                 }
-                Inst::Await => {
-                    let future = self.op_await()?;
+                Inst::Await { address, output } => {
+                    let future = self.op_await(address)?;
                     // NB: the future itself will advance the virtual machine.
-                    return Ok(VmHalt::Awaited(Awaited::Future(future)));
+                    return Ok(VmHalt::Awaited(Awaited::Future(future, output)));
                 }
-                Inst::Select { len } => {
-                    if let Some(select) = self.op_select(len)? {
+                Inst::Select {
+                    address,
+                    len,
+                    output,
+                    branch_output,
+                } => {
+                    if let Some(select) = self.op_select(address, len, output)? {
                         // NB: the future itself will advance the virtual machine.
-                        return Ok(VmHalt::Awaited(Awaited::Select(select)));
+                        return Ok(VmHalt::Awaited(Awaited::Select(
+                            select,
+                            output,
+                            branch_output,
+                        )));
                     }
                 }
-                Inst::LoadFn { hash } => {
-                    self.op_load_fn(hash)?;
+                Inst::LoadFn { hash, output } => {
+                    self.op_load_fn(hash, output)?;
                 }
-                Inst::Push { value } => {
-                    self.op_push(value)?;
+                Inst::Store { value, output } => {
+                    self.op_store(value, output)?;
                 }
-                Inst::Pop => {
-                    self.op_pop()?;
+                Inst::Copy { address, output } => {
+                    self.op_copy(address, output)?;
                 }
-                Inst::PopN { count } => {
-                    self.op_popn(count)?;
+                Inst::Move { address, output } => {
+                    self.op_move(address, output)?;
                 }
-                Inst::PopAndJumpIfNot { count, offset } => {
-                    self.op_pop_and_jump_if_not(count, offset)?;
-                }
-                Inst::Clean { count } => {
-                    self.op_clean(count)?;
-                }
-                Inst::Copy { offset } => {
-                    self.op_copy(offset)?;
-                }
-                Inst::Move { offset } => {
-                    self.op_move(offset)?;
-                }
-                Inst::Drop { offset } => {
-                    self.op_drop(offset)?;
-                }
-                Inst::Dup => {
-                    self.op_dup()?;
-                }
-                Inst::Replace { offset } => {
-                    self.op_replace(offset)?;
+                Inst::Drop { address } => {
+                    self.op_drop(address)?;
                 }
                 Inst::Jump { offset } => {
                     self.op_jump(offset)?;
                 }
-                Inst::JumpIf { offset } => {
-                    self.op_jump_if(offset)?;
+                Inst::JumpIf { address, offset } => {
+                    self.op_jump_if(address, offset, true)?;
                 }
-                Inst::JumpIfOrPop { offset } => {
-                    self.op_jump_if_or_pop(offset)?;
+                Inst::JumpIfNot { address, offset } => {
+                    self.op_jump_if(address, offset, false)?;
                 }
-                Inst::JumpIfNotOrPop { offset } => {
-                    self.op_jump_if_not_or_pop(offset)?;
-                }
-                Inst::JumpIfBranch { branch, offset } => {
-                    self.op_jump_if_branch(branch, offset)?;
-                }
-                Inst::Vec { count } => {
-                    self.op_vec(count)?;
-                }
-                Inst::Tuple { count } => {
-                    self.op_tuple(count)?;
-                }
-                Inst::Tuple1 { args } => {
-                    self.op_tuple_n(&args[..])?;
-                }
-                Inst::Tuple2 { args } => {
-                    self.op_tuple_n(&args[..])?;
-                }
-                Inst::Tuple3 { args } => {
-                    self.op_tuple_n(&args[..])?;
-                }
-                Inst::Tuple4 { args } => {
-                    self.op_tuple_n(&args[..])?;
-                }
-                Inst::PushTuple => {
-                    self.op_push_tuple()?;
-                }
-                Inst::Object { slot } => {
-                    self.op_object(slot)?;
-                }
-                Inst::Range { limits } => {
-                    self.op_range(limits)?;
-                }
-                Inst::UnitStruct { hash } => {
-                    self.op_empty_struct(hash)?;
-                }
-                Inst::Struct { hash, slot } => {
-                    self.op_struct(hash, slot)?;
-                }
-                Inst::UnitVariant { hash } => {
-                    self.op_unit_variant(hash)?;
-                }
-                Inst::StructVariant { hash, slot } => {
-                    self.op_object_variant(hash, slot)?;
-                }
-                Inst::String { slot } => {
-                    self.op_string(slot)?;
-                }
-                Inst::Bytes { slot } => {
-                    self.op_bytes(slot)?;
-                }
-                Inst::StringConcat { len, size_hint } => {
-                    self.op_string_concat(len, size_hint)?;
-                }
-                Inst::Format { spec } => {
-                    self.op_format(spec)?;
-                }
-                Inst::IsUnit => {
-                    self.op_is_unit()?;
-                }
-                Inst::Try {
+                Inst::JumpIfBranch {
                     address,
-                    clean,
-                    preserve,
+                    branch,
+                    offset,
                 } => {
-                    if self.op_try(address, clean, preserve)? {
+                    self.op_jump_if_branch(address, branch, offset)?;
+                }
+                Inst::Vec {
+                    address,
+                    count,
+                    output,
+                } => {
+                    self.op_vec(address, count, output)?;
+                }
+                Inst::Tuple {
+                    address,
+                    count,
+                    output,
+                } => {
+                    self.op_tuple(address, count, output)?;
+                }
+                Inst::Tuple1 { args, output } => {
+                    self.op_tuple_n(&args[..], output)?;
+                }
+                Inst::Tuple2 { args, output } => {
+                    self.op_tuple_n(&args[..], output)?;
+                }
+                Inst::Tuple3 { args, output } => {
+                    self.op_tuple_n(&args[..], output)?;
+                }
+                Inst::Tuple4 { args, output } => {
+                    self.op_tuple_n(&args[..], output)?;
+                }
+                Inst::UnpackTuple { address, output } => {
+                    self.op_unpack_tuple(address, output)?;
+                }
+                Inst::Object {
+                    address,
+                    slot,
+                    output,
+                } => {
+                    self.op_object(address, slot, output)?;
+                }
+                Inst::Range {
+                    from,
+                    to,
+                    limits,
+                    output,
+                } => {
+                    self.op_range(from, to, limits, output)?;
+                }
+                Inst::UnitStruct { hash, output } => {
+                    self.op_empty_struct(hash, output)?;
+                }
+                Inst::Struct {
+                    hash,
+                    address,
+                    slot,
+                    output,
+                } => {
+                    self.op_struct(hash, address, slot, output)?;
+                }
+                Inst::UnitVariant { hash, output } => {
+                    self.op_unit_variant(hash, output)?;
+                }
+                Inst::StructVariant {
+                    hash,
+                    address,
+                    slot,
+                    output,
+                } => {
+                    self.op_struct_variant(hash, address, slot, output)?;
+                }
+                Inst::String { slot, output } => {
+                    self.op_string(slot, output)?;
+                }
+                Inst::Bytes { slot, output } => {
+                    self.op_bytes(slot, output)?;
+                }
+                Inst::StringConcat {
+                    address,
+                    count,
+                    size_hint,
+                    output,
+                } => {
+                    self.op_string_concat(address, count, size_hint, output)?;
+                }
+                Inst::Format {
+                    address,
+                    spec,
+                    output,
+                } => {
+                    self.op_format(address, spec, output)?;
+                }
+                Inst::Try { address, output } => {
+                    if self.op_try(address, output)? {
                         self.advance();
                         return Ok(VmHalt::Exited);
                     }
                 }
-                Inst::EqByte { byte } => {
-                    self.op_eq_byte(byte)?;
+                Inst::MatchValue {
+                    address,
+                    value,
+                    offset,
+                } => {
+                    self.op_match_value(address, value, offset)?;
                 }
-                Inst::EqChar { char: character } => {
-                    self.op_eq_character(character)?;
+                Inst::MatchString {
+                    address,
+                    slot,
+                    offset,
+                } => {
+                    self.op_match_string(address, slot, offset)?;
                 }
-                Inst::EqInteger { integer } => {
-                    self.op_eq_integer(integer)?;
+                Inst::MatchBytes {
+                    address,
+                    slot,
+                    offset,
+                } => {
+                    self.op_match_bytes(address, slot, offset)?;
                 }
-                Inst::EqBool { boolean } => {
-                    self.op_eq_bool(boolean)?;
+                Inst::MatchType {
+                    address,
+                    type_hash,
+                    offset,
+                } => {
+                    self.op_match_type(address, type_hash, offset)?;
                 }
-                Inst::EqString { slot } => {
-                    self.op_eq_string(slot)?;
-                }
-                Inst::EqBytes { slot } => {
-                    self.op_eq_bytes(slot)?;
+                Inst::MatchVariant {
+                    address,
+                    variant_hash,
+                    enum_hash,
+                    index,
+                    offset,
+                    output,
+                } => {
+                    self.op_match_variant(address, variant_hash, enum_hash, index, offset, output)?;
                 }
                 Inst::MatchSequence {
+                    address,
                     type_check,
                     len,
                     exact,
+                    offset,
+                    output,
                 } => {
-                    self.op_match_sequence(type_check, len, exact)?;
+                    self.op_match_sequence(address, type_check, len, exact, offset, output)?;
                 }
-                Inst::MatchType { hash } => {
-                    self.op_match_type(hash)?;
-                }
-                Inst::MatchVariant {
-                    enum_hash,
-                    variant_hash,
-                    index,
+                Inst::MatchBuiltIn {
+                    address,
+                    type_check,
+                    offset,
                 } => {
-                    self.op_match_variant(enum_hash, variant_hash, index)?;
+                    self.op_match_builtin(address, type_check, offset)?;
                 }
-                Inst::MatchBuiltIn { type_check } => {
-                    self.op_match_builtin(type_check)?;
+                Inst::MatchObject {
+                    address,
+                    slot,
+                    exact,
+                    offset,
+                    output,
+                } => {
+                    self.op_match_object(address, slot, exact, offset, output)?;
                 }
-                Inst::MatchObject { slot, exact } => {
-                    self.op_match_object(slot, exact)?;
+                Inst::Yield { address, output } => {
+                    return Ok(VmHalt::Yielded {
+                        address: Some(address),
+                        output,
+                    });
                 }
-                Inst::Yield => {
-                    self.advance();
-                    return Ok(VmHalt::Yielded);
+                Inst::YieldUnit { output } => {
+                    return Ok(VmHalt::Yielded {
+                        address: None,
+                        output,
+                    });
                 }
-                Inst::YieldUnit => {
-                    self.advance();
-                    self.stack.push(Value::Unit);
-                    return Ok(VmHalt::Yielded);
+                Inst::Variant {
+                    address,
+                    variant,
+                    output,
+                } => {
+                    self.op_variant(address, variant, output)?;
                 }
-                Inst::Variant { variant } => {
-                    self.op_variant(variant)?;
+                Inst::Op { op, a, b, output } => {
+                    self.op_op(op, a, b, output)?;
                 }
-                Inst::Op { op, a, b } => {
-                    self.op_op(op, a, b)?;
+                Inst::Assign {
+                    lhs,
+                    rhs,
+                    target,
+                    op,
+                    output,
+                } => {
+                    self.op_assign(lhs, rhs, target, op, output)?;
                 }
-                Inst::Assign { target, op } => {
-                    self.op_assign(target, op)?;
-                }
-                Inst::IterNext { offset, jump } => {
-                    self.op_iter_next(offset, jump)?;
+                Inst::IterNext {
+                    address,
+                    offset,
+                    output,
+                } => {
+                    self.op_iter_next(address, offset, output)?;
                 }
                 Inst::Panic { reason } => {
                     return Err(VmError::from(VmErrorKind::Panic {
@@ -3122,6 +3227,10 @@ pub struct CallFrame {
     /// I.e. a function should not be able to manipulate the size of any other
     /// stack than its own.
     stack_bottom: usize,
+    /// The size of the stack when the call was entered.
+    stack: usize,
+    /// Where to write the return value of the stack frame.
+    output: Address,
 }
 
 impl CallFrame {
@@ -3142,5 +3251,375 @@ struct ClearStack<'a>(&'a mut Vm);
 impl Drop for ClearStack<'_> {
     fn drop(&mut self) {
         self.0.stack.clear();
+    }
+}
+
+/// Check that arguments matches expected or raise the appropriate error.
+pub(crate) fn check_args(args: usize, expected: usize) -> Result<(), VmError> {
+    if args != expected {
+        return Err(VmError::from(VmErrorKind::BadArgumentCount {
+            actual: args,
+            expected,
+        }));
+    }
+
+    Ok(())
+}
+
+/// Implementation of getting a string index on an object-like type.
+fn try_tuple_like_index_get(
+    target: &Value,
+    index: usize,
+) -> Result<CallResult<BorrowRef<'_, Value>>, VmError> {
+    let value = match target {
+        Value::Unit => None,
+        Value::Tuple(tuple) => BorrowRef::try_map(tuple.borrow_ref()?, |v| v.get(index)),
+        Value::Vec(vec) => BorrowRef::try_map(vec.borrow_ref()?, |v| v.get(index)),
+        Value::Result(result) => BorrowRef::try_map(result.borrow_ref()?, |v| match (index, v) {
+            (0, Ok(value)) => Some(value),
+            (1, Err(value)) => Some(value),
+            _ => None,
+        }),
+        Value::Option(option) => BorrowRef::try_map(option.borrow_ref()?, |v| match (index, &*v) {
+            (0, Some(value)) => Some(value),
+            _ => None,
+        }),
+        Value::GeneratorState(state) => {
+            use crate::runtime::GeneratorState::*;
+
+            BorrowRef::try_map(state.borrow_ref()?, |v| match (index, &*v) {
+                (0, Yielded(value)) => Some(value),
+                (1, Complete(value)) => Some(value),
+                _ => None,
+            })
+        }
+        Value::TupleStruct(tuple) => {
+            BorrowRef::try_map(tuple.borrow_ref()?, |v| v.data().get(index))
+        }
+        Value::Variant(variant) => {
+            BorrowRef::try_map(variant.borrow_ref()?, |variant| match variant.data() {
+                VariantData::Tuple(tuple) => tuple.get(index),
+                _ => None,
+            })
+        }
+        _ => return Ok(CallResult::Unsupported),
+    };
+
+    let value = match value {
+        Some(value) => value,
+        None => {
+            return Err(VmError::from(VmErrorKind::MissingIndex {
+                target: target.type_info()?,
+                index: VmIntegerRepr::from(index),
+            }));
+        }
+    };
+
+    Ok(CallResult::Ok(value))
+}
+
+/// Implementation of getting a mutable value out of a tuple-like value.
+fn try_tuple_like_index_get_mut(
+    target: &Value,
+    index: usize,
+) -> Result<CallResult<BorrowMut<'_, Value>>, VmError> {
+    let value = match target {
+        Value::Tuple(tuple) => {
+            let tuple = tuple.borrow_mut()?;
+            BorrowMut::try_map(tuple, |tuple| tuple.get_mut(index))
+        }
+        Value::Vec(vec) => BorrowMut::try_map(vec.borrow_mut()?, |vec| vec.get_mut(index)),
+        Value::Result(result) => {
+            BorrowMut::try_map(result.borrow_mut()?, |result| match (index, result) {
+                (0, Ok(value)) => Some(value),
+                (1, Err(value)) => Some(value),
+                _ => None,
+            })
+        }
+        Value::Option(option) => {
+            BorrowMut::try_map(option.borrow_mut()?, |option| match (index, option) {
+                (0, Some(value)) => Some(value),
+                _ => None,
+            })
+        }
+        Value::GeneratorState(state) => {
+            use crate::runtime::GeneratorState::*;
+
+            BorrowMut::try_map(state.borrow_mut()?, |state| match (index, state) {
+                (0, Yielded(value)) => Some(value),
+                (1, Complete(value)) => Some(value),
+                _ => None,
+            })
+        }
+        Value::TupleStruct(tuple) => {
+            BorrowMut::try_map(tuple.borrow_mut()?, |tuple| tuple.get_mut(index))
+        }
+        Value::Variant(variant) => {
+            let data =
+                BorrowMut::try_map(variant.borrow_mut()?, |variant| match variant.data_mut() {
+                    VariantData::Tuple(data) => Some(data),
+                    _ => None,
+                });
+
+            let data = match data {
+                Some(data) => data,
+                None => {
+                    return Ok(CallResult::Unsupported);
+                }
+            };
+
+            BorrowMut::try_map(data, |data| data.get_mut(index))
+        }
+        _ => return Ok(CallResult::Unsupported),
+    };
+
+    if let Some(value) = value {
+        return Ok(CallResult::Ok(value));
+    }
+
+    Err(VmError::from(VmErrorKind::MissingIndex {
+        target: target.type_info()?,
+        index: VmIntegerRepr::from(index),
+    }))
+}
+
+/// Implementation of getting a string index on an object-like type.
+fn try_object_like_index_get<'a>(
+    target: &'a Value,
+    field: &str,
+) -> Result<CallResult<BorrowRef<'a, Value>>, VmError> {
+    let value = match &target {
+        Value::Object(target) => BorrowRef::try_map(target.borrow_ref()?, |v| v.get(field)),
+        Value::Struct(target) => BorrowRef::try_map(target.borrow_ref()?, |v| v.get(field)),
+        Value::Variant(variant) => BorrowRef::try_map(variant.borrow_ref()?, |v| match v.data() {
+            VariantData::Struct(target) => target.get(field),
+            _ => None,
+        }),
+        _ => return Ok(CallResult::Unsupported),
+    };
+
+    let value = match value {
+        Some(value) => value,
+        None => {
+            return Err(VmError::from(VmErrorKind::MissingField {
+                target: target.type_info()?,
+                field: field.to_owned(),
+            }));
+        }
+    };
+
+    Ok(CallResult::Ok(value))
+}
+
+/// Implementation of getting a mutable string index on an object-like type.
+fn try_object_like_index_get_mut<'value>(
+    target: &'value Value,
+    field: &str,
+) -> Result<CallResult<BorrowMut<'value, Value>>, VmError> {
+    let value = match target {
+        Value::Object(object) => {
+            BorrowMut::try_map(object.borrow_mut()?, |object| object.get_mut(field))
+        }
+        Value::Struct(st) => BorrowMut::try_map(st.borrow_mut()?, |st| st.get_mut(field)),
+        Value::Variant(variant) => {
+            let data =
+                BorrowMut::try_map(variant.borrow_mut()?, |variant| match variant.data_mut() {
+                    VariantData::Struct(data) => Some(data),
+                    _ => None,
+                });
+
+            let data = match data {
+                Some(data) => data,
+                None => return Ok(CallResult::Unsupported),
+            };
+
+            BorrowMut::try_map(data, |data| data.get_mut(field))
+        }
+        _ => return Ok(CallResult::Unsupported),
+    };
+
+    if let Some(value) = value {
+        return Ok(CallResult::Ok(value));
+    }
+
+    Err(VmError::from(VmErrorKind::MissingField {
+        target: target.type_info()?,
+        field: field.to_owned(),
+    }))
+}
+
+/// Helper to resolve an [InstTarget].
+fn target_value<T>(
+    vm: &mut Vm,
+    lhs_address: Address,
+    rhs_address: Address,
+    target: InstTarget,
+    protocol: Protocol,
+    output: Address,
+    builtin: T,
+) -> Result<(), VmError>
+where
+    T: FnOnce(&mut Value, &Value) -> Result<CallResult<()>, VmError>,
+{
+    let (lhs, rhs) = vm.stack.pair(lhs_address, rhs_address)?;
+
+    if let CallResult::Ok(()) = apply_builtin(&vm.unit, lhs, rhs, target, builtin)? {
+        return Ok(());
+    }
+
+    let lhs = lhs.clone();
+    let rhs = rhs.clone();
+
+    if let CallResult::Ok(()) = vm
+        .context
+        .call_instance_fn(&mut vm.stack, &vm.unit, lhs, protocol, (rhs,), output)?
+        .or_call_offset_with(vm)?
+    {
+        return Ok(());
+    }
+
+    return Err(VmError::from(VmErrorKind::UnsupportedBinaryOperation {
+        op: protocol.name,
+        lhs: vm.stack.at(lhs_address)?.type_info()?,
+        rhs: vm.stack.at(rhs_address)?.type_info()?,
+    }));
+
+    fn apply_builtin<T>(
+        unit: &Unit,
+        lhs: &mut Value,
+        rhs: &Value,
+        target: InstTarget,
+        builtin: T,
+    ) -> Result<CallResult<()>, VmError>
+    where
+        T: FnOnce(&mut Value, &Value) -> Result<CallResult<()>, VmError>,
+    {
+        match target {
+            InstTarget::Offset => builtin(lhs, rhs),
+            InstTarget::TupleField(index) => {
+                if let CallResult::Ok(mut value) = try_tuple_like_index_get_mut(lhs, index)? {
+                    return builtin(&mut *value, rhs);
+                }
+
+                Err(VmError::from(VmErrorKind::UnsupportedTupleIndexGet {
+                    target: lhs.type_info()?,
+                }))
+            }
+            InstTarget::ObjectField(field) => {
+                let field = unit.lookup_string(field)?;
+
+                if let CallResult::Ok(mut value) = try_object_like_index_get_mut(lhs, field)? {
+                    return builtin(&mut *value, rhs);
+                }
+
+                Err(VmError::from(VmErrorKind::UnsupportedObjectSlotIndexGet {
+                    target: lhs.type_info()?,
+                }))
+            }
+        }
+    }
+}
+
+impl Vm {
+    /// Unpack the given tuple.
+    fn on_tuple<'a>(
+        &mut self,
+        type_check: TypeCheck,
+        value: &'a Value,
+    ) -> Result<Option<BorrowRef<'a, [Value]>>, VmError> {
+        use std::slice;
+
+        match (type_check, value) {
+            (TypeCheck::Tuple, Value::Tuple(tuple)) => {
+                Ok(Some(BorrowRef::map(tuple.borrow_ref()?, |value| &**value)))
+            }
+            (TypeCheck::Vec, Value::Vec(vec)) => {
+                Ok(Some(BorrowRef::map(vec.borrow_ref()?, |value| &**value)))
+            }
+            (TypeCheck::Result(v), Value::Result(result)) => {
+                Ok(BorrowRef::try_map(result.borrow_ref()?, |result| {
+                    match (v, result) {
+                        (0, Ok(ok)) => Some(slice::from_ref(ok)),
+                        (1, Err(err)) => Some(slice::from_ref(err)),
+                        _ => None,
+                    }
+                }))
+            }
+            (TypeCheck::Option(v), Value::Option(option)) => {
+                Ok(BorrowRef::try_map(option.borrow_ref()?, |option| {
+                    match (v, option) {
+                        (0, Some(some)) => Some(slice::from_ref(some)),
+                        (1, None) => Some(&[]),
+                        _ => None,
+                    }
+                }))
+            }
+            (TypeCheck::GeneratorState(v), Value::GeneratorState(state)) => {
+                use crate::runtime::GeneratorState::*;
+                Ok(BorrowRef::try_map(state.borrow_ref()?, |state| {
+                    match (v, state) {
+                        (0, Complete(complete)) => Some(slice::from_ref(complete)),
+                        (1, Yielded(yielded)) => Some(slice::from_ref(yielded)),
+                        _ => None,
+                    }
+                }))
+            }
+            (TypeCheck::Unit, Value::Unit) => Ok(Some(BorrowRef::from_static(&[]))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Perform a function call to determine if `any` matches the variant given
+    /// by `index`.
+    fn call_is_variant(
+        &mut self,
+        any: &Shared<AnyObj>,
+        index: usize,
+        output: Address,
+    ) -> Result<CallResult<bool>, VmError> {
+        let value = Value::Any(any.clone());
+
+        if let CallResult::Unsupported = self
+            .context
+            .call_instance_fn(
+                &mut self.stack,
+                &self.unit,
+                value,
+                Protocol::IS_VARIANT,
+                (index,),
+                output,
+            )?
+            .or_call_offset_with(self)?
+        {
+            Ok(CallResult::Unsupported)
+        } else {
+            Ok(CallResult::Ok(self.stack.take_at(output)?.into_bool()?))
+        }
+    }
+
+    /// Call [Protocol::NEXT] on the given value.
+    fn call_next(
+        &mut self,
+        any: &Shared<AnyObj>,
+        output: Address,
+    ) -> Result<CallResult<()>, VmError> {
+        let value = Value::Any(any.clone());
+
+        if let CallResult::Unsupported = self
+            .context
+            .call_instance_fn(
+                &mut self.stack,
+                &self.unit,
+                value,
+                Protocol::NEXT,
+                (),
+                output,
+            )?
+            .or_call_offset_with(self)?
+        {
+            Ok(CallResult::Unsupported)
+        } else {
+            Ok(CallResult::Ok(()))
+        }
     }
 }

@@ -23,7 +23,6 @@ pub(crate) use self::wildcard_import::WildcardImport;
 pub(crate) struct Worker<'a> {
     context: &'a Context,
     options: &'a Options,
-    pub(crate) diagnostics: &'a mut Diagnostics,
     pub(crate) source_loader: &'a mut dyn SourceLoader,
     /// Query engine.
     pub(crate) q: Query<'a>,
@@ -55,10 +54,18 @@ impl<'a> Worker<'a> {
         Self {
             context,
             options,
-            diagnostics,
             source_loader,
             q: Query::new(
-                unit, prelude, consts, storage, sources, pool, visitor, gen, inner,
+                unit,
+                prelude,
+                consts,
+                storage,
+                sources,
+                pool,
+                visitor,
+                diagnostics,
+                gen,
+                inner,
             ),
             gen,
             loaded: HashMap::new(),
@@ -85,7 +92,8 @@ impl<'a> Worker<'a> {
                     let source = match self.q.sources.get(source_id) {
                         Some(source) => source,
                         None => {
-                            self.diagnostics
+                            self.q
+                                .diagnostics
                                 .internal(source_id, "missing queued source by id");
                             continue;
                         }
@@ -98,7 +106,7 @@ impl<'a> Worker<'a> {
                     ) {
                         Ok(file) => file,
                         Err(error) => {
-                            self.diagnostics.error(source_id, error);
+                            self.q.diagnostics.error(source_id, error);
                             continue;
                         }
                     };
@@ -119,7 +127,6 @@ impl<'a> Worker<'a> {
                         context: self.context,
                         options: self.options,
                         source_id,
-                        diagnostics: self.diagnostics,
                         items,
                         scopes: IndexScopes::new(),
                         mod_item,
@@ -129,7 +136,7 @@ impl<'a> Worker<'a> {
                     };
 
                     if let Err(error) = index::file(&mut file, &mut indexer) {
-                        indexer.diagnostics.error(source_id, error);
+                        indexer.q.diagnostics.error(source_id, error);
                     }
                 }
                 Task::ExpandImport(import) => {
@@ -143,7 +150,7 @@ impl<'a> Worker<'a> {
                     });
 
                     if let Err(error) = result {
-                        self.diagnostics.error(source_id, error);
+                        self.q.diagnostics.error(source_id, error);
                     }
                 }
                 Task::ExpandWildcardImport(wildcard_import) => {
@@ -158,7 +165,7 @@ impl<'a> Worker<'a> {
             let source_id = wildcard_import.source_id;
 
             if let Err(error) = wildcard_import.process_local(&mut self.q) {
-                self.diagnostics.error(source_id, error);
+                self.q.diagnostics.error(source_id, error);
             }
         }
     }

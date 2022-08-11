@@ -205,6 +205,12 @@ fn main() -> Result<()> {
                 ('}') => {
                     $crate::ast::CloseBrace
                 };
+                ("<<") => {
+                    $crate::ast::OpenEmpty
+                };
+                (">>") => {
+                    $crate::ast::CloseEmpty
+                };
                 (is not) => {
                     $crate::ast::IsNot
                 };
@@ -244,6 +250,8 @@ fn main() -> Result<()> {
                 (']') => { $crate::ast::Kind::Close($crate::ast::Delimiter::Bracket) };
                 ('{') => { $crate::ast::Kind::Open($crate::ast::Delimiter::Brace) };
                 ('}') => { $crate::ast::Kind::Close($crate::ast::Delimiter::Brace) };
+                ("<<") => { $crate::ast::Kind::Open($crate::ast::Delimiter::Empty) };
+                (">>") => { $crate::ast::Kind::Close($crate::ast::Delimiter::Empty) };
                 #(for k in &keywords join(#<push>) =>
                     (#(&k.keyword)) => { $crate::ast::Kind::#(&k.variant) };
                 )

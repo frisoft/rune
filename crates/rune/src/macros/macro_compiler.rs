@@ -1,8 +1,8 @@
 //! Macro compiler.
 
-use crate::ast;
-use crate::ast::{Spanned, SpannedError};
-use crate::compile::{CompileError, CompileErrorKind, CompileResult, IrError, ItemMeta, Options};
+use crate::arena::Arena;
+use crate::ast::{self, Spanned, SpannedError};
+use crate::compile::{CompileError, CompileErrorKind, IrError, ItemMeta, Options};
 use crate::macros::MacroContext;
 use crate::parse::{Parse, ParseError, Parser};
 use crate::query::Query;
@@ -17,7 +17,7 @@ pub(crate) struct MacroCompiler<'a> {
 
 impl MacroCompiler<'_> {
     /// Compile the given macro into the given output type.
-    pub(crate) fn eval_macro<T>(&mut self, macro_call: &ast::MacroCall) -> CompileResult<T>
+    pub(crate) fn eval_macro<T>(&mut self, macro_call: &ast::MacroCall) -> Result<T, CompileError>
     where
         T: Parse,
     {
@@ -34,9 +34,16 @@ impl MacroCompiler<'_> {
         // from.
         //
         // TODO: Figure out how to avoid performing ad-hoc lowering here.
-        let arena = crate::hir::Arena::new();
-        let ctx = crate::hir::lowering::Ctx::new(&arena, self.query.borrow());
-        let path = crate::hir::lowering::path(&ctx, &macro_call.path)?;
+        let arena = Arena::new();
+
+        let path = {
+            let mut cx = crate::hir::lowering::Ctxt::new(
+                self.item_meta.location.source_id,
+                self.query.borrow(),
+                &arena,
+            );
+            crate::hir::lowering::path(&mut cx, &macro_call.path)?
+        };
         let named = self.query.convert_path(self.context, &path)?;
 
         let hash = self.query.pool.item_type_hash(named.item);

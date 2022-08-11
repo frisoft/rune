@@ -1,7 +1,7 @@
 //! The `std::future` module.
 
 use crate::runtime::future::SelectFuture;
-use crate::runtime::{Future, Shared, Stack, Value, VmError, VmErrorKind};
+use crate::runtime::{Address, Future, Shared, Stack, Value, VmError, VmErrorKind};
 use crate::{ContextError, Module};
 
 /// Construct the `std::future` module.
@@ -55,7 +55,12 @@ async fn join(value: Value) -> Result<Value, VmError> {
 }
 
 /// The join implementation.
-fn raw_join(stack: &mut Stack, args: usize) -> Result<(), VmError> {
+fn raw_join(
+    stack: &mut Stack,
+    address: Address,
+    args: usize,
+    output: Address,
+) -> Result<(), VmError> {
     if args != 1 {
         return Err(VmError::from(VmErrorKind::BadArgumentCount {
             actual: args,
@@ -63,8 +68,8 @@ fn raw_join(stack: &mut Stack, args: usize) -> Result<(), VmError> {
         }));
     }
 
-    let value = stack.pop()?;
+    let value = stack.take_at(address)?;
     let value = Value::Future(Shared::new(Future::new(join(value))));
-    stack.push(value);
+    stack.store(output, value)?;
     Ok(())
 }

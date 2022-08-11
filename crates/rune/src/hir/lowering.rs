@@ -35,6 +35,10 @@ macro_rules! option {
 
 /// Unpacks an iterator value and allocates it in the arena as a slice.
 macro_rules! iter {
+    ($span:expr => $cx:expr; $iter:expr) => {{
+        iter!($span => $cx; $iter, |item| item)
+    }};
+
     ($span:expr => $cx:expr; $iter:expr, |$pat:pat_param| $closure:expr) => {{
         let mut it = IntoIterator::into_iter($iter);
         let span = Spanned::span($span);
@@ -95,6 +99,41 @@ pub fn item_fn<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::ItemFn) -> Result<hir::
         name: alloc!(ast => cx; ast.name),
         args: iter!(ast => cx; &ast.args, |(ast, _)| fn_arg(cx, ast)?),
         body: alloc!(ast => cx; block(cx, &ast.body)?),
+    })
+}
+
+fn expr_select<'hir>(
+    cx: &mut Ctxt<'_, 'hir>,
+    ast: &ast::ExprSelect,
+) -> Result<hir::ExprSelect<'hir>> {
+    let mut branches = Vec::new();
+    let mut default_branch: Option<&'hir hir::Expr<'hir>> = None;
+
+    for (branch, _) in &ast.branches {
+        match branch {
+            ast::ExprSelectBranch::Pat(ast) => {
+                branches.push(hir::ExprSelectBranch {
+                    pat: alloc!(&ast.pat => cx; pat(cx, &ast.pat)?),
+                    expr: alloc!(&ast.expr => cx; expr(cx, &ast.expr)?),
+                    body: alloc!(&ast.body => cx; expr(cx, &ast.body)?),
+                });
+            }
+            ast::ExprSelectBranch::Default(ast) => {
+                if let Some(existing) = default_branch {
+                    return Err(CompileError::new(
+                        existing.span,
+                        CompileErrorKind::SelectMultipleDefaults,
+                    ));
+                }
+
+                default_branch = Some(&*alloc!(&ast.body => cx; expr(cx, &ast.body)?));
+            }
+        }
+    }
+
+    Ok(hir::ExprSelect {
+        branches: iter!(ast => cx; branches),
+        default_branch,
     })
 }
 
@@ -298,18 +337,7 @@ pub fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::Expr) -> Result<hir::Expr<
         }
         ast::Expr::Await(ast) => hir::ExprKind::Await(alloc!(ast => cx; expr(cx, &ast.expr)?)),
         ast::Expr::Try(ast) => hir::ExprKind::Try(alloc!(ast => cx; expr(cx, &ast.expr)?)),
-        ast::Expr::Select(ast) => hir::ExprKind::Select(alloc!(ast => cx; hir::ExprSelect {
-            branches: iter!(ast => cx; &ast.branches, |(ast, _)| {
-                match ast {
-                    ast::ExprSelectBranch::Pat(ast) => hir::ExprSelectBranch::Pat(alloc!(ast => cx; hir::ExprSelectPatBranch {
-                        pat: alloc!(&ast.pat => cx; pat(cx, &ast.pat)?),
-                        expr: alloc!(&ast.expr => cx; expr(cx, &ast.expr)?),
-                        body: alloc!(&ast.body => cx; expr(cx, &ast.body)?),
-                    })),
-                    ast::ExprSelectBranch::Default(ast) => hir::ExprSelectBranch::Default(alloc!(&ast.body => cx; expr(cx, &ast.body)?)),
-                }
-            })
-        })),
+        ast::Expr::Select(ast) => hir::ExprKind::Select(alloc!(ast => cx; expr_select(cx, ast)?)),
         ast::Expr::Closure(ast) => {
             hir::ExprKind::Closure(alloc!(ast => cx; expr_closure(cx, ast)?))
         }

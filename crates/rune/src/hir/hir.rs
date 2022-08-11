@@ -421,22 +421,14 @@ pub enum ExprBlockKind {
 pub struct ExprSelect<'hir> {
     /// The branches of the select.
     pub branches: &'hir [ExprSelectBranch<'hir>],
+    /// The default branch, if present.
+    pub default_branch: Option<&'hir Expr<'hir>>,
 }
 
 /// A single selection branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Spanned)]
 #[non_exhaustive]
-pub enum ExprSelectBranch<'hir> {
-    /// A patterned branch.
-    Pat(&'hir ExprSelectPatBranch<'hir>),
-    /// A default branch.
-    Default(&'hir Expr<'hir>),
-}
-
-/// A single selection branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Spanned)]
-#[non_exhaustive]
-pub struct ExprSelectPatBranch<'hir> {
+pub struct ExprSelectBranch<'hir> {
     /// The identifier to bind the result to.
     pub pat: &'hir Pat<'hir>,
     /// The expression that should evaluate to a future.

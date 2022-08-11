@@ -940,12 +940,12 @@ impl Vm {
     fn op_select(
         &mut self,
         address: Address,
-        len: usize,
+        count: usize,
         output: Address,
     ) -> Result<Option<Select>, VmError> {
         let futures = futures_util::stream::FuturesUnordered::new();
 
-        for (branch, value) in self.stack.drain_at(address, len)?.enumerate() {
+        for (branch, value) in self.stack.drain_at(address, count)?.enumerate() {
             let future = value.into_shared_future()?.into_mut()?;
 
             if !future.is_completed() {
@@ -2952,11 +2952,11 @@ impl Vm {
                 }
                 Inst::Select {
                     address,
-                    len,
+                    count,
                     output,
                     branch_output,
                 } => {
-                    if let Some(select) = self.op_select(address, len, output)? {
+                    if let Some(select) = self.op_select(address, count, output)? {
                         // NB: the future itself will advance the virtual machine.
                         return Ok(VmHalt::Awaited(Awaited::Select(
                             select,

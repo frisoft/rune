@@ -407,11 +407,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 
     /// Construct a new label.
     fn new_label(&mut self, label: &'static str) -> Label {
-        if !matches!(self.state, CtxtState::Unreachable { .. }) {
-            self.asm.new_label(label)
-        } else {
-            Label::EMPTY
-        }
+        self.asm.new_label(label)
     }
 
     /// Label the current position.

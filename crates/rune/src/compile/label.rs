@@ -12,12 +12,6 @@ pub(crate) struct Label {
 }
 
 impl Label {
-    /// Empty label.
-    pub(crate) const EMPTY: Label = Label {
-        name: "empty",
-        id: usize::MAX,
-    };
-
     /// Construct a new label.
     pub(crate) const fn new(name: &'static str, id: usize) -> Self {
         Self { name, id }

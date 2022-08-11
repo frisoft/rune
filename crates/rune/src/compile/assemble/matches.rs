@@ -1,8 +1,8 @@
 use crate::arena::AllocIter;
 use crate::ast::Span;
 use crate::compile::assemble::{
-    arena_error, arena_slice_write_error, assemble_expr_value, assemble_pat, BoundPat, Ctxt, Expr,
-    ExprKind, PatKind, Result,
+    arena_error, arena_slice_write_error, assemble_expr_value, assemble_pat, Ctxt, Expr, ExprKind,
+    Pat, PatKind, Result,
 };
 use crate::compile::AssemblyAddress;
 use crate::hir;
@@ -10,9 +10,10 @@ use crate::hir;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MatchBranch<'hir> {
     pub(crate) span: Span,
-    pub(crate) pat: BoundPat<'hir>,
-    pub(crate) condition: Expr<'hir>,
-    pub(crate) body: Expr<'hir>,
+    pub(crate) pat: Pat<'hir>,
+    pub(crate) address: AssemblyAddress,
+    pub(crate) condition: hir::Expr<'hir>,
+    pub(crate) body: hir::Expr<'hir>,
 }
 
 pub(crate) struct Matches<'hir> {
@@ -58,31 +59,19 @@ impl<'hir> Matches<'hir> {
         };
 
         let condition = match condition {
-            Some(hir) => hir,
-            None => {
-                alloc!(cx; hir::Expr { span: cx.span, kind: hir::ExprKind::Empty })
-            }
+            Some(hir) => *hir,
+            None => hir::Expr {
+                span: cx.span,
+                kind: hir::ExprKind::Empty,
+            },
         };
-
-        let scope = cx.scopes.push_branch(cx.span, Some(cx.scope))?;
-
-        let (pat, condition, body) = cx.with_scope(scope, |cx| {
-            let branch_expr = cx.expr(ExprKind::Address {
-                binding: None,
-                address: self.address,
-            });
-
-            let pat = pat.bind(cx, branch_expr)?;
-            let condition = assemble_expr_value(cx, condition)?;
-            let body = assemble_expr_value(cx, body)?.free_scope();
-            Ok((pat, condition, body))
-        })?;
 
         let branch = MatchBranch {
             span: body.span,
             pat,
+            address: self.address,
             condition,
-            body,
+            body: *body,
         };
 
         self.branches

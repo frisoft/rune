@@ -256,7 +256,7 @@ pub struct PatObject {
     /// The open brace.
     pub open: T!['{'],
     /// The fields matched against.
-    pub items: Vec<(PatBinding, Option<T![,]>)>,
+    pub items: Vec<(PatAssign, Option<T![,]>)>,
     /// The rest pattern.
     #[rune(iter)]
     pub rest: Option<T![..]>,
@@ -265,18 +265,19 @@ pub struct PatObject {
 }
 
 /// An object item.
-#[derive(Debug, Clone, PartialEq, Eq, ToTokens, Spanned, Parse)]
+#[derive(Debug, Clone, PartialEq, Eq, ToTokens, Parse, Spanned)]
 #[non_exhaustive]
-pub struct PatBinding {
-    /// The key of an object.
+pub struct PatAssign {
+    /// The key which is being assigned to.
     pub key: ast::ObjectKey,
+    /// The optional pattern being assigned.
+    /// A key-value binding.
     /// The colon separator for the binding.
-    pub colon: T![:],
-    /// What the binding is to.
-    pub pat: Box<ast::Pat>,
+    #[rune(iter)]
+    pub assign: Option<(T![:], Box<ast::Pat>)>,
 }
 
-impl Peek for PatBinding {
+impl Peek for PatAssign {
     fn peek(p: &mut Peeker<'_>) -> bool {
         ast::ObjectKey::peek(p)
     }

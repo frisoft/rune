@@ -270,6 +270,11 @@ impl UnitBuilder {
         Ok(new_slot)
     }
 
+    /// Lookup the given static object keys.
+    pub(crate) fn get_static_object_keys(&self, slot: usize) -> Option<&[String]> {
+        Some(self.static_object_keys.get(slot)?)
+    }
+
     /// Declare a new struct.
     pub(crate) fn insert_meta(
         &mut self,

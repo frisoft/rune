@@ -975,8 +975,26 @@ fn pat_tuple(ast: &mut ast::PatTuple, idx: &mut Indexer<'_>) -> Result<()> {
 }
 
 #[instrument]
-fn pat_binding(ast: &mut ast::PatBinding, idx: &mut Indexer<'_>, is_used: IsUsed) -> Result<()> {
-    pat(&mut ast.pat, idx, is_used)?;
+fn pat_binding(ast: &mut ast::PatAssign, idx: &mut Indexer<'_>, is_used: IsUsed) -> Result<()> {
+    if let Some((_, assign)) = &mut ast.assign {
+        pat(assign, idx, is_used)?;
+        object_key(&mut ast.key, idx, NOT_USED)?;
+    } else {
+        object_key(&mut ast.key, idx, is_used)?;
+    }
+
+    Ok(())
+}
+
+#[instrument]
+fn object_key(ast: &mut ast::ObjectKey, idx: &mut Indexer<'_>, is_used: IsUsed) -> Result<()> {
+    match ast {
+        ast::ObjectKey::LitStr(..) => {}
+        ast::ObjectKey::Path(ast) => {
+            path(ast, idx, is_used)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -1801,21 +1819,11 @@ fn expr_object(ast: &mut ast::ExprObject, idx: &mut Indexer<'_>) -> Result<()> {
     }
 
     for (assign, _) in &mut ast.assignments {
-        match &mut assign.key {
-            ast::ObjectKey::LitStr(..) => {}
-            ast::ObjectKey::Path(ast) => {
-                if assign.assign.is_none() {
-                    // NB: this is a simple object expression which captures
-                    // variables as fields directly.
-                    path(ast, idx, IS_USED)?;
-                } else {
-                    path(ast, idx, NOT_USED)?;
-                }
-            }
-        }
-
         if let Some((_, e)) = &mut assign.assign {
+            object_key(&mut assign.key, idx, NOT_USED)?;
             expr(e, idx, IS_USED)?;
+        } else {
+            object_key(&mut assign.key, idx, IS_USED)?;
         }
     }
 

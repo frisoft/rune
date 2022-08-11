@@ -97,7 +97,24 @@ fn pat_tuple(ast: &mut ast::PatTuple, idx: &mut Indexer<'_>) -> Result<()> {
 }
 
 #[instrument]
-fn pat_binding(ast: &mut ast::PatBinding, idx: &mut Indexer<'_>) -> Result<()> {
-    pat(&mut ast.pat, idx)?;
+fn pat_binding(ast: &mut ast::PatAssign, idx: &mut Indexer<'_>) -> Result<()> {
+    if let Some((_, ast)) = &mut ast.assign {
+        pat(ast, idx)?;
+    } else {
+        object_key(&mut ast.key, idx)?;
+    }
+
+    Ok(())
+}
+
+#[instrument]
+fn object_key(ast: &mut ast::ObjectKey, idx: &mut Indexer<'_>) -> Result<()> {
+    match ast {
+        ast::ObjectKey::LitStr(..) => {}
+        ast::ObjectKey::Path(ast) => {
+            path(ast, idx)?;
+        }
+    }
+
     Ok(())
 }

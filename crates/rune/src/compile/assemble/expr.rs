@@ -45,6 +45,17 @@ impl<'hir> Expr<'hir> {
         }
     }
 
+    /// Translate expression into an address.
+    pub(crate) fn as_address(&self, cx: &mut Ctxt<'_, 'hir>) -> Result<AssemblyAddress> {
+        match self.kind {
+            ExprKind::Address { address, .. } => {
+                cx.scopes.retain(cx.span, address)?;
+                Ok(address)
+            }
+            _ => Ok(cx.scopes.alloc()),
+        }
+    }
+
     /// Wrap the curent expression as a return expression.
     pub(crate) fn into_return(self, cx: &mut Ctxt<'_, 'hir>) -> Result<Expr<'hir>> {
         let expr = alloc!(cx; self);
@@ -1117,7 +1128,7 @@ fn compile_expr_binary<'hir>(
     ) -> Result<ExprOutcome> {
         let output = cx.alloc_or(output);
         let end_label = cx.new_label("conditional_end");
-        lhs.compile(cx, Some(*output))?.free(cx)?;
+        cx.with_state_checkpoint(|cx| lhs.compile(cx, Some(*output))?.free(cx))?;
 
         match op {
             ast::BinOp::And(..) => {
@@ -1137,8 +1148,8 @@ fn compile_expr_binary<'hir>(
             }
         }
 
-        rhs.compile(cx, Some(*output))?.free(cx)?;
-        cx.label(end_label)?;
+        cx.with_state_checkpoint(|cx| rhs.compile(cx, Some(*output))?.free(cx))?;
+        cx.asm.label(cx.span, end_label)?;
         Ok(ExprOutcome::Output(output))
     }
 
@@ -1211,9 +1222,12 @@ fn compile_expr_select<'hir>(
     let output = cx.alloc_or(output);
     let branch_output = cx.scopes.alloc();
 
-    let start = cx.new_label("select_start");
     let end = cx.new_label("select_end");
-    let default_label = cx.new_label("select_default");
+
+    let default_label = match default_branch {
+        Some(..) => Some(cx.new_label("select_default")),
+        None => None,
+    };
 
     let address = cx.array(branches.iter().map(|b| b.expr))?.free(cx)?;
 
@@ -1226,25 +1240,47 @@ fn compile_expr_select<'hir>(
 
     let mut labels = Vec::new();
 
-    for _ in branches {
-        labels.push(cx.new_label("select_branch"));
+    for (branch, _) in branches.iter().enumerate() {
+        let branch_label = cx.new_label("select_branch");
+
+        let branch = match i64::try_from(branch) {
+            Ok(branch) => branch,
+            Err(..) => return Err(CompileError::msg(cx.span, "branch number out-of-bounds")),
+        };
+
+        cx.push(Inst::JumpIfBranch {
+            address: branch_output,
+            branch,
+            label: branch_label,
+        });
+
+        labels.push(branch_label);
     }
 
     cx.push(Inst::Jump {
-        label: default_label,
+        label: default_label.unwrap_or(end),
     });
 
-    for (branch, label) in branches.iter().zip(labels.iter().copied()) {
-        cx.label(label);
+    let mut it = branches.iter().zip(labels.iter().copied()).peekable();
+
+    while let Some((branch, label)) = it.next() {
+        cx.label(label)?;
 
         let branch_expr = cx.expr(ExprKind::Address {
             address: *output,
             binding: None,
         });
 
+        let block_end = match it.peek() {
+            Some((_, label)) => *label,
+            None => default_label.unwrap_or(end),
+        };
+
         cx.with_scope(branch.scope, |cx| {
-            let _ = branch.pat.bind(cx, branch_expr)?.compile(cx, start)?;
-            assemble_expr_value(cx, branch.body)?.compile(cx, Some(*output))?;
+            let _ = branch.pat.bind(cx, branch_expr)?.compile(cx, block_end)?;
+            assemble_expr_value(cx, branch.body)?
+                .compile(cx, Some(*output))?
+                .free(cx)?;
             Ok(())
         })?;
 
@@ -1252,8 +1288,11 @@ fn compile_expr_select<'hir>(
         cx.scopes.pop(cx.span, branch.scope)?;
     }
 
-    if let Some(hir) = default_branch {
-        assemble_expr_value(cx, hir)?.compile(cx, Some(*output))?;
+    if let (Some(label), Some(hir)) = (default_label, default_branch) {
+        cx.label(label)?;
+        assemble_expr_value(cx, hir)?
+            .compile(cx, Some(*output))?
+            .free(cx)?;
     }
 
     cx.label(end)?;

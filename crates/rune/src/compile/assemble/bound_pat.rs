@@ -50,9 +50,9 @@ pub(crate) enum BoundPatKind<'hir> {
         items: &'hir [BoundPat<'hir>],
     },
     TypedSequence {
+        type_match: TypeMatch,
         expr: &'hir Expr<'hir>,
         address: AssemblyAddress,
-        type_match: TypeMatch,
         items: &'hir [BoundPat<'hir>],
     },
 }
@@ -209,9 +209,9 @@ impl<'hir> BoundPat<'hir> {
                 Ok(PatOutcome::Refutable)
             }
             BoundPatKind::TypedSequence {
+                type_match,
                 expr,
                 address,
-                type_match,
                 items,
             } => {
                 let address = expr.compile(cx, Some(address))?.ensure_address(cx)?;

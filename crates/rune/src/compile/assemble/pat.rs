@@ -2,6 +2,7 @@ use rune_macros::__instrument_hir as instrument;
 
 use crate::ast::{self, Span};
 use crate::collections::{HashMap, HashSet};
+use crate::compile::assemble::type_match::tuple_match_for;
 use crate::compile::assemble::{
     BoundPat, BoundPatKind, Ctxt, Expr, ExprKind, ExprStructKind, Result, TypeMatch,
 };
@@ -102,7 +103,19 @@ impl<'hir> Pat<'hir> {
                 PatKind::Path {
                     path: PatPath::Meta { meta, .. },
                 } => {
-                    todo!("{:?}", meta)
+                    let type_match = match tuple_match_for(cx, meta) {
+                        Some((args, inst)) if args == 0 => inst,
+                        _ => return Err(cx.error(CompileErrorKind::UnsupportedPattern)),
+                    };
+
+                    let address = expr.as_address(cx)?;
+
+                    Ok(cx.bound_pat(BoundPatKind::TypedSequence {
+                        type_match,
+                        expr: alloc!(cx; expr),
+                        address,
+                        items: &[],
+                    }))
                 }
                 PatKind::Vec { items, is_open } => bind_pat_vec(cx, items, is_open, expr, removed),
                 PatKind::Tuple {
@@ -363,13 +376,7 @@ fn bind_pat_object<'hir>(
 ) -> Result<BoundPat<'hir>> {
     match kind {
         PatObjectKind::Typed { type_match, keys } => {
-            let address = match expr.kind {
-                ExprKind::Address { address, .. } => {
-                    cx.scopes.retain(cx.span, address)?;
-                    address
-                }
-                _ => cx.scopes.alloc(),
-            };
+            let address = expr.as_address(cx)?;
 
             let items = iter!(cx; keys.iter().zip(patterns), |(&(slot, hash), pat)| {
                 let expr = cx.expr(ExprKind::StructFieldAccess {
@@ -382,9 +389,9 @@ fn bind_pat_object<'hir>(
             });
 
             Ok(cx.bound_pat(BoundPatKind::TypedSequence {
+                type_match,
                 expr: alloc!(cx; expr),
                 address,
-                type_match,
                 items,
             }))
         }

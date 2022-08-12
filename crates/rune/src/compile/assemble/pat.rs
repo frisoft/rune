@@ -4,7 +4,7 @@ use crate::ast::{self, Span};
 use crate::collections::{HashMap, HashSet};
 use crate::compile::assemble::type_match::tuple_match_for;
 use crate::compile::assemble::{
-    BoundPat, BoundPatKind, Ctxt, Expr, ExprKind, ExprStructKind, Result, TypeMatch,
+    BoundPat, BoundPatKind, Ctxt, Expr, ExprKind, ExprStructKind, MaybeAlloc, Result, TypeMatch,
 };
 use crate::compile::{
     AssemblyAddress, BindingName, CompileError, CompileErrorKind, PrivMeta, UnitBuilder,
@@ -61,17 +61,8 @@ impl<'hir> Pat<'hir> {
                 PatKind::Path {
                     path: PatPath::Ident { ident },
                 } => {
-                    let (address, expr) = match expr.kind {
-                        ExprKind::Address { address, .. } => {
-                            cx.scopes.retain(expr.span, address)?;
-                            expr.scope.free(cx)?;
-                            (address, cx.expr(ExprKind::Empty))
-                        }
-                        _ => {
-                            let address = cx.scopes.alloc();
-                            (address, expr)
-                        }
-                    };
+                    let address = expr.retain_address(cx)?;
+                    expr.compile(cx, Some(*address))?.free(cx)?;
 
                     // Handle syntactical reassignment of the given expression.
                     let ident = ident.resolve(resolve_context!(cx.q))?;
@@ -81,7 +72,7 @@ impl<'hir> Pat<'hir> {
 
                     let (binding, replaced_address) =
                         cx.scopes
-                            .declare_as(self.span, cx.scope, binding_name, address)?;
+                            .declare_as(self.span, cx.scope, binding_name, *address)?;
 
                     if let Some(address) = replaced_address {
                         if let Some((_, span)) = removed.insert(binding.name, (address, self.span))
@@ -95,10 +86,8 @@ impl<'hir> Pat<'hir> {
                         }
                     }
 
-                    Ok(cx.bound_pat(BoundPatKind::Expr {
-                        address,
-                        expr: alloc!(cx; expr),
-                    }))
+                    address.free(cx)?;
+                    Ok(cx.bound_pat(BoundPatKind::Irrefutable))
                 }
                 PatKind::Path {
                     path: PatPath::Meta { meta, .. },
@@ -108,11 +97,11 @@ impl<'hir> Pat<'hir> {
                         _ => return Err(cx.error(CompileErrorKind::UnsupportedPattern)),
                     };
 
-                    let address = expr.as_address(cx)?;
+                    let address = expr.retain_address(cx)?;
+                    expr.compile(cx, Some(*address))?.free(cx)?;
 
                     Ok(cx.bound_pat(BoundPatKind::TypedSequence {
                         type_match,
-                        expr: alloc!(cx; expr),
                         address,
                         items: &[],
                     }))
@@ -260,10 +249,13 @@ fn bind_pat_vec<'hir>(
     }
 
     let address = cx.scopes.array_index();
+    expr.compile(cx, Some(address))?.free(cx)?;
 
     cx.scopes.alloc_array_items(patterns.len());
 
-    let items = iter!(cx; patterns, |pat| {
+    // NB we bind the arguments in reverse to allow for higher elements
+    // in the array to be freed up.
+    let items = iter!(cx; patterns.iter().rev(), |pat| {
         cx.scopes.free_array_item(cx.span)?;
 
         let expr = cx.expr(ExprKind::Address {
@@ -279,8 +271,7 @@ fn bind_pat_vec<'hir>(
     });
 
     Ok(cx.bound_pat(BoundPatKind::Vec {
-        expr: alloc!(cx; expr),
-        address,
+        address: MaybeAlloc::temporary(address),
         is_open,
         items,
     }))
@@ -298,17 +289,12 @@ fn bind_pat_tuple<'hir>(
 ) -> Result<BoundPat<'hir>> {
     match kind {
         PatTupleKind::Typed { type_match } => {
-            let address = match expr.kind {
-                ExprKind::Address { address, .. } => {
-                    cx.scopes.retain(cx.span, address)?;
-                    address
-                }
-                _ => cx.scopes.alloc(),
-            };
+            let address = expr.retain_address(cx)?;
+            expr.compile(cx, Some(*address))?.free(cx)?;
 
             let items = iter!(cx; patterns.iter().enumerate().rev(), |(index, pat)| {
                 let expr = cx.expr(ExprKind::TupleFieldAccess {
-                    lhs: alloc!(cx; cx.expr(ExprKind::Address { address, binding: None })),
+                    lhs: alloc!(cx; cx.expr(ExprKind::Address { address: *address, binding: None })),
                     index,
                 });
 
@@ -317,7 +303,6 @@ fn bind_pat_tuple<'hir>(
 
             Ok(cx.bound_pat(BoundPatKind::TypedSequence {
                 type_match,
-                expr: alloc!(cx; expr),
                 address,
                 items,
             }))
@@ -343,8 +328,11 @@ fn bind_pat_tuple<'hir>(
             let address = cx.scopes.array_index();
 
             cx.scopes.alloc_array_items(patterns.len());
+            expr.compile(cx, Some(address))?.free(cx)?;
 
-            let items = iter!(cx; patterns, |pat| {
+            // NB we bind the arguments in reverse to allow for higher elements
+            // in the array to be freed up for subsequent bindings.
+            let items = iter!(cx; patterns.iter().rev(), |pat| {
                 cx.scopes.free_array_item(cx.span)?;
 
                 let expr = cx.expr(ExprKind::Address {
@@ -356,8 +344,7 @@ fn bind_pat_tuple<'hir>(
             });
 
             Ok(cx.bound_pat(BoundPatKind::AnonymousTuple {
-                expr: alloc!(cx; expr),
-                address,
+                address: MaybeAlloc::temporary(address),
                 is_open,
                 items,
             }))
@@ -376,11 +363,12 @@ fn bind_pat_object<'hir>(
 ) -> Result<BoundPat<'hir>> {
     match kind {
         PatObjectKind::Typed { type_match, keys } => {
-            let address = expr.as_address(cx)?;
+            let address = expr.retain_address(cx)?;
+            expr.compile(cx, Some(*address))?.free(cx)?;
 
             let items = iter!(cx; keys.iter().zip(patterns), |(&(slot, hash), pat)| {
                 let expr = cx.expr(ExprKind::StructFieldAccess {
-                    lhs: alloc!(cx; cx.expr(ExprKind::Address { address, binding: None })),
+                    lhs: alloc!(cx; cx.expr(ExprKind::Address { address: *address, binding: None })),
                     slot,
                     hash,
                 });
@@ -390,7 +378,6 @@ fn bind_pat_object<'hir>(
 
             Ok(cx.bound_pat(BoundPatKind::TypedSequence {
                 type_match,
-                expr: alloc!(cx; expr),
                 address,
                 items,
             }))
@@ -416,10 +403,13 @@ fn bind_pat_object<'hir>(
             }
 
             let address = cx.scopes.array_index();
+            expr.compile(cx, Some(address))?.free(cx)?;
 
             cx.scopes.alloc_array_items(patterns.len());
 
-            let items = iter!(cx; patterns, |pat| {
+            // NB we bind the arguments in reverse to allow for higher elements
+            // in the array to be freed up for subsequent bindings.
+            let items = iter!(cx; patterns.iter().rev(), |pat| {
                 cx.scopes.free_array_item(cx.span)?;
 
                 let expr = cx.expr(ExprKind::Address {
@@ -431,8 +421,7 @@ fn bind_pat_object<'hir>(
             });
 
             Ok(cx.bound_pat(BoundPatKind::AnonymousObject {
-                expr: alloc!(cx; expr),
-                address,
+                address: MaybeAlloc::temporary(address),
                 slot,
                 is_open,
                 items,

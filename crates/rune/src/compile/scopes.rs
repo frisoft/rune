@@ -366,7 +366,7 @@ impl Scopes {
         if scope.children != 0 {
             return Err(CompileError::msg(
                 span,
-                "tried to remove scope which still has children",
+                format_args!("tried to remove scope {id:?} which still has children"),
             ));
         }
 

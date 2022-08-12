@@ -46,13 +46,13 @@ impl<'hir> Expr<'hir> {
     }
 
     /// Translate expression into an address.
-    pub(crate) fn as_address(&self, cx: &mut Ctxt<'_, 'hir>) -> Result<AssemblyAddress> {
+    pub(crate) fn retain_address(&self, cx: &mut Ctxt<'_, 'hir>) -> Result<MaybeAlloc> {
         match self.kind {
             ExprKind::Address { address, .. } => {
                 cx.scopes.retain(cx.span, address)?;
-                Ok(address)
+                Ok(MaybeAlloc::allocated(address))
             }
-            _ => Ok(cx.scopes.alloc()),
+            _ => Ok(MaybeAlloc::allocated(cx.scopes.alloc())),
         }
     }
 
@@ -112,6 +112,7 @@ impl<'hir> Expr<'hir> {
         let outcome = cx.with_span(self.span, |cx| {
             cx.with_scope(self.scope.id, |cx| self.compile_inner(cx, output))
         })?;
+
         self.scope.free(cx)?;
 
         let outcome = match (cx.state, outcome) {
@@ -137,6 +138,7 @@ impl<'hir> Expr<'hir> {
         output: Option<AssemblyAddress>,
     ) -> Result<ExprOutcome> {
         let outcome = match self.kind {
+            ExprKind::Hir { hir } => assemble_expr_value(cx, hir)?.compile(cx, output)?,
             ExprKind::Function { hash } => {
                 let output = cx.alloc_or(output);
                 cx.push(Inst::LoadFn {
@@ -432,6 +434,12 @@ impl<'hir> Expr<'hir> {
                 cx.free_iter([address])?;
                 ExprOutcome::Output(output)
             }
+            ExprKind::BinaryAssign { lhs, op, rhs } => {
+                compile_assign_binop(cx, lhs, op, rhs, output)?
+            }
+            ExprKind::BinaryConditional { lhs, op, rhs } => {
+                compile_conditional_binop(cx, lhs, op, rhs, output)?
+            }
             ExprKind::Binary { lhs, op, rhs } => compile_expr_binary(cx, lhs, op, rhs, output)?,
             ExprKind::Loop { hir } => compile_expr_loop(cx, hir, output)?,
             ExprKind::TupleFieldAccess { lhs, index } => {
@@ -595,6 +603,11 @@ impl<'hir> Expr<'hir> {
 /// An expression kind.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ExprKind<'hir> {
+    /// A deferred raw expression. This is necessary in case scoping is involved.
+    Hir {
+        /// The HIR of the expression.
+        hir: &'hir hir::Expr<'hir>,
+    },
     /// An empty expression.
     Empty,
     /// A collection of conditions.
@@ -723,6 +736,24 @@ pub(crate) enum ExprKind<'hir> {
     Unary {
         op: ExprUnOp,
         expr: &'hir Expr<'hir>,
+    },
+    /// A binary assign operation.
+    BinaryAssign {
+        /// The left-hand side of a binary operation.
+        lhs: &'hir Expr<'hir>,
+        /// The operator.
+        op: ast::BinOp,
+        /// The right-hand side of a binary operation.
+        rhs: &'hir Expr<'hir>,
+    },
+    /// A binary conditional operation.
+    BinaryConditional {
+        /// The left-hand side of a binary operation.
+        lhs: &'hir Expr<'hir>,
+        /// The operator.
+        op: ast::BinOp,
+        /// The right-hand side of a binary operation.
+        rhs: &'hir Expr<'hir>,
     },
     /// A binary expression.
     Binary {
@@ -1063,6 +1094,100 @@ fn compile_expr_matches<'hir>(
     Ok(ExprOutcome::Output(output))
 }
 
+#[instrument]
+fn compile_assign_binop<'hir>(
+    cx: &mut Ctxt<'_, 'hir>,
+    lhs: &'hir Expr<'hir>,
+    op: ast::BinOp,
+    rhs: &'hir Expr<'hir>,
+    output: Option<AssemblyAddress>,
+) -> Result<ExprOutcome> {
+    let output = cx.alloc_or(output);
+
+    let (lhs, target) = match lhs.kind {
+        ExprKind::Address { address, .. } => {
+            rhs.compile(cx, Some(*output))?.free(cx)?;
+            (address, InstTarget::Offset)
+        }
+        _ => {
+            return Err(cx.error(CompileErrorKind::UnsupportedBinaryExpr));
+        }
+    };
+
+    let op = match op {
+        ast::BinOp::AddAssign(..) => InstAssignOp::Add,
+        ast::BinOp::SubAssign(..) => InstAssignOp::Sub,
+        ast::BinOp::MulAssign(..) => InstAssignOp::Mul,
+        ast::BinOp::DivAssign(..) => InstAssignOp::Div,
+        ast::BinOp::RemAssign(..) => InstAssignOp::Rem,
+        ast::BinOp::BitAndAssign(..) => InstAssignOp::BitAnd,
+        ast::BinOp::BitXorAssign(..) => InstAssignOp::BitXor,
+        ast::BinOp::BitOrAssign(..) => InstAssignOp::BitOr,
+        ast::BinOp::ShlAssign(..) => InstAssignOp::Shl,
+        ast::BinOp::ShrAssign(..) => InstAssignOp::Shr,
+        _ => {
+            return Err(cx.error(CompileErrorKind::UnsupportedBinaryExpr));
+        }
+    };
+
+    let tmp = cx.scopes.temporary();
+
+    cx.push(Inst::Assign {
+        lhs,
+        rhs: *output,
+        target,
+        op,
+        // NB: while an assign operation doesn't output anything, this
+        // might result in a call to an external function which expects
+        // to always have a writable address slot available, regardless
+        // of what it outputs. So we hand it a temporary slot, which is
+        // just an address on the stack which will probably immediately
+        // be used for something else.
+        //
+        // The virtual machine ensures that this address is cleared
+        // immediately after it's been called.
+        output: tmp,
+    });
+
+    Ok(ExprOutcome::Output(output))
+}
+
+#[instrument]
+fn compile_conditional_binop<'hir>(
+    cx: &mut Ctxt<'_, 'hir>,
+    lhs: &'hir Expr<'hir>,
+    op: ast::BinOp,
+    rhs: &'hir Expr<'hir>,
+    output: Option<AssemblyAddress>,
+) -> Result<ExprOutcome> {
+    let output = cx.alloc_or(output);
+    let end_label = cx.new_label("conditional_end");
+
+    cx.with_state_checkpoint(|cx| lhs.compile(cx, Some(*output))?.free(cx))?;
+
+    match op {
+        ast::BinOp::And(..) => {
+            cx.push(Inst::JumpIfNot {
+                address: *output,
+                label: end_label,
+            });
+        }
+        ast::BinOp::Or(..) => {
+            cx.push(Inst::JumpIf {
+                address: *output,
+                label: end_label,
+            });
+        }
+        op => {
+            return Err(cx.error(CompileErrorKind::UnsupportedBinaryOp { op }));
+        }
+    }
+
+    cx.with_state_checkpoint(|cx| rhs.compile(cx, Some(*output))?.free(cx))?;
+    cx.label(end_label)?;
+    Ok(ExprOutcome::Output(output))
+}
+
 /// Assembling of a binary expression.
 #[instrument]
 fn compile_expr_binary<'hir>(
@@ -1072,14 +1197,6 @@ fn compile_expr_binary<'hir>(
     rhs: &'hir Expr<'hir>,
     output: Option<AssemblyAddress>,
 ) -> Result<ExprOutcome> {
-    if op.is_assign() {
-        return compile_assign_binop(cx, lhs, rhs, op, output);
-    }
-
-    if op.is_conditional() {
-        return compile_conditional_binop(cx, lhs, rhs, op, output);
-    }
-
     let op = match op {
         ast::BinOp::Eq(..) => InstOp::Eq,
         ast::BinOp::Neq(..) => InstOp::Neq,
@@ -1117,98 +1234,7 @@ fn compile_expr_binary<'hir>(
     });
 
     cx.free_iter([a, b])?;
-    return Ok(ExprOutcome::Output(output));
-
-    fn compile_conditional_binop<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        lhs: &'hir Expr<'hir>,
-        rhs: &'hir Expr<'hir>,
-        op: ast::BinOp,
-        output: Option<AssemblyAddress>,
-    ) -> Result<ExprOutcome> {
-        let output = cx.alloc_or(output);
-        let end_label = cx.new_label("conditional_end");
-        cx.with_state_checkpoint(|cx| lhs.compile(cx, Some(*output))?.free(cx))?;
-
-        match op {
-            ast::BinOp::And(..) => {
-                cx.push(Inst::JumpIfNot {
-                    address: *output,
-                    label: end_label,
-                });
-            }
-            ast::BinOp::Or(..) => {
-                cx.push(Inst::JumpIf {
-                    address: *output,
-                    label: end_label,
-                });
-            }
-            op => {
-                return Err(cx.error(CompileErrorKind::UnsupportedBinaryOp { op }));
-            }
-        }
-
-        cx.with_state_checkpoint(|cx| rhs.compile(cx, Some(*output))?.free(cx))?;
-        cx.label(end_label)?;
-        Ok(ExprOutcome::Output(output))
-    }
-
-    fn compile_assign_binop<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        lhs: &'hir Expr<'hir>,
-        rhs: &'hir Expr<'hir>,
-        op: ast::BinOp,
-        output: Option<AssemblyAddress>,
-    ) -> Result<ExprOutcome> {
-        let output = cx.alloc_or(output);
-
-        let (lhs, target) = match lhs.kind {
-            ExprKind::Address { address, .. } => {
-                rhs.compile(cx, Some(*output))?.free(cx)?;
-                (address, InstTarget::Offset)
-            }
-            _ => {
-                return Err(cx.error(CompileErrorKind::UnsupportedBinaryExpr));
-            }
-        };
-
-        let op = match op {
-            ast::BinOp::AddAssign(..) => InstAssignOp::Add,
-            ast::BinOp::SubAssign(..) => InstAssignOp::Sub,
-            ast::BinOp::MulAssign(..) => InstAssignOp::Mul,
-            ast::BinOp::DivAssign(..) => InstAssignOp::Div,
-            ast::BinOp::RemAssign(..) => InstAssignOp::Rem,
-            ast::BinOp::BitAndAssign(..) => InstAssignOp::BitAnd,
-            ast::BinOp::BitXorAssign(..) => InstAssignOp::BitXor,
-            ast::BinOp::BitOrAssign(..) => InstAssignOp::BitOr,
-            ast::BinOp::ShlAssign(..) => InstAssignOp::Shl,
-            ast::BinOp::ShrAssign(..) => InstAssignOp::Shr,
-            _ => {
-                return Err(cx.error(CompileErrorKind::UnsupportedBinaryExpr));
-            }
-        };
-
-        let tmp = cx.scopes.temporary();
-
-        cx.push(Inst::Assign {
-            lhs,
-            rhs: *output,
-            target,
-            op,
-            // NB: while an assign operation doesn't output anything, this
-            // might result in a call to an external function which expects
-            // to always have a writable address slot available, regardless
-            // of what it outputs. So we hand it a temporary slot, which is
-            // just an address on the stack which will probably immediately
-            // be used for something else.
-            //
-            // The virtual machine ensures that this address is cleared
-            // immediately after it's been called.
-            output: tmp,
-        });
-
-        Ok(ExprOutcome::Output(output))
-    }
+    Ok(ExprOutcome::Output(output))
 }
 
 /// Compile a select statement.

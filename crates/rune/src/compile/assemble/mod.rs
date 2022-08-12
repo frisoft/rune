@@ -180,8 +180,8 @@ type Result<T> = std::result::Result<T, CompileError>;
 
 use Needs::*;
 
-#[derive(Clone, Copy, Default)]
-enum CtxtState {
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) enum CtxtState {
     #[default]
     Default,
     Unreachable {
@@ -212,7 +212,7 @@ pub(crate) struct Ctxt<'a, 'hir> {
     /// Scopes declared in context.
     scopes: Scopes,
     /// State of code generation.
-    state: CtxtState,
+    pub(crate) state: CtxtState,
 }
 
 impl Spanned for Ctxt<'_, '_> {
@@ -1547,6 +1547,41 @@ fn assemble_expr_binary<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
     hir: &hir::ExprBinary<'hir>,
 ) -> Result<Expr<'hir>> {
+    if hir.op.is_assign() {
+        let lhs = alloc!(cx; assemble_expr_value(cx, hir.lhs)?);
+        let rhs = alloc!(cx; assemble_expr_value(cx, hir.rhs)?);
+
+        return Ok(cx.expr(ExprKind::BinaryAssign {
+            lhs,
+            op: hir.op,
+            rhs,
+        }));
+    }
+
+    if hir.op.is_conditional() {
+        // NB: We need to defer evaluation since conditional branches are
+        // scoped. This means we have less information about them until we try
+        // and compile them.
+        let lhs_scope = cx.scopes.push_branch(cx.span, Some(cx.scope))?;
+        let lhs = cx
+            .with_scope(lhs_scope, |cx| Ok(cx.expr(ExprKind::Hir { hir: hir.lhs })))?
+            .free_scope();
+
+        let rhs_scope = cx.scopes.push_branch(cx.span, Some(cx.scope))?;
+        let rhs = cx
+            .with_scope(rhs_scope, |cx| Ok(cx.expr(ExprKind::Hir { hir: hir.rhs })))?
+            .free_scope();
+
+        let lhs = alloc!(cx; lhs);
+        let rhs = alloc!(cx; rhs);
+
+        return Ok(cx.expr(ExprKind::BinaryConditional {
+            lhs,
+            op: hir.op,
+            rhs,
+        }));
+    }
+
     let lhs = alloc!(cx; assemble_expr_value(cx, hir.lhs)?);
     let rhs = alloc!(cx; assemble_expr(cx, hir.rhs, rhs_needs_of(&hir.op))?);
 

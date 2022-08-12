@@ -1,6 +1,6 @@
 use crate::ast::Span;
-use crate::compile::assemble::{Ctxt, Expr, ExprKind, PatOutcome, Result, TypeMatch};
-use crate::compile::{AssemblyAddress, CompileErrorKind, Label};
+use crate::compile::assemble::{Ctxt, Expr, ExprKind, MaybeAlloc, PatOutcome, Result, TypeMatch};
+use crate::compile::{CompileErrorKind, Label};
 use crate::runtime::{AssemblyInst as Inst, PanicReason, TypeCheck};
 
 /// A pattern that has been bound with an expression.
@@ -21,38 +21,29 @@ pub(crate) enum BoundPatKind<'hir> {
     IrrefutableSequence {
         items: &'hir [BoundPat<'hir>],
     },
-    /// Bind an expression to the given address.
-    Expr {
-        address: AssemblyAddress,
-        expr: &'hir Expr<'hir>,
-    },
     Lit {
         lit: &'hir Expr<'hir>,
         expr: &'hir Expr<'hir>,
     },
     Vec {
-        expr: &'hir Expr<'hir>,
-        address: AssemblyAddress,
+        address: MaybeAlloc,
         is_open: bool,
         items: &'hir [BoundPat<'hir>],
     },
     AnonymousTuple {
-        expr: &'hir Expr<'hir>,
-        address: AssemblyAddress,
+        address: MaybeAlloc,
         is_open: bool,
         items: &'hir [BoundPat<'hir>],
     },
     AnonymousObject {
-        expr: &'hir Expr<'hir>,
-        address: AssemblyAddress,
+        address: MaybeAlloc,
         slot: usize,
         is_open: bool,
         items: &'hir [BoundPat<'hir>],
     },
     TypedSequence {
         type_match: TypeMatch,
-        expr: &'hir Expr<'hir>,
-        address: AssemblyAddress,
+        address: MaybeAlloc,
         items: &'hir [BoundPat<'hir>],
     },
 }
@@ -99,11 +90,6 @@ impl<'hir> BoundPat<'hir> {
 
                 Ok(outcome)
             }
-            BoundPatKind::Expr { address, expr } => {
-                expr.compile(cx, Some(address))?.free(cx)?;
-                cx.scopes.free(cx.span, address)?;
-                Ok(PatOutcome::Irrefutable)
-            }
             BoundPatKind::Lit { lit, expr } => {
                 let output = expr.compile(cx, None)?.ensure_address(cx)?;
 
@@ -140,21 +126,20 @@ impl<'hir> BoundPat<'hir> {
                 Ok(PatOutcome::Refutable)
             }
             BoundPatKind::Vec {
-                expr,
                 address,
                 is_open,
                 items,
             } => {
-                expr.compile(cx, Some(address))?.free(cx)?;
-
                 cx.push(Inst::MatchSequence {
-                    address: address,
+                    address: *address,
                     type_check: TypeCheck::Vec,
                     len: items.len(),
                     exact: !is_open,
                     label,
-                    output: address,
+                    output: *address,
                 });
+
+                address.free(cx)?;
 
                 for pat in items {
                     pat.compile(cx, label)?;
@@ -163,21 +148,20 @@ impl<'hir> BoundPat<'hir> {
                 Ok(PatOutcome::Refutable)
             }
             BoundPatKind::AnonymousTuple {
-                expr,
                 address,
                 is_open,
                 items,
             } => {
-                expr.compile(cx, Some(address))?.free(cx)?;
-
                 cx.push(Inst::MatchSequence {
-                    address,
+                    address: *address,
                     type_check: TypeCheck::Tuple,
                     len: items.len(),
                     exact: !is_open,
                     label,
-                    output: address,
+                    output: *address,
                 });
+
+                address.free(cx)?;
 
                 for pat in items {
                     pat.compile(cx, label)?;
@@ -186,21 +170,20 @@ impl<'hir> BoundPat<'hir> {
                 Ok(PatOutcome::Refutable)
             }
             BoundPatKind::AnonymousObject {
-                expr,
                 address,
                 slot,
                 is_open,
                 items,
             } => {
-                expr.compile(cx, Some(address))?.free(cx)?;
-
                 cx.push(Inst::MatchObject {
-                    address,
+                    address: *address,
                     slot,
                     exact: !is_open,
                     label,
-                    output: address,
+                    output: *address,
                 });
+
+                address.free(cx)?;
 
                 for pat in items {
                     pat.compile(cx, label)?;
@@ -210,12 +193,9 @@ impl<'hir> BoundPat<'hir> {
             }
             BoundPatKind::TypedSequence {
                 type_match,
-                expr,
                 address,
                 items,
             } => {
-                let address = expr.compile(cx, Some(address))?.ensure_address(cx)?;
-
                 match type_match {
                     TypeMatch::BuiltIn { type_check } => cx.push(Inst::MatchBuiltIn {
                         address: *address,
@@ -245,11 +225,12 @@ impl<'hir> BoundPat<'hir> {
                     }
                 }
 
+                address.free(cx)?;
+
                 for pat in items {
                     pat.compile(cx, label)?;
                 }
 
-                address.free(cx)?;
                 Ok(PatOutcome::Refutable)
             }
         }

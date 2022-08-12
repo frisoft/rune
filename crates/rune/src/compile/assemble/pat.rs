@@ -263,7 +263,9 @@ fn bind_pat_vec<'hir>(
 
     cx.scopes.alloc_array_items(patterns.len());
 
-    let items = iter!(cx; patterns, |pat| {
+    // NB we bind the arguments in reverse to allow for higher elements
+    // in the array to be freed up.
+    let items = iter!(cx; patterns.iter().rev(), |pat| {
         cx.scopes.free_array_item(cx.span)?;
 
         let expr = cx.expr(ExprKind::Address {
@@ -344,7 +346,9 @@ fn bind_pat_tuple<'hir>(
 
             cx.scopes.alloc_array_items(patterns.len());
 
-            let items = iter!(cx; patterns, |pat| {
+            // NB we bind the arguments in reverse to allow for higher elements
+            // in the array to be freed up for subsequent bindings.
+            let items = iter!(cx; patterns.iter().rev(), |pat| {
                 cx.scopes.free_array_item(cx.span)?;
 
                 let expr = cx.expr(ExprKind::Address {
@@ -419,7 +423,9 @@ fn bind_pat_object<'hir>(
 
             cx.scopes.alloc_array_items(patterns.len());
 
-            let items = iter!(cx; patterns, |pat| {
+            // NB we bind the arguments in reverse to allow for higher elements
+            // in the array to be freed up for subsequent bindings.
+            let items = iter!(cx; patterns.iter().rev(), |pat| {
                 cx.scopes.free_array_item(cx.span)?;
 
                 let expr = cx.expr(ExprKind::Address {

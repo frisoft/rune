@@ -7,6 +7,7 @@ mod assembly;
 pub(crate) use self::assembly::{Assembly, AssemblyAddress};
 
 pub(crate) mod assemble;
+pub(crate) use self::assemble::{Allocator, Name};
 
 pub(crate) mod attrs;
 
@@ -66,11 +67,6 @@ pub use self::named::Named;
 
 mod names;
 pub(crate) use self::names::Names;
-
-mod scopes;
-pub use self::scopes::BindingName;
-pub(crate) use self::scopes::Scopes;
-pub(self) use self::scopes::{Binding, ControlFlow, ScopeId};
 
 mod visibility;
 pub(crate) use self::visibility::Visibility;
@@ -212,9 +208,10 @@ impl CompileBuildEntry<'_> {
             Build::Function(function) => {
                 tracing::trace!("function: {}", self.q.pool.item(item_meta.item));
 
+                let arena = Arena::new();
+
                 let (scopes, asm) = {
                     let mut asm = self.q.unit.new_assembly(location);
-                    let arena = Arena::new();
 
                     let hir = {
                         let mut cx =
@@ -230,7 +227,7 @@ impl CompileBuildEntry<'_> {
                         &arena,
                     );
                     self::assemble::fn_from_item_fn(&mut cx, &hir, false)?;
-                    (cx.into_scopes(), asm)
+                    (cx.into_allocator(), asm)
                 };
 
                 if used.is_unused() {
@@ -259,9 +256,10 @@ impl CompileBuildEntry<'_> {
             Build::InstanceFunction(instance_function) => {
                 tracing::trace!("instance function: {}", self.q.pool.item(item_meta.item));
 
+                let arena = crate::arena::Arena::new();
+
                 let (scopes, asm) = {
                     let mut asm = self.q.unit.new_assembly(location);
-                    let arena = crate::arena::Arena::new();
 
                     let hir = {
                         let mut cx =
@@ -277,7 +275,7 @@ impl CompileBuildEntry<'_> {
                         &arena,
                     );
                     self::assemble::fn_from_item_fn(&mut cx, &hir, true)?;
-                    (cx.into_scopes(), asm)
+                    (cx.into_allocator(), asm)
                 };
 
                 if used.is_unused() {
@@ -314,9 +312,10 @@ impl CompileBuildEntry<'_> {
             Build::Closure(closure) => {
                 tracing::trace!("closure: {}", self.q.pool.item(item_meta.item));
 
+                let arena = Arena::new();
+
                 let (scopes, asm) = {
                     let mut asm = self.q.unit.new_assembly(location);
-                    let arena = Arena::new();
 
                     let hir = {
                         let mut cx =
@@ -334,7 +333,7 @@ impl CompileBuildEntry<'_> {
 
                     self::assemble::closure_from_expr_closure(&mut cx, &hir, &closure.captures)?;
 
-                    (cx.into_scopes(), asm)
+                    (cx.into_allocator(), asm)
                 };
 
                 if used.is_unused() {
@@ -363,9 +362,10 @@ impl CompileBuildEntry<'_> {
             Build::AsyncBlock(b) => {
                 tracing::trace!("async block: {}", self.q.pool.item(item_meta.item));
 
+                let arena = Arena::new();
+
                 let (scopes, asm) = {
                     let mut asm = self.q.unit.new_assembly(location);
-                    let arena = Arena::new();
 
                     let hir = {
                         let mut cx =
@@ -381,7 +381,7 @@ impl CompileBuildEntry<'_> {
                         &arena,
                     );
                     self::assemble::closure_from_block(&mut cx, &hir, &b.captures)?;
-                    (cx.into_scopes(), asm)
+                    (cx.into_allocator(), asm)
                 };
 
                 if used.is_unused() {

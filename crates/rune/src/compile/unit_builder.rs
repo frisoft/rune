@@ -10,9 +10,10 @@ use thiserror::Error;
 
 use crate::ast::Span;
 use crate::collections::HashMap;
+use crate::compile::assemble::Allocator;
 use crate::compile::{
     Assembly, CompileError, CompileErrorKind, Item, ItemBuf, Label, Location, Pool, PrivMeta,
-    PrivMetaKind, PrivVariantMeta, Scopes,
+    PrivMetaKind, PrivVariantMeta,
 };
 use crate::query::{QueryError, QueryErrorKind};
 use crate::runtime::debug::{DebugArgs, DebugSignature};
@@ -545,7 +546,7 @@ impl UnitBuilder {
         item: &Item,
         args: usize,
         assembly: Assembly,
-        scopes: Scopes,
+        allocator: Allocator,
         call: Call,
         debug_args: Box<[Box<str>]>,
     ) -> Result<(), CompileError> {
@@ -557,7 +558,7 @@ impl UnitBuilder {
             offset,
             call,
             args,
-            frame: scopes.frame(),
+            frame: allocator.frame(),
         };
         let signature = DebugSignature::new(item.to_owned(), DebugArgs::Named(debug_args));
 
@@ -576,7 +577,7 @@ impl UnitBuilder {
         );
 
         self.debug_info_mut().functions.insert(hash, signature);
-        self.add_assembly(location, assembly, scopes)?;
+        self.add_assembly(location, assembly, allocator)?;
         Ok(())
     }
 
@@ -609,7 +610,7 @@ impl UnitBuilder {
         name: &str,
         args: usize,
         assembly: Assembly,
-        scopes: Scopes,
+        allocator: Allocator,
         call: Call,
         debug_args: Box<[Box<str>]>,
     ) -> Result<(), CompileError> {
@@ -623,7 +624,7 @@ impl UnitBuilder {
             offset,
             call,
             args,
-            frame: scopes.frame(),
+            frame: allocator.frame(),
         };
 
         let signature = DebugSignature::new(item.to_owned(), DebugArgs::Named(debug_args));
@@ -655,7 +656,7 @@ impl UnitBuilder {
             .functions
             .insert(instance_fn, signature);
         self.functions_rev.insert(offset, hash);
-        self.add_assembly(location, assembly, scopes)?;
+        self.add_assembly(location, assembly, allocator)?;
         Ok(())
     }
 
@@ -687,7 +688,7 @@ impl UnitBuilder {
         &mut self,
         location: Location,
         mut assembly: Assembly,
-        scopes: Scopes,
+        allocator: Allocator,
     ) -> Result<(), CompileError> {
         self.label_count = assembly.label_count;
 
@@ -701,7 +702,7 @@ impl UnitBuilder {
             let mut comment = None::<Box<str>>;
             let label = assembly.labels_rev.get(&pos).copied();
 
-            let inst = inst.translate(span, &scopes, |label| {
+            let inst = inst.translate(span, &allocator, |label| {
                 translate_offset(span, pos, label, &assembly.labels)
             })?;
             self.instructions.push(inst);

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::ast::{self, Span, Spanned, SpannedError};
-use crate::compile::{BindingName, IrError, IrErrorKind, ItemBuf, Location, Meta};
+use crate::compile::{IrError, IrErrorKind, ItemBuf, Location, Meta, Name};
 use crate::parse::{ParseError, ParseErrorKind, ResolveError, ResolveErrorKind};
 use crate::query::{QueryError, QueryErrorKind};
 use crate::runtime::debug::DebugSignature;
@@ -296,8 +296,8 @@ pub enum CompileErrorKind {
     UnsupportedPatternRest,
     #[error("expected expression to be terminated by a semicolon `;`")]
     ExpectedBlockSemiColon { followed_span: Span },
-    #[error("internal: missing binding {binding_name:?}")]
-    MissingBindingName { binding_name: BindingName },
+    #[error("missing binding {name:?}")]
+    MissingBindingName { name: Name },
 }
 
 /// A single step in an import.

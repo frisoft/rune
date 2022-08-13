@@ -109,7 +109,7 @@ impl Derive {
                             let mut elements = Vec::with_capacity(len);
 
                             for index in 0..len {
-                                elements.push(quote_spanned!(field.span() => scopes.translate(span, #ident[#index])?));
+                                elements.push(quote_spanned!(field.span() => allocator.translate(span, #ident[#index])?));
                             }
 
                             translate.push(quote_spanned! {
@@ -124,7 +124,7 @@ impl Derive {
                         _ => {
                             translate.push(quote_spanned! {
                                 variant.span() =>
-                                let #ident = scopes.translate(span, #ident)?;
+                                let #ident = allocator.translate(span, #ident)?;
                             });
 
                             decls.push(quote_spanned!(field.span() => #ident: #assembly_address));
@@ -192,7 +192,7 @@ impl Derive {
         }
 
         let compile_error = &tokens.compile_error;
-        let scopes = &tokens.scopes;
+        let allocator = &tokens.allocator;
         let span = &tokens.span;
         let label = &tokens.label;
         let fmt_display = &tokens.fmt_display;
@@ -207,7 +207,7 @@ impl Derive {
             }
 
             impl AssemblyInst {
-                pub(crate) fn translate<T>(self, span: #span, scopes: &#scopes, translate_label: T) -> Result<#type_ident, #compile_error>
+                pub(crate) fn translate<T>(self, span: #span, allocator: &#allocator, translate_label: T) -> Result<#type_ident, #compile_error>
                 where
                     T: Fn(#label) -> Result<isize, #compile_error>
                 {

@@ -318,7 +318,7 @@ where
             if let Some(inst) = vm.unit().instruction_at(vm.ip()) {
                 write!(o, "  {:04} = {}", vm.ip(), inst)?;
             } else {
-                write!(o, "  {:04} = *o of bounds*", vm.ip())?;
+                write!(o, "  {:04} = *out of bounds*", vm.ip())?;
             }
 
             if let Some(comment) = debug.and_then(|d| d.comment.as_ref()) {

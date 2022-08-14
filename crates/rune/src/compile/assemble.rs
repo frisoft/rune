@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 use std::mem;
 use std::num::NonZeroUsize;
@@ -209,13 +210,13 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     }
 
     /// Insert a pattern.
-    fn insert_pat(&mut self, kind: PatKind<'hir>) -> Slot {
-        self.scopes.insert_pat(self.span, kind)
+    fn insert_pat(&mut self, kind: PatKind<'hir>, outputs: &'hir [Slot]) -> Slot {
+        self.scopes.insert_pat(self.span, kind, outputs)
     }
 
     /// Insert a bound pattern.
-    fn insert_bound_pat(&mut self, kind: BoundPatKind<'hir>) -> Slot {
-        self.scopes.insert_bound_pat(self.span, kind)
+    fn bound_pat(&mut self, kind: BoundPatKind<'hir>) -> BoundPat<'hir> {
+        BoundPat::new(self.span, kind)
     }
 
     /// Access the meta for the given language item.
@@ -654,13 +655,21 @@ struct Pat<'hir> {
     span: Span,
     /// The kind of the expression.
     kind: PatKind<'hir>,
-    /// The output address of the expression.
-    output: Slot,
+    /// The slot that this pattern belongs to.
+    slot: Slot,
+    /// The outputs once this pattern has been bound. It also corresponds to the
+    /// number of array slots used by the pattern binding.
+    outputs: &'hir [Slot],
 }
 
 impl<'hir> Pat<'hir> {
-    const fn new(span: Span, kind: PatKind<'hir>, output: Slot) -> Self {
-        Self { span, kind, output }
+    const fn new(span: Span, kind: PatKind<'hir>, slot: Slot, outputs: &'hir [Slot]) -> Self {
+        Self {
+            span,
+            kind,
+            slot,
+            outputs,
+        }
     }
 }
 
@@ -672,7 +681,9 @@ enum PatKind<'hir> {
     /// A literal value.
     Lit { lit: Slot },
     /// A path pattern.
-    Path { path: &'hir PatPath<'hir> },
+    Name { name: &'hir str },
+    /// A meta binding.
+    Meta { meta: &'hir PrivMeta },
     /// A vector pattern.
     Vec { items: &'hir [Slot], is_open: bool },
     /// A tuple pattern.
@@ -696,13 +707,11 @@ struct BoundPat<'hir> {
     span: Span,
     /// The kind of the bound pattern.
     kind: BoundPatKind<'hir>,
-    /// The output address of the bound pattern.
-    output: Slot,
 }
 
 impl<'hir> BoundPat<'hir> {
-    const fn new(span: Span, kind: BoundPatKind<'hir>, output: Slot) -> Self {
-        Self { span, kind, output }
+    const fn new(span: Span, kind: BoundPatKind<'hir>) -> Self {
+        Self { span, kind }
     }
 }
 
@@ -711,10 +720,11 @@ impl<'hir> BoundPat<'hir> {
 enum BoundPatKind<'hir> {
     Irrefutable,
     IrrefutableSequence {
-        items: &'hir [Slot],
+        items: &'hir [BoundPat<'hir>],
     },
     /// Bind an expression to the given address.
     Expr {
+        name: &'hir str,
         expr: Slot,
     },
     Lit {
@@ -724,33 +734,24 @@ enum BoundPatKind<'hir> {
     Vec {
         expr: Slot,
         is_open: bool,
-        items: &'hir [Slot],
+        items: &'hir [BoundPat<'hir>],
     },
     AnonymousTuple {
         expr: Slot,
         is_open: bool,
-        items: &'hir [Slot],
+        items: &'hir [BoundPat<'hir>],
     },
     AnonymousObject {
         expr: Slot,
         slot: usize,
         is_open: bool,
-        items: &'hir [Slot],
+        items: &'hir [BoundPat<'hir>],
     },
     TypedSequence {
         type_match: TypeMatch,
         expr: Slot,
-        items: &'hir [Slot],
+        items: &'hir [BoundPat<'hir>],
     },
-}
-
-/// A path that has been evaluated.
-#[derive(Debug, Clone, Copy)]
-enum PatPath<'hir> {
-    /// An identifier as a pattern.
-    Ident { ident: &'hir ast::Ident },
-    /// A meta item as a pattern.
-    Meta { meta: &'hir PrivMeta },
 }
 
 /// The type of a pattern object.
@@ -911,21 +912,6 @@ impl<'hir> Scopes<'hir> {
         }
     }
 
-    /// Look up the bound pattern associated with the given slot.
-    fn bound_pat(&self, span: Span, slot: Slot) -> Result<(&BoundPat<'hir>, usize)> {
-        let (storage, uses) = self.slot_data(span, slot)?;
-
-        match storage {
-            SlotData::BoundPat(pat) => Ok((pat, uses)),
-            _ => {
-                return Err(CompileError::msg(
-                    span,
-                    format_args!("slot {slot:?} exists but isn't a pattern"),
-                ))
-            }
-        }
-    }
-
     /// Perform a shallow clone of a scope (without updating users) and return the id of the cloned scope.
     fn clone_scope(&mut self, span: Span, scope: ScopeId) -> Result<ScopeId> {
         let scope = match self.scopes.get(scope.0) {
@@ -976,32 +962,17 @@ impl<'hir> Scopes<'hir> {
     }
 
     /// Insert a pattern and return its slot address.
-    fn insert_pat(&mut self, span: Span, kind: PatKind<'hir>) -> Slot {
-        self.insert_pat_with(span, |_| kind)
+    fn insert_pat(&mut self, span: Span, kind: PatKind<'hir>, outputs: &'hir [Slot]) -> Slot {
+        self.insert_pat_with(span, |_| kind, outputs)
     }
 
     /// Insert a pattern and return its slot address.
-    fn insert_pat_with<T>(&mut self, span: Span, builder: T) -> Slot
+    fn insert_pat_with<T>(&mut self, span: Span, builder: T, outputs: &'hir [Slot]) -> Slot
     where
         T: FnOnce(Slot) -> PatKind<'hir>,
     {
-        self.insert_with(span, |address| {
-            SlotData::Pat(Pat::new(span, builder(address), address))
-        })
-    }
-
-    /// Insert a bound pattern and return its slot address.
-    fn insert_bound_pat(&mut self, span: Span, kind: BoundPatKind<'hir>) -> Slot {
-        self.insert_bound_pat_with(span, |_| kind)
-    }
-
-    /// Insert a bound pattern and return its slot address.
-    fn insert_bound_pat_with<T>(&mut self, span: Span, builder: T) -> Slot
-    where
-        T: FnOnce(Slot) -> BoundPatKind<'hir>,
-    {
-        self.insert_with(span, |address| {
-            SlotData::BoundPat(BoundPat::new(span, builder(address), address))
+        self.insert_with(span, |slot| {
+            SlotData::Pat(Pat::new(span, builder(slot), slot, outputs))
         })
     }
 
@@ -1355,7 +1326,6 @@ struct Binding {
 enum SlotData<'hir> {
     Expr(Expr<'hir>),
     Pat(Pat<'hir>),
-    BoundPat(BoundPat<'hir>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1698,9 +1668,6 @@ fn asm<'hir>(
 
     #[instrument]
     fn asm_let<'hir>(cx: &mut Ctxt<'_, 'hir>, pat: Slot, expr: Slot) -> Result<()> {
-        let (&pat, _) = cx.scopes.pat(cx.span, pat)?;
-        let (&expr, _) = cx.scopes.expr(cx.span, expr)?;
-
         let panic_label = cx.new_label("let_panic");
 
         if let PatOutcome::Refutable = asm_pat(cx, pat, expr, panic_label)? {
@@ -1719,10 +1686,12 @@ fn asm<'hir>(
     #[instrument]
     fn asm_pat<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
-        pat: Pat<'hir>,
-        expr: Expr<'hir>,
+        pat: Slot,
+        expr: Slot,
         label: Label,
     ) -> Result<PatOutcome> {
+        let bound_pat = bind_pat(cx, pat, expr)?;
+
         todo!()
     }
 
@@ -2541,12 +2510,6 @@ fn block<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Block<'hir>) -> Result<Slot> 
                 hir::Stmt::Local(hir) => {
                     let expr = expr_value(cx, hir.expr)?;
                     let pat = pat(cx, hir.pat)?;
-
-                    let mut removed = HashMap::new();
-
-                    // Bind the current scope, with the given expression.
-                    bind_pat(cx, pat, expr, &mut removed)?;
-
                     cx.insert_expr(ExprKind::Let { pat, expr })
                 }
                 hir::Stmt::Expr(hir) => expr_value(cx, hir)?,
@@ -3432,33 +3395,57 @@ fn const_value<'hir>(cx: &mut Ctxt<'_, 'hir>, value: &ConstValue) -> Result<Slot
 }
 
 /// Assemble a pattern.
-#[instrument]
 fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Pat<'hir>) -> Result<Slot> {
-    return cx.with_span(hir.span(), |cx| {
-        let slot = match hir.kind {
-            hir::PatKind::PatPath(hir) => {
-                let path = alloc!(cx; pat_path(cx, hir)?);
-                cx.insert_pat(PatKind::Path { path })
-            }
-            hir::PatKind::PatIgnore => cx.insert_pat(PatKind::Ignore),
-            hir::PatKind::PatLit(hir) => {
-                let lit = expr_value(cx, hir)?;
-                cx.insert_pat(PatKind::Lit { lit })
-            }
-            hir::PatKind::PatVec(hir) => {
-                let items = iter!(cx; hir.items, |hir| pat(cx, hir)?);
+    let mut removed = HashMap::new();
+    return pat(cx, hir, &mut removed);
 
-                cx.insert_pat(PatKind::Vec {
-                    items,
-                    is_open: hir.is_open,
-                })
-            }
-            hir::PatKind::PatTuple(hir) => pat_tuple(cx, hir)?,
-            hir::PatKind::PatObject(hir) => pat_object(cx, hir)?,
-        };
+    #[instrument]
+    fn pat<'hir>(
+        cx: &mut Ctxt<'_, 'hir>,
+        hir: &hir::Pat<'hir>,
+        removed: &mut HashMap<Name, Span>,
+    ) -> Result<Slot> {
+        return cx.with_span(hir.span(), |cx| {
+            let slot = match hir.kind {
+                hir::PatKind::PatPath(hir) => pat_binding(cx, hir, removed)?,
+                hir::PatKind::PatIgnore => cx.insert_pat(PatKind::Ignore, &[]),
+                hir::PatKind::PatLit(hir) => {
+                    let lit = expr_value(cx, hir)?;
+                    cx.insert_pat(PatKind::Lit { lit }, &[])
+                }
+                hir::PatKind::PatVec(hir) => {
+                    let items = iter!(cx; hir.items, |hir| pat(cx, hir, removed)?);
 
-        Ok(slot)
-    });
+                    let mut outputs = Vec::new();
+
+                    for slot in items.iter().copied() {
+                        outputs.extend(cx.scopes.pat(cx.span, slot)?.0.outputs.iter().copied());
+                    }
+
+                    cx.insert_pat(
+                        PatKind::Vec {
+                            items,
+                            is_open: hir.is_open,
+                        },
+                        iter!(cx; outputs),
+                    )
+                }
+                hir::PatKind::PatTuple(hir) => pat_tuple(cx, hir, removed)?,
+                hir::PatKind::PatObject(hir) => pat_object(cx, hir, removed)?,
+            };
+
+            Ok(slot)
+        });
+    }
+
+    /// A path that has been evaluated.
+    #[derive(Debug, Clone, Copy)]
+    enum PatPath<'hir> {
+        /// An identifier as a pattern.
+        Name { name: &'hir str },
+        /// A meta item as a pattern.
+        Meta { meta: &'hir PrivMeta },
+    }
 
     #[instrument]
     fn pat_path<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Path<'hir>) -> Result<PatPath<'hir>> {
@@ -3473,7 +3460,10 @@ fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Pat<'hir>) -> Result<Slot> {
         }
 
         if let Some(ident) = hir.try_as_ident() {
-            return Ok(PatPath::Ident { ident });
+            let name = ident.resolve(resolve_context!(cx.q))?;
+            return Ok(PatPath::Name {
+                name: str!(cx; name),
+            });
         }
 
         Err(CompileError::new(
@@ -3486,7 +3476,11 @@ fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Pat<'hir>) -> Result<Slot> {
 
     /// Assemble a tuple pattern.
     #[instrument]
-    fn pat_tuple<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::PatItems<'hir>) -> Result<Slot> {
+    fn pat_tuple<'hir>(
+        cx: &mut Ctxt<'_, 'hir>,
+        hir: &hir::PatItems<'hir>,
+        removed: &mut HashMap<Name, Span>,
+    ) -> Result<Slot> {
         let path = match hir.path {
             Some(hir) => Some(pat_path(cx, hir)?),
             None => None,
@@ -3521,18 +3515,31 @@ fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Pat<'hir>) -> Result<Slot> {
             None => PatTupleKind::Anonymous,
         };
 
-        let patterns = iter!(cx; hir.items, |hir| pat(cx, hir)?);
+        let patterns = iter!(cx; hir.items, |hir| pat(cx, hir, removed)?);
 
-        Ok(cx.insert_pat(PatKind::Tuple {
-            kind,
-            patterns,
-            is_open: hir.is_open,
-        }))
+        let mut outputs = Vec::new();
+
+        for slot in patterns.iter().copied() {
+            outputs.extend(cx.scopes.pat(cx.span, slot)?.0.outputs.iter().copied());
+        }
+
+        Ok(cx.insert_pat(
+            PatKind::Tuple {
+                kind,
+                patterns,
+                is_open: hir.is_open,
+            },
+            iter!(cx; outputs),
+        ))
     }
 
     /// Assemble a pattern object.
     #[instrument]
-    fn pat_object<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::PatObject<'hir>) -> Result<Slot> {
+    fn pat_object<'hir>(
+        cx: &mut Ctxt<'_, 'hir>,
+        hir: &hir::PatObject<'hir>,
+        removed: &mut HashMap<Name, Span>,
+    ) -> Result<Slot> {
         let path = match hir.path {
             Some(hir) => Some(pat_path(cx, hir)?),
             None => None,
@@ -3544,22 +3551,22 @@ fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Pat<'hir>) -> Result<Slot> {
         for binding in hir.bindings {
             let key = match binding.key {
                 hir::ObjectKey::Path(hir) => match pat_path(cx, hir)? {
-                    PatPath::Ident { ident } => ident.resolve(resolve_context!(cx.q))?.to_owned(),
+                    PatPath::Name { name } => Cow::Borrowed(name),
                     _ => {
                         return Err(cx.error(CompileErrorKind::UnsupportedPattern));
                     }
                 },
-                hir::ObjectKey::LitStr(lit) => lit.resolve(resolve_context!(cx.q))?.into_owned(),
+                hir::ObjectKey::LitStr(lit) => lit.resolve(resolve_context!(cx.q))?,
             };
 
-            if let Some(existing) = keys_dup.insert(key.clone(), binding.span) {
+            if let Some(existing) = keys_dup.insert(key.clone().into_owned(), binding.span) {
                 return Err(cx.error(CompileErrorKind::DuplicateObjectKey {
                     existing,
                     object: binding.span,
                 }));
             }
 
-            keys.push(key);
+            keys.push(key.into_owned());
         }
 
         let kind = match path {
@@ -3625,25 +3632,68 @@ fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Pat<'hir>) -> Result<Slot> {
 
         let patterns = iter!(cx; hir.bindings, |binding| {
             if let Some(hir) = binding.pat {
-                pat(cx, hir)?
+                pat(cx, hir, removed)?
             } else {
-                pat_object_key(cx, binding.key)?
+                pat_object_key(cx, binding.key, removed)?
             }
         });
 
-        Ok(cx.insert_pat(PatKind::Object { kind, patterns }))
+        let mut outputs = Vec::new();
+
+        for slot in patterns.iter().copied() {
+            outputs.extend(cx.scopes.pat(cx.span, slot)?.0.outputs.iter().copied());
+        }
+
+        Ok(cx.insert_pat(PatKind::Object { kind, patterns }, iter!(cx; outputs)))
     }
 
     /// Assemble a binding pattern which is *just* a variable captured from an object.
     #[instrument]
-    fn pat_object_key<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::ObjectKey<'hir>) -> Result<Slot> {
-        match *hir {
-            hir::ObjectKey::LitStr(..) => Err(cx.error(CompileErrorKind::UnsupportedPattern)),
-            hir::ObjectKey::Path(hir) => {
-                let path = alloc!(cx; pat_path(cx, hir)?);
-                Ok(cx.insert_pat(PatKind::Path { path }))
+    fn pat_object_key<'hir>(
+        cx: &mut Ctxt<'_, 'hir>,
+        hir: &hir::ObjectKey<'hir>,
+        removed: &mut HashMap<Name, Span>,
+    ) -> Result<Slot> {
+        let slot = match *hir {
+            hir::ObjectKey::LitStr(..) => {
+                return Err(cx.error(CompileErrorKind::UnsupportedPattern))
             }
-        }
+            hir::ObjectKey::Path(hir) => pat_binding(cx, hir, removed)?,
+        };
+
+        Ok(slot)
+    }
+
+    /// Handle the binding of a path.
+    #[instrument]
+    fn pat_binding<'hir>(
+        cx: &mut Ctxt<'_, 'hir>,
+        hir: &hir::Path<'hir>,
+        removed: &mut HashMap<Name, Span>,
+    ) -> Result<Slot> {
+        let slot = match pat_path(cx, hir)? {
+            PatPath::Name { name } => {
+                let expr = cx.insert_expr(ExprKind::Empty);
+
+                {
+                    let name = cx.scopes.name(name);
+                    let replaced = cx.scopes.declare(cx.span, cx.scope, name, expr)?;
+
+                    if replaced.is_some() {
+                        if let Some(span) = removed.insert(name, cx.span) {
+                            return Err(cx.error(CompileErrorKind::DuplicateBinding {
+                                previous_span: span,
+                            }));
+                        }
+                    }
+                }
+
+                cx.insert_pat(PatKind::Name { name }, iter!(cx; [expr]))
+            }
+            PatPath::Meta { meta } => cx.insert_pat(PatKind::Meta { meta }, &[]),
+        };
+
+        Ok(slot)
     }
 }
 
@@ -3684,84 +3734,61 @@ fn generics_parameters<'hir>(
 
 /// Bind the pattern in the *current* scope.
 #[instrument]
-fn bind_pat<'hir>(
-    cx: &mut Ctxt<'_, 'hir>,
-    pat: Slot,
-    expr: Slot,
-    removed: &mut HashMap<Name, Span>,
-) -> Result<Slot> {
+fn bind_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, pat: Slot, expr: Slot) -> Result<BoundPat<'hir>> {
     let (&pat, _) = cx.scopes.pat(cx.span, pat)?;
 
-    return cx.with_span(pat.span, |cx| {
-        match pat.kind {
-            PatKind::Ignore => Ok(cx.insert_bound_pat(BoundPatKind::Irrefutable)),
-            PatKind::Lit { lit } => bind_pat_lit(cx, lit, expr),
-            PatKind::Path {
-                path: PatPath::Ident { ident },
-            } => {
-                // Handle syntactical reassignment of the given expression.
-                let ident = ident.resolve(resolve_context!(cx.q))?;
-                let name = cx.scopes.name(ident);
+    return cx.with_span(pat.span, |cx| match pat.kind {
+        PatKind::Ignore => Ok(cx.bound_pat(BoundPatKind::Irrefutable)),
+        PatKind::Lit { lit } => bind_pat_lit(cx, lit, expr),
+        PatKind::Name { name } => Ok(cx.bound_pat(BoundPatKind::Expr { name, expr })),
+        PatKind::Meta { meta } => {
+            let type_match = match tuple_match_for(cx, meta) {
+                Some((args, inst)) if args == 0 => inst,
+                _ => return Err(cx.error(CompileErrorKind::UnsupportedPattern)),
+            };
 
-                let replaced = cx.scopes.declare(cx.span, cx.scope, name, expr)?;
-
-                if replaced.is_some() {
-                    if let Some(span) = removed.insert(name, cx.span) {
-                        return Err(cx.error(CompileErrorKind::DuplicateBinding {
-                            previous_span: span,
-                        }));
-                    }
-                }
-
-                Ok(cx.insert_bound_pat(BoundPatKind::Expr { expr }))
-            }
-            PatKind::Path {
-                path: PatPath::Meta { meta, .. },
-            } => {
-                let type_match = match tuple_match_for(cx, meta) {
-                    Some((args, inst)) if args == 0 => inst,
-                    _ => return Err(cx.error(CompileErrorKind::UnsupportedPattern)),
-                };
-
-                Ok(cx.insert_bound_pat(BoundPatKind::TypedSequence {
-                    type_match,
-                    expr,
-                    items: &[],
-                }))
-            }
-            PatKind::Vec { items, is_open } => bind_pat_vec(cx, items, is_open, expr, removed),
-            PatKind::Tuple {
-                kind,
-                patterns,
-                is_open,
-            } => bind_pat_tuple(cx, kind, patterns, is_open, expr, removed),
-            PatKind::Object { kind, patterns } => {
-                bind_pat_object(cx, kind, patterns, expr, removed)
-            }
+            Ok(cx.bound_pat(BoundPatKind::TypedSequence {
+                type_match,
+                expr,
+                items: &[],
+            }))
         }
+        PatKind::Vec { items, is_open } => bind_pat_vec(cx, items, is_open, expr),
+        PatKind::Tuple {
+            kind,
+            patterns,
+            is_open,
+        } => bind_pat_tuple(cx, kind, patterns, is_open, expr),
+        PatKind::Object { kind, patterns } => bind_pat_object(cx, kind, patterns, expr),
     });
 
     /// Bind a literal pattern.
     #[instrument]
-    fn bind_pat_lit<'hir>(cx: &mut Ctxt<'_, 'hir>, lit: Slot, expr: Slot) -> Result<Slot> {
-        // Match irrefutable patterns.
-        match (
-            cx.scopes.expr(cx.span, lit)?.0.kind,
-            cx.scopes.expr(cx.span, lit)?.0.kind,
-        ) {
-            (ExprKind::Store { value: a }, ExprKind::Store { value: b }) if a == b => {
-                return Ok(cx.insert_bound_pat(BoundPatKind::Irrefutable));
+    fn bind_pat_lit<'hir>(
+        cx: &mut Ctxt<'_, 'hir>,
+        lit: Slot,
+        expr: Slot,
+    ) -> Result<BoundPat<'hir>> {
+        {
+            let (&lit, _) = cx.scopes.expr(cx.span, lit)?;
+            let (&expr, _) = cx.scopes.expr(cx.span, expr)?;
+
+            // Match irrefutable patterns.
+            match (lit.kind, expr.kind) {
+                (ExprKind::Store { value: a }, ExprKind::Store { value: b }) if a == b => {
+                    return Ok(cx.bound_pat(BoundPatKind::Irrefutable));
+                }
+                (ExprKind::String { string: a }, ExprKind::String { string: b }) if a == b => {
+                    return Ok(cx.bound_pat(BoundPatKind::Irrefutable));
+                }
+                (ExprKind::Bytes { bytes: a }, ExprKind::Bytes { bytes: b }) if a == b => {
+                    return Ok(cx.bound_pat(BoundPatKind::Irrefutable));
+                }
+                _ => {}
             }
-            (ExprKind::String { string: a }, ExprKind::String { string: b }) if a == b => {
-                return Ok(cx.insert_bound_pat(BoundPatKind::Irrefutable));
-            }
-            (ExprKind::Bytes { bytes: a }, ExprKind::Bytes { bytes: b }) if a == b => {
-                return Ok(cx.insert_bound_pat(BoundPatKind::Irrefutable));
-            }
-            _ => {}
         }
 
-        Ok(cx.insert_bound_pat(BoundPatKind::Lit { lit, expr }))
+        Ok(cx.bound_pat(BoundPatKind::Lit { lit, expr }))
     }
 
     /// Bind a vector pattern.
@@ -3771,8 +3798,7 @@ fn bind_pat<'hir>(
         patterns: &'hir [Slot],
         is_open: bool,
         expr: Slot,
-        removed: &mut HashMap<Name, Span>,
-    ) -> Result<Slot> {
+    ) -> Result<BoundPat<'hir>> {
         // Try a simpler form of pattern matching through syntactical reassignment.
         match cx.scopes.expr(cx.span, expr)?.0.kind {
             ExprKind::Vec { items: expr_items }
@@ -3780,10 +3806,10 @@ fn bind_pat<'hir>(
                     || expr_items.len() >= patterns.len() && is_open =>
             {
                 let items = iter!(cx; patterns.iter().copied().zip(expr_items.iter().copied()), |(pat, expr)| {
-                    bind_pat(cx, pat, expr, removed)?
+                    bind_pat(cx, pat, expr)?
                 });
 
-                return Ok(cx.insert_bound_pat(BoundPatKind::IrrefutableSequence { items }));
+                return Ok(cx.bound_pat(BoundPatKind::IrrefutableSequence { items }));
             }
             _ => {}
         }
@@ -3803,11 +3829,10 @@ fn bind_pat<'hir>(
                 cx,
                 *pat,
                 expr,
-                removed,
             )?
         });
 
-        Ok(cx.insert_bound_pat(BoundPatKind::Vec {
+        Ok(cx.bound_pat(BoundPatKind::Vec {
             expr,
             is_open,
             items,
@@ -3822,8 +3847,7 @@ fn bind_pat<'hir>(
         patterns: &'hir [Slot],
         is_open: bool,
         expr: Slot,
-        removed: &mut HashMap<Name, Span>,
-    ) -> Result<Slot> {
+    ) -> Result<BoundPat<'hir>> {
         match kind {
             PatTupleKind::Typed { type_match } => {
                 let items = iter!(cx; patterns.iter().enumerate().rev(), |(index, pat)| {
@@ -3832,10 +3856,10 @@ fn bind_pat<'hir>(
                         index,
                     });
 
-                    bind_pat(cx, *pat, expr, removed)?
+                    bind_pat(cx, *pat, expr)?
                 });
 
-                Ok(cx.insert_bound_pat(BoundPatKind::TypedSequence {
+                Ok(cx.bound_pat(BoundPatKind::TypedSequence {
                     type_match,
                     expr,
                     items,
@@ -3850,10 +3874,10 @@ fn bind_pat<'hir>(
                             || is_open && tuple_items.len() >= patterns.len() =>
                     {
                         let items = iter!(cx; patterns.iter().zip(tuple_items), |(pat, expr)| {
-                            bind_pat(cx, *pat, *expr, removed)?
+                            bind_pat(cx, *pat, *expr)?
                         });
 
-                        return Ok(cx.insert_bound_pat(BoundPatKind::IrrefutableSequence { items }));
+                        return Ok(cx.bound_pat(BoundPatKind::IrrefutableSequence { items }));
                     }
                     _ => {}
                 }
@@ -3865,10 +3889,10 @@ fn bind_pat<'hir>(
                 let items = iter!(cx; patterns.iter().rev(), |pat| {
                     cx.allocator.free_array_item(cx.span)?;
                     let expr = todo!();
-                    bind_pat(cx, *pat, expr, removed)?
+                    bind_pat(cx, *pat, expr)?
                 });
 
-                Ok(cx.insert_bound_pat(BoundPatKind::AnonymousTuple {
+                Ok(cx.bound_pat(BoundPatKind::AnonymousTuple {
                     expr,
                     is_open,
                     items,
@@ -3884,8 +3908,7 @@ fn bind_pat<'hir>(
         kind: PatObjectKind<'hir>,
         patterns: &'hir [Slot],
         expr: Slot,
-        removed: &mut HashMap<Name, Span>,
-    ) -> Result<Slot> {
+    ) -> Result<BoundPat<'hir>> {
         match kind {
             PatObjectKind::Typed { type_match, keys } => {
                 let items = iter!(cx; keys.iter().zip(patterns), |(&(field, hash), pat)| {
@@ -3895,10 +3918,10 @@ fn bind_pat<'hir>(
                         hash,
                     });
 
-                    bind_pat(cx, *pat, expr, removed)?
+                    bind_pat(cx, *pat, expr)?
                 });
 
-                Ok(cx.insert_bound_pat(BoundPatKind::TypedSequence {
+                Ok(cx.bound_pat(BoundPatKind::TypedSequence {
                     type_match,
                     expr,
                     items,
@@ -3915,10 +3938,10 @@ fn bind_pat<'hir>(
                         .unwrap_or_default() =>
                     {
                         let items = iter!(cx; patterns.iter().zip(exprs), |(pat, expr)| {
-                            bind_pat(cx, *pat, *expr, removed)?
+                            bind_pat(cx, *pat, *expr)?
                         });
 
-                        return Ok(cx.insert_bound_pat(BoundPatKind::IrrefutableSequence { items }));
+                        return Ok(cx.bound_pat(BoundPatKind::IrrefutableSequence { items }));
                     }
                     _ => {}
                 }
@@ -3932,10 +3955,10 @@ fn bind_pat<'hir>(
                 let items = iter!(cx; patterns.iter().rev(), |pat| {
                     cx.allocator.free_array_item(cx.span)?;
                     let expr = todo!();
-                    bind_pat(cx, *pat, expr, removed)?
+                    bind_pat(cx, *pat, expr)?
                 });
 
-                Ok(cx.insert_bound_pat(BoundPatKind::AnonymousObject {
+                Ok(cx.bound_pat(BoundPatKind::AnonymousObject {
                     expr,
                     slot,
                     is_open,

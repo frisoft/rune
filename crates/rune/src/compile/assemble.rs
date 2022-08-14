@@ -451,10 +451,151 @@ pub(crate) fn fn_from_item_fn<'hir>(
 
     cx.scopes.pop(span, scope)?;
 
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    debug(&mut out, cx, address, 0)?;
+
     let output = cx.allocator.alloc_for(address);
     asm(cx, address, output)?;
     cx.push(Inst::Return { address: output });
     Ok(())
+}
+
+/// Debug a slot.
+fn debug<O>(o: &mut O, cx: &mut Ctxt<'_, '_>, slot: Slot, indentation: usize) -> Result<()>
+where
+    O: std::io::Write,
+{
+    let (&data, uses) = cx.scopes.slot_data(cx.span, slot)?;
+
+    let i = std::iter::repeat(' ').take(indentation).collect::<String>();
+
+    macro_rules! field {
+        ($pad:literal, slot, $var:expr) => {
+            writeln!(o, "{i}{}{} = {{", $pad, stringify!($var)).map_err(io(&data))?;
+            debug(o, cx, $var, indentation + 2 + $pad.len())?;
+            writeln!(o, "{i}{}}},", $pad).map_err(io(&data))?;
+        };
+
+        ($pad:literal, lit, $var:expr) => {
+            writeln!(o, "{i}{}{} = {:?},", $pad, stringify!($var), $var).map_err(io(&data))?;
+        };
+
+        ($pad:literal, array, $var:expr) => {
+            let mut it = IntoIterator::into_iter($var);
+
+            let first = it.next();
+
+            if let Some(&slot) = first {
+                writeln!(o, "{i}{}{} = [", $pad, stringify!($var)).map_err(io(&data))?;
+
+                debug(o, cx, slot, indentation + 2 + $pad.len())?;
+
+                for &slot in it {
+                    debug(o, cx, slot, indentation + 2 + $pad.len())?;
+                }
+
+                writeln!(o, "{i}{}],", $pad).map_err(io(&data))?;
+            } else {
+                writeln!(o, "{i}{}{} = []", $pad, stringify!($var)).map_err(io(&data))?;
+            }
+        };
+
+        ($pad:literal, option, $var:expr) => {
+            if let Some(slot) = $var {
+                writeln!(o, "{i}{}{} = Some(", $pad, stringify!($var)).map_err(io(&data))?;
+                debug(o, cx, slot, indentation + 2 + $pad.len())?;
+                writeln!(o, "{i}{}),", $pad).map_err(io(&data))?;
+            } else {
+                writeln!(o, "{i}{}{} = None,", $pad, stringify!($var)).map_err(io(&data))?;
+            }
+        };
+    }
+
+    macro_rules! variant {
+        ($enum_ty:ident :: $name:ident { $($what:ident $field:ident),* }) => {{
+            writeln!(o, "{i}{name} {{ slot = {slot:?}, uses = {uses:?} }} {{", name = stringify!($name), slot = slot.0, uses = uses).map_err(io(&data))?;
+            $(field!("  ", $what, $field);)*
+            writeln!(o, "{i}}}").map_err(io(&data))?;
+        }};
+
+        ($enum_ty:ident :: $name:ident) => {{
+            writeln!(o, "{i}{name} {{ slot = {slot:?}, uses = {uses:?} }},", name = stringify!($name), slot = slot.0, uses = uses).map_err(io(&data))?;
+        }};
+    }
+
+    macro_rules! matches {
+        ($expr:expr, { $($type_what:ident $type_expr:expr),* $(,)? }, { $($enum_ty:ident :: $name:ident $({ $($what:ident $field:ident),* $(,)? })?),* $(,)? }) => {{
+            $(field!("", $type_what, $type_expr);)*
+
+            match $expr {
+                $(
+                    $enum_ty::$name { $($($field),*)* } => {
+                        variant!($enum_ty :: $name $({ $($what $field),* })*)
+                    }
+                )*
+            }
+        }}
+    }
+
+    match data {
+        SlotData::Expr(expr) => matches! {
+            expr.kind, {}, {
+                ExprKind::Empty,
+                ExprKind::Address { slot address },
+                ExprKind::Binding { lit binding, slot address },
+                ExprKind::TupleFieldAccess { slot lhs, lit index },
+                ExprKind::StructFieldAccess { slot lhs, lit field, lit hash },
+                ExprKind::StructFieldAccessGeneric { slot lhs, lit hash, lit generics },
+                ExprKind::Assign { slot address, slot rhs },
+                ExprKind::AssignStructField { slot lhs, lit field, slot rhs },
+                ExprKind::AssignTupleField { slot lhs, lit index, slot rhs },
+                ExprKind::Block { array statements, option tail },
+                ExprKind::Let { slot pat, slot expr },
+                ExprKind::Store { lit value },
+                ExprKind::Bytes { lit bytes },
+                ExprKind::String { lit string },
+                ExprKind::Unary { lit op, slot expr },
+                ExprKind::BinaryAssign { slot lhs, lit op, slot rhs },
+                ExprKind::BinaryConditional { slot lhs, lit op, slot rhs },
+                ExprKind::Binary { slot lhs, lit op, slot rhs },
+                ExprKind::Index { slot target, slot index },
+                ExprKind::Meta { lit meta, lit needs, lit named },
+                ExprKind::Struct { lit kind, array exprs },
+                ExprKind::Tuple { array items },
+                ExprKind::Vec { array items },
+                ExprKind::Range { slot from, lit limits, slot to },
+                ExprKind::Option { option value },
+                ExprKind::CallAddress { slot address, array args },
+                ExprKind::CallHash { lit hash, array args },
+                ExprKind::CallInstance { slot lhs, lit hash, array args },
+                ExprKind::CallExpr { slot expr, array args },
+                ExprKind::Yield { option expr },
+                ExprKind::Await { slot expr },
+                ExprKind::Return { slot expr },
+                ExprKind::Try { slot expr },
+                ExprKind::Function { lit hash },
+                ExprKind::Closure { lit hash, array captures },
+            }
+        },
+        SlotData::Pat(pat) => matches! {
+            pat.kind, { array pat.outputs }, {
+                PatKind::Ignore,
+                PatKind::Lit { slot lit },
+                PatKind::Name { lit name },
+                PatKind::Meta { lit meta },
+                PatKind::Vec { array items, lit is_open },
+                PatKind::Tuple { lit kind, array patterns, lit is_open },
+                PatKind::Object { lit kind, array patterns },
+            }
+        },
+    }
+
+    return Ok(());
+
+    fn io<'a>(data: &'a SlotData) -> impl FnOnce(std::io::Error) -> CompileError + 'a {
+        move |e| CompileError::msg(data.span(), e)
+    }
 }
 
 /// An expression that can be assembled.
@@ -1328,6 +1469,15 @@ enum SlotData<'hir> {
     Pat(Pat<'hir>),
 }
 
+impl<'hir> SlotData<'hir> {
+    fn span(&self) -> Span {
+        match self {
+            SlotData::Expr(expr) => expr.span,
+            SlotData::Pat(pat) => pat.span,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SlotStorage<'hir> {
     /// The downstream users of this slot.
@@ -1691,8 +1841,54 @@ fn asm<'hir>(
         label: Label,
     ) -> Result<PatOutcome> {
         let bound_pat = bind_pat(cx, pat, expr)?;
+        asm_bound_pat(cx, bound_pat, label)
+    }
 
-        todo!()
+    #[instrument]
+    fn asm_bound_pat<'hir>(
+        cx: &mut Ctxt<'_, 'hir>,
+        bound_pat: BoundPat<'hir>,
+        label: Label,
+    ) -> Result<PatOutcome> {
+        cx.with_span(bound_pat.span, |cx| match bound_pat.kind {
+            BoundPatKind::Irrefutable => Ok(PatOutcome::Irrefutable),
+            BoundPatKind::IrrefutableSequence { items } => {
+                let mut outcome = PatOutcome::Irrefutable;
+
+                for bound_pat in items {
+                    outcome = outcome.combine(asm_bound_pat(cx, *bound_pat, label)?);
+                }
+
+                Ok(outcome)
+            }
+            BoundPatKind::Expr { expr, .. } => {
+                let output = cx.allocator.alloc_for(expr);
+                asm(cx, expr, output)?;
+                Ok(PatOutcome::Irrefutable)
+            }
+            BoundPatKind::Lit { lit, expr } => todo!(),
+            BoundPatKind::Vec {
+                expr,
+                is_open,
+                items,
+            } => todo!(),
+            BoundPatKind::AnonymousTuple {
+                expr,
+                is_open,
+                items,
+            } => todo!(),
+            BoundPatKind::AnonymousObject {
+                expr,
+                slot,
+                is_open,
+                items,
+            } => todo!(),
+            BoundPatKind::TypedSequence {
+                type_match,
+                expr,
+                items,
+            } => todo!(),
+        })
     }
 
     #[instrument]

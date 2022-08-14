@@ -14,6 +14,8 @@ type Result<T> = ::std::result::Result<T, CompileError>;
 /// The address as declared by a scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AssemblyAddress {
+    /// An exact address from the bottom of the address space.
+    Bottom(usize),
     /// A slot address.
     Slot(usize),
     /// An array address.

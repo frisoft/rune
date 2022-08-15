@@ -11,7 +11,7 @@ use rune_macros::__instrument_hir as instrument;
 
 use crate::arena::{Arena, ArenaAllocError, ArenaWriteSliceOutOfBounds};
 use crate::ast::{self, Span, Spanned};
-use crate::collections::{BTreeSet, HashMap, HashSet};
+use crate::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::compile::UnitBuilder;
 use crate::compile::{
     ir, Assembly, AssemblyAddress, CaptureMeta, CompileError, CompileErrorKind, CompileVisitor,
@@ -224,23 +224,26 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         self.scopes.next_slot(self.span)
     }
 
-    /// Add a slot user.
-    fn add_slot_user(&mut self, slot: Slot, user: Slot) -> Result<()> {
-        self.add_slot_user_with(slot, user, Lookup::Same)
-    }
-
-    /// Add a slot user with custom lookup.
-    fn add_slot_user_with(&mut self, slot: Slot, user: Slot, lookup: Lookup) -> Result<()> {
-        self.slot_mut(slot)?.add_user(user, lookup);
+    /// Add a slot user with custom use kind.
+    fn add_slot_user_with(&mut self, slot: Slot, user: Slot, use_kind: UseKind) -> Result<()> {
+        let span = self.span;
+        self.slot_mut(slot)?.add_user(span, user, use_kind);
         // We can now remove this slot from the set of useless slots.
         self.useless.remove(&slot);
         Ok(())
     }
 
+    /// Take a single slot user.
+    fn take_slot_use(&mut self, slot: Slot, user: Slot) -> Result<SlotUse> {
+        let span = self.span;
+        self.slot_mut(slot)?.take_use(span, user)
+    }
+
     /// Remove a slot user.
     fn remove_slot_user(&mut self, slot: Slot, user: Slot) -> Result<()> {
+        let span = self.span;
         let storage = self.slot_mut(slot)?;
-        storage.remove_user(user);
+        storage.remove_user(span, user)?;
 
         if storage.users.is_empty() {
             self.useless.insert(slot);
@@ -250,30 +253,30 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     }
 
     /// Retain all slots referenced by the given expression.
-    fn retain_expr_kind(&mut self, kind: ExprKind<'hir>, this_slot: Slot) -> Result<()> {
-        walk_expr_slots(kind, |slot, lookup| {
-            self.add_slot_user_with(slot, this_slot, lookup)
+    fn retain_expr_kind(&mut self, kind: ExprKind<'hir>, this: Slot) -> Result<()> {
+        walk_expr_slots(kind, |slot, use_kind| {
+            self.add_slot_user_with(slot, this, use_kind)
         })
     }
 
     /// Free all slots referenced by the given expression.
-    fn release_expr_kind(&mut self, kind: ExprKind<'hir>, this_slot: Slot) -> Result<()> {
-        walk_expr_slots(kind, |slot, _| self.remove_slot_user(slot, this_slot))
+    fn release_expr_kind(&mut self, kind: ExprKind<'hir>, this: Slot) -> Result<()> {
+        walk_expr_slots(kind, |slot, _| self.remove_slot_user(slot, this))
     }
 
     /// Insert a expression.
     fn insert_expr(&mut self, kind: ExprKind<'hir>) -> Result<Slot> {
-        let this_slot = self.next_slot()?;
-        self.retain_expr_kind(kind, this_slot)?;
+        let this = self.next_slot()?;
+        self.retain_expr_kind(kind, this)?;
         // Mark current statement inserted as potentially useless to sweep it up later.
-        self.useless.insert(this_slot);
+        self.useless.insert(this);
         self.scopes.insert_expr(self.span, kind)
     }
 
     /// Free an expression.
-    fn free_expr(&mut self, this_slot: Slot) -> Result<()> {
-        let kind = self.expr(this_slot)?.kind;
-        self.release_expr_kind(kind, this_slot)?;
+    fn free_expr(&mut self, this: Slot) -> Result<()> {
+        let kind = self.expr(this)?.kind;
+        self.release_expr_kind(kind, this)?;
         Ok(())
     }
 
@@ -458,7 +461,12 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     }
 
     /// Allocate a collection of slots as addresses.
-    fn addresses<const N: usize, T>(&mut self, slots: [Slot; N], tmp: T) -> Result<[UsedAddress; N]>
+    fn addresses<const N: usize, T>(
+        &mut self,
+        user: Slot,
+        slots: [Slot; N],
+        tmp: T,
+    ) -> Result<[UsedAddress; N]>
     where
         T: IntoIterator<Item = AssemblyAddress>,
     {
@@ -466,7 +474,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         let mut out = [mem::MaybeUninit::<UsedAddress>::uninit(); N];
 
         for (slot, out) in slots.into_iter().zip(&mut out) {
-            let address = follow_slot(self, &mut tmp, slot)?;
+            let address = follow_slot(self, &mut tmp, slot, user)?;
             out.write(address);
         }
 
@@ -486,15 +494,18 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
             cx: &mut Ctxt<'_, '_>,
             tmp: &mut impl Iterator<Item = AssemblyAddress>,
             slot: Slot,
+            user: Slot,
         ) -> Result<UsedAddress> {
+            let span = cx.span;
             let slot_mut = cx.slot_mut(slot)?;
-            let used = slot_mut.take_use();
+            let used = slot_mut.take_use(span, user)?;
 
             let address = match slot_mut.expr.kind {
                 ExprKind::Address { address } => UsedAddress::new(address, slot, used),
-                ExprKind::Binding { slot, .. } if used.is_only() => {
-                    return follow_slot(cx, tmp, slot)
-                }
+                ExprKind::Binding {
+                    slot: followed_slot,
+                    ..
+                } if used.is_only() => return follow_slot(cx, tmp, followed_slot, slot),
                 _ => {
                     let address = if let Some(address) = tmp.next() {
                         address
@@ -531,12 +542,12 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 struct UsedAddress {
     address: AssemblyAddress,
     slot: Slot,
-    used: UseSummary,
+    used: SlotUse,
 }
 
 impl UsedAddress {
     /// A temporary address.
-    const fn new(address: AssemblyAddress, slot: Slot, used: UseSummary) -> Self {
+    const fn new(address: AssemblyAddress, slot: Slot, used: SlotUse) -> Self {
         Self {
             address,
             slot,
@@ -642,8 +653,9 @@ where
     let span = storage.expr.span;
     let i = std::iter::repeat(' ').take(indent).collect::<String>();
     let err = io_err(span);
-    let users = storage.users.len();
-    let uses = storage.uses;
+    let users = storage.users.clone();
+    let same = storage.same;
+    let branches = storage.branches;
     let expr = storage.expr;
 
     macro_rules! field {
@@ -707,13 +719,13 @@ where
 
     macro_rules! variant {
         ($name:ident { $($what:ident $field:ident),* }) => {{
-            writeln!(o, "{i}{}${} {{ uses = {uses:?}, users = {users:?} }} {{", stringify!($name), slot.index()).map_err(err)?;
+            writeln!(o, "{i}{}${} {{ same = {same:?}, branches = {branches:?}, users = {users:?} }} {{", stringify!($name), slot.index()).map_err(err)?;
             $(field!("  ", $what, $field);)*
             writeln!(o, "{i}}}").map_err(err)?;
         }};
 
         ($name:ident) => {{
-            writeln!(o, "{i}{}${} {{ uses = {uses:?}, users = {users:?} }},", stringify!($name), slot.index()).map_err(err)?;
+            writeln!(o, "{i}{}${} {{ same = {same:?}, branches = {branches:?}, users = {users:?} }},", stringify!($name), slot.index()).map_err(err)?;
         }};
     }
 
@@ -733,11 +745,11 @@ where
         expr.kind, {
             Empty,
             Address { lit address },
-            Binding { binding binding, slot slot, lit lookup },
+            Binding { binding binding, slot slot, lit use_kind },
             TupleFieldAccess { slot lhs, lit index },
             StructFieldAccess { slot lhs, lit field, lit hash },
             StructFieldAccessGeneric { slot lhs, lit hash, lit generics },
-            Assign { binding binding, slot lhs, lit lookup, slot rhs },
+            Assign { binding binding, slot lhs, lit use_kind, slot rhs },
             AssignStructField { slot lhs, lit field, slot rhs },
             AssignTupleField { slot lhs, lit index, slot rhs },
             Block { array statements, option tail },
@@ -916,7 +928,7 @@ enum ExprKind<'hir> {
     Binding {
         binding: Binding,
         slot: Slot,
-        lookup: Lookup,
+        use_kind: UseKind,
     },
     /// An assignment to a binding.
     Assign {
@@ -925,7 +937,7 @@ enum ExprKind<'hir> {
         /// Address to assign to.
         lhs: Slot,
         /// The lookup being assigned to.
-        lookup: Lookup,
+        use_kind: UseKind,
         /// The expression to assign.
         rhs: Slot,
     },
@@ -1148,17 +1160,19 @@ enum BoundPatKind<'hir> {
         expr: Slot,
     },
     Vec {
+        address: AssemblyAddress,
         expr: Slot,
         is_open: bool,
         items: &'hir [BoundPat<'hir>],
     },
     AnonymousTuple {
+        address: AssemblyAddress,
         expr: Slot,
         is_open: bool,
         items: &'hir [BoundPat<'hir>],
-        address: AssemblyAddress,
     },
     AnonymousObject {
+        address: AssemblyAddress,
         expr: Slot,
         slot: usize,
         is_open: bool,
@@ -1375,10 +1389,12 @@ impl<'hir> Scopes<'hir> {
         let slot = self.next_slot(span)?;
 
         self.slots.push(SlotStorage {
-            users: vec![],
+            users: BTreeMap::new(),
             expr: builder(slot),
-            uses: Uses::Count(0),
+            same: 0,
+            branches: 0,
             pending: true,
+            sealed: None,
         });
 
         Ok(slot)
@@ -1510,12 +1526,12 @@ impl<'hir> Scopes<'hir> {
         scope: ScopeId,
         _: &mut dyn CompileVisitor,
         string: &str,
-    ) -> Result<Option<(Binding, Slot, Lookup)>> {
+    ) -> Result<Option<(Binding, Slot, UseKind)>> {
         let name = self.name(string);
         tracing::trace!(string = string, name = ?name);
 
         let mut current = Some(scope);
-        let mut lookup = Lookup::Same;
+        let mut use_kind = UseKind::Same;
 
         while let Some((id, scope)) = current
             .take()
@@ -1524,11 +1540,11 @@ impl<'hir> Scopes<'hir> {
             if let Some(slot) = scope.lookup(name) {
                 tracing::trace!("found: {name:?} => {slot:?}");
                 let binding = Binding { scope: id, name };
-                return Ok(Some((binding, slot, lookup)));
+                return Ok(Some((binding, slot, use_kind)));
             }
 
             if !matches!(scope.control_flow, ControlFlow::None) {
-                lookup = Lookup::Branch;
+                use_kind = UseKind::Branch;
             }
 
             current = scope.parent;
@@ -1545,7 +1561,7 @@ impl<'hir> Scopes<'hir> {
         scope: ScopeId,
         visitor: &mut dyn CompileVisitor,
         name: &str,
-    ) -> Result<(Binding, Slot, Lookup)> {
+    ) -> Result<(Binding, Slot, UseKind)> {
         match self.try_lookup(location, scope, visitor, name)? {
             Some(output) => Ok(output),
             None => Err(CompileError::new(
@@ -1663,8 +1679,8 @@ struct LoopControlFlow {
 }
 
 /// The kind of lookup that was performed.
-#[derive(Debug, Clone, Copy)]
-enum Lookup {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum UseKind {
     /// The variable is found in the same scope as this one.
     Same,
     /// The variable was found outside of a branch.
@@ -1725,33 +1741,23 @@ struct Binding {
     name: Name,
 }
 
-/// Indicates how exactly a slot is used.
-#[derive(Debug, Clone, Copy)]
-enum Uses {
-    /// Slot is used exactly the given number of counts.
-    Count(usize),
-    /// Slot is used in a branch context, which means that its exact number of
-    /// uses depends on runtime variables.
-    Branch,
-}
-
 /// Use summary for a slot.
 #[derive(Debug, Clone, Copy)]
 struct UseSummary {
-    uses: Uses,
+    /// How many users this value has.
+    same: usize,
+    /// How many branches that are using this value.
+    branches: usize,
+    /// The total number of users of an expression.
     total: usize,
+    /// If the value is pending construction.
     pending: bool,
 }
 
 impl UseSummary {
-    /// If this caller is the only user of the expression.
-    fn is_only(&self) -> bool {
-        matches!((self.uses, self.total), (Uses::Count(..), 1))
-    }
-
-    /// If this caller is the last user of the expression.
+    /// Test if this is the last user.
     fn is_last(&self) -> bool {
-        matches!(self.uses, Uses::Count(0))
+        self.same == 0 && self.branches == 0
     }
 
     /// If the expression is waiting to be built.
@@ -1760,57 +1766,149 @@ impl UseSummary {
     }
 }
 
+/// Use summary for a slot.
+#[derive(Debug, Clone, Copy)]
+struct SlotUse {
+    /// The kind of use which is in place.
+    use_kind: UseKind,
+    /// How many users this value has.
+    summary: UseSummary,
+}
+
+impl SlotUse {
+    /// Test if this is the only non-branch user.
+    fn is_only(&self) -> bool {
+        matches!((self.use_kind, self.summary.total), (UseKind::Same, 1))
+    }
+
+    /// Test if this is the last user.
+    #[inline(always)]
+    fn is_last(&self) -> bool {
+        self.summary.is_last()
+    }
+
+    /// If the expression is waiting to be built.
+    #[inline(always)]
+    fn is_pending(&self) -> bool {
+        self.summary.is_pending()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SlotSealed {
+    total: usize,
+}
+
 #[derive(Debug)]
 struct SlotStorage<'hir> {
     /// The downstream users of this slot.
-    users: Vec<Slot>,
+    users: BTreeMap<Slot, UseKind>,
     /// The expression associated with this slot.
     expr: Expr<'hir>,
     /// The number of pending users.
-    uses: Uses,
+    same: usize,
+    /// Branches used.
+    branches: usize,
     /// If the slot is pending to be built.
     pending: bool,
+    /// Is calculated when the first `take_user` is called.
+    sealed: Option<SlotSealed>,
 }
 
 impl<'hir> SlotStorage<'hir> {
     /// Add a single user.
-    fn add_user(&mut self, slot: Slot, lookup: Lookup) {
-        self.users.push(slot);
+    fn add_user(&mut self, span: Span, slot: Slot, use_kind: UseKind) -> Result<()> {
+        if self.sealed.is_some() {
+            let this = self.expr.slot;
 
-        match (lookup, &mut self.uses) {
-            (Lookup::Same, Uses::Count(n)) => {
-                *n = self.users.len();
+            return Err(CompileError::msg(
+                span,
+                "cannot add user to slot {this:?} since it's sealed",
+            ));
+        }
+
+        self.users.insert(slot, use_kind);
+
+        match use_kind {
+            UseKind::Same => {
+                self.same = self.same.saturating_add(1);
             }
-            (_, Uses::Branch) => {}
-            (Lookup::Branch, uses) => {
-                *uses = Uses::Branch;
+            UseKind::Branch => {
+                self.branches = self.same.saturating_add(1);
             }
         }
+
+        Ok(())
     }
 
     /// Remove a single user.
-    fn remove_user(&mut self, slot: Slot) {
-        self.users.retain(|s| *s != slot);
+    fn remove_user(&mut self, span: Span, slot: Slot) -> Result<UseKind> {
+        let use_kind = match self.users.remove(&slot) {
+            Some(use_kind) => use_kind,
+            None => {
+                let this = self.expr.slot;
+                return Err(CompileError::msg(
+                    span,
+                    format_args!("{slot:?} is not a user of slot {this:?}"),
+                ));
+            }
+        };
 
-        if let Uses::Count(n) = &mut self.uses {
-            *n = self.users.len();
+        match use_kind {
+            UseKind::Same => {
+                self.same = self.same.saturating_sub(1);
+            }
+            UseKind::Branch => {
+                self.branches = self.same.saturating_sub(1);
+            }
+        }
+
+        Ok(use_kind)
+    }
+
+    /// Seal the current slot. This is called automatically when a summary
+    /// called for or use is taken.
+    fn seal(&mut self) -> SlotSealed {
+        *self.sealed.get_or_insert_with(|| SlotSealed {
+            total: self.users.len(),
+        })
+    }
+
+    /// Get a use summary for the current slot.
+    fn use_summary(&mut self) -> UseSummary {
+        let sealed = self.seal();
+
+        UseSummary {
+            same: self.same,
+            branches: self.branches,
+            total: sealed.total,
+            pending: self.pending,
         }
     }
 
     /// Mark one use as completed, return the old use count.
-    fn take_use(&mut self) -> UseSummary {
-        match &mut self.uses {
-            Uses::Count(n) => {
-                *n = (*n).saturating_sub(1);
-            }
-            Uses::Branch => {}
-        };
+    fn take_use(&mut self, span: Span, slot: Slot) -> Result<SlotUse> {
+        let sealed = self.seal();
+        let use_kind = self.remove_user(span, slot)?;
 
-        UseSummary {
-            pending: self.pending,
-            uses: self.uses,
-            total: self.users.len(),
+        match use_kind {
+            UseKind::Same => {
+                self.same = self.same.saturating_sub(1);
+            }
+            UseKind::Branch => {
+                self.branches = self.branches.saturating_sub(1);
+            }
         }
+
+        Ok(SlotUse {
+            use_kind,
+            summary: UseSummary {
+                same: self.same,
+                branches: self.branches,
+                total: sealed.total,
+                pending: self.pending,
+            },
+        })
     }
 }
 
@@ -1879,6 +1977,12 @@ impl Allocator {
             u32::try_from(slot).ok(),
             "slot out of bound",
         )?))
+    }
+
+    /// Get the next address that will be generated without consuming it.
+    fn next_address(&self) -> AssemblyAddress {
+        let slot = self.slots.vacant_key();
+        AssemblyAddress::Slot(slot)
     }
 
     /// Allocate a new assembly address.
@@ -2096,6 +2200,7 @@ fn asm<'hir>(
     }
 
     slot.pending = false;
+    let this = slot.expr.slot;
 
     match slot.expr.kind {
         ExprKind::Empty => {}
@@ -2103,7 +2208,7 @@ fn asm<'hir>(
             asm_address(cx, address, output);
         }
         ExprKind::Binding { binding, slot, .. } => {
-            asm_binding(cx, binding, slot, output)?;
+            asm_binding(cx, this, binding, slot, output)?;
         }
         ExprKind::Block { statements, tail } => {
             asm_block(cx, statements, tail, output)?;
@@ -2119,7 +2224,7 @@ fn asm<'hir>(
             asm_string(cx, string, output)?;
         }
         ExprKind::Unary { op, expr } => {
-            asm_unary(cx, op, expr, output)?;
+            asm_unary(cx, this, op, expr, output)?;
         }
         ExprKind::BinaryAssign { lhs, op, rhs } => {
             asm_binary_assign(cx, lhs, op, rhs, output)?;
@@ -2128,7 +2233,7 @@ fn asm<'hir>(
             asm_binary_conditional(cx, lhs, op, rhs, output)?;
         }
         ExprKind::Binary { lhs, op, rhs } => {
-            asm_binary(cx, lhs, op, rhs, output)?;
+            asm_binary(cx, this, lhs, op, rhs, output)?;
         }
         ExprKind::Index { target, index } => {
             asm_index(cx, target, index, output)?;
@@ -2163,7 +2268,7 @@ fn asm<'hir>(
         ExprKind::Assign {
             binding, lhs, rhs, ..
         } => {
-            asm_assign(cx, binding, lhs, rhs)?;
+            asm_assign(cx, this, binding, lhs, rhs)?;
         }
         ExprKind::AssignStructField { lhs, field, rhs } => {
             asm_assign_struct_field(cx, lhs, field, rhs, output)?;
@@ -2241,11 +2346,12 @@ fn asm<'hir>(
     #[instrument]
     fn asm_binding<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         binding: Binding,
         slot: Slot,
         output: AssemblyAddress,
     ) -> Result<()> {
-        let user = cx.slot_mut(slot)?.take_use();
+        let user = cx.take_slot_use(slot, this)?;
 
         // We are the one and only user, so assemble the referenced binding
         // directly on our output.
@@ -2338,11 +2444,11 @@ fn asm<'hir>(
             BoundPatKind::Expr {
                 name_expr, expr, ..
             } => {
-                let slot = cx.slot_mut(name_expr)?;
+                let summary = cx.slot_mut(name_expr)?.use_summary();
 
-                match slot.uses {
+                match (summary.same, summary.branches) {
                     // Assemble eagerly *in case* there are no users.
-                    Uses::Count(0) => {
+                    (0, 0) => {
                         // If an expression can have side effects it has to be
                         // executed.
                         if has_side_effects(cx, expr)? {
@@ -2353,7 +2459,7 @@ fn asm<'hir>(
                     }
                     // In case there are exactly *1* user, forward this
                     // expression to that user.
-                    Uses::Count(1) => {
+                    (1, 0) => {
                         let expr = *cx.expr(expr)?;
                         *cx.expr_mut(name_expr)? = expr;
                     }
@@ -2370,7 +2476,7 @@ fn asm<'hir>(
                 Ok(PatOutcome::Irrefutable)
             }
             BoundPatKind::Lit { lit, expr } => {
-                let user = cx.slot_mut(expr)?.take_use();
+                let user = cx.slot_mut(expr)?.use_summary();
                 let address = cx.allocator.alloc_for(expr);
 
                 if user.is_pending() {
@@ -2413,20 +2519,47 @@ fn asm<'hir>(
                 Ok(PatOutcome::Refutable)
             }
             BoundPatKind::Vec {
-                expr,
-                is_open,
-                items,
-            } => todo!(),
-            BoundPatKind::AnonymousTuple {
-                expr,
-                is_open,
-                items,
                 address,
+                expr,
+                is_open,
+                items,
             } => {
-                let user = cx.slot_mut(expr)?.take_use();
+                let expr_use = cx.slot_mut(expr)?.use_summary();
                 let expr_output = cx.allocator.alloc_for(expr);
 
-                if user.is_pending() {
+                if expr_use.is_pending() {
+                    asm(cx, expr, expr_output)?;
+                }
+
+                cx.push(Inst::MatchSequence {
+                    address: expr_output,
+                    type_check: TypeCheck::Vec,
+                    len: items.len(),
+                    exact: !is_open,
+                    label,
+                    output: address,
+                });
+
+                for &pat in items {
+                    asm_bound_pat(cx, pat, label)?;
+                }
+
+                if expr_use.is_last() {
+                    cx.allocator.free_for(cx.span, expr)?;
+                }
+
+                Ok(PatOutcome::Refutable)
+            }
+            BoundPatKind::AnonymousTuple {
+                address,
+                expr,
+                is_open,
+                items,
+            } => {
+                let expr_use = cx.slot_mut(expr)?.use_summary();
+                let expr_output = cx.allocator.alloc_for(expr);
+
+                if expr_use.is_pending() {
                     asm(cx, expr, expr_output)?;
                 }
 
@@ -2443,23 +2576,91 @@ fn asm<'hir>(
                     asm_bound_pat(cx, pat, label)?;
                 }
 
-                if user.is_last() {
+                if expr_use.is_last() {
                     cx.allocator.free_for(cx.span, expr)?;
                 }
 
                 Ok(PatOutcome::Refutable)
             }
             BoundPatKind::AnonymousObject {
+                address,
                 expr,
                 slot,
                 is_open,
                 items,
-            } => todo!(),
+            } => {
+                let expr_use = cx.slot_mut(expr)?.use_summary();
+                let expr_output = cx.allocator.alloc_for(expr);
+
+                if expr_use.is_pending() {
+                    asm(cx, expr, expr_output)?;
+                }
+
+                cx.push(Inst::MatchObject {
+                    address,
+                    slot,
+                    exact: !is_open,
+                    label,
+                    output: address,
+                });
+
+                for &pat in items {
+                    asm_bound_pat(cx, pat, label)?;
+                }
+
+                Ok(PatOutcome::Refutable)
+            }
             BoundPatKind::TypedSequence {
                 type_match,
                 expr,
                 items,
-            } => todo!(),
+            } => {
+                let expr_use = cx.slot_mut(expr)?.use_summary();
+                let expr_output = cx.allocator.alloc_for(expr);
+
+                if expr_use.is_pending() {
+                    asm(cx, expr, expr_output)?;
+                }
+
+                match type_match {
+                    TypeMatch::BuiltIn { type_check } => cx.push(Inst::MatchBuiltIn {
+                        address: expr_output,
+                        type_check,
+                        label,
+                    }),
+                    TypeMatch::Type { type_hash } => cx.push(Inst::MatchType {
+                        address: expr_output,
+                        type_hash,
+                        label,
+                    }),
+                    TypeMatch::Variant {
+                        variant_hash,
+                        enum_hash,
+                        index,
+                    } => {
+                        let output = cx.allocator.next_address();
+
+                        cx.push(Inst::MatchVariant {
+                            address: expr_output,
+                            variant_hash,
+                            enum_hash,
+                            index,
+                            label,
+                            output,
+                        });
+                    }
+                }
+
+                for &pat in items {
+                    asm_bound_pat(cx, pat, label)?;
+                }
+
+                if expr_use.is_last() {
+                    cx.allocator.free_for(cx.span, expr)?;
+                }
+
+                Ok(PatOutcome::Refutable)
+            }
         })
     }
 
@@ -2498,11 +2699,12 @@ fn asm<'hir>(
     #[instrument]
     fn asm_unary<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         op: ExprUnOp,
         expr: Slot,
         output: AssemblyAddress,
     ) -> Result<()> {
-        let [address] = cx.addresses([expr], [output])?;
+        let [address] = cx.addresses(this, [expr], [output])?;
 
         match op {
             ExprUnOp::Neg => {
@@ -2608,6 +2810,7 @@ fn asm<'hir>(
     #[instrument]
     fn asm_binary<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         lhs: Slot,
         op: ast::BinOp,
         rhs: Slot,
@@ -2639,7 +2842,7 @@ fn asm<'hir>(
             }
         };
 
-        let [lhs, rhs] = cx.addresses([lhs, rhs], [output])?;
+        let [lhs, rhs] = cx.addresses(this, [lhs, rhs], [output])?;
 
         cx.push(Inst::Op {
             op,
@@ -3029,16 +3232,15 @@ fn asm<'hir>(
     #[instrument]
     fn asm_assign<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         binding: Binding,
         lhs: Slot,
         rhs: Slot,
     ) -> Result<()> {
-        let lhs_summary = cx.slot_mut(lhs)?.take_use();
-        let rhs_summary = cx.slot_mut(rhs)?.take_use();
+        let lhs_summary = cx.take_slot_use(lhs, this)?;
+        let rhs_summary = cx.take_slot_use(rhs, this)?;
 
         let lhs_output = cx.allocator.alloc_for(lhs);
-
-        dbg!(rhs_summary);
 
         if rhs_summary.is_only() {
             asm(cx, rhs, lhs_output)?;
@@ -3378,11 +3580,12 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
         let loc = Location::new(cx.source_id, span);
 
         if let Some(ast::PathKind::SelfValue) = hir.as_kind() {
-            let (binding, slot, lookup) = cx.scopes.lookup(loc, cx.scope, cx.q.visitor, SELF)?;
+            let (binding, slot, use_kind) = cx.scopes.lookup(loc, cx.scope, cx.q.visitor, SELF)?;
+
             return Ok(cx.insert_expr(ExprKind::Binding {
                 binding,
                 slot,
-                lookup,
+                use_kind,
             })?);
         }
 
@@ -3392,13 +3595,13 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
             if let Some(local) = named.as_local() {
                 let local = local.resolve(resolve_context!(cx.q))?;
 
-                if let Some((binding, slot, lookup)) =
+                if let Some((binding, slot, use_kind)) =
                     cx.scopes.try_lookup(loc, cx.scope, cx.q.visitor, local)?
                 {
                     return Ok(cx.insert_expr(ExprKind::Binding {
                         binding,
                         slot,
-                        lookup,
+                        use_kind,
                     })?);
                 }
             }
@@ -3440,16 +3643,16 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
     fn assign<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &'hir hir::ExprAssign<'hir>) -> Result<Slot> {
         let rhs = expr_value(cx, &hir.rhs)?;
 
-        let this_slot = expr_value(cx, &hir.lhs)?;
+        let this = expr_value(cx, &hir.lhs)?;
 
-        this_slot.map_expr(cx, |cx, kind| match kind {
+        this.map_expr(cx, |cx, kind| match kind {
             ExprKind::Binding {
                 binding,
                 slot,
-                lookup,
+                use_kind,
             } => {
                 // Handle syntactical reassignments.
-                if let Lookup::Same = lookup {
+                if let UseKind::Same = use_kind {
                     match cx.expr(rhs)?.kind {
                         ExprKind::Binding { slot, .. } => {
                             cx.free_expr(rhs)?;
@@ -3468,7 +3671,7 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
                 Ok(ExprKind::Assign {
                     binding,
                     lhs: slot,
-                    lookup,
+                    use_kind,
                     rhs,
                 })
             }
@@ -3485,11 +3688,11 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
     /// Assemble a call expression.
     #[instrument]
     fn call<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::ExprCall<'hir>) -> Result<Slot> {
-        let this_slot = expr_value(cx, hir.expr)?;
+        let this = expr_value(cx, hir.expr)?;
 
-        this_slot.map_expr(cx, |cx, kind| match kind {
+        this.map_expr(cx, |cx, kind| match kind {
             ExprKind::Address { .. } | ExprKind::Binding { .. } => Ok(ExprKind::CallAddress {
-                address: this_slot,
+                address: this,
                 args: iter!(cx; hir.args, |hir| expr_value(cx, hir)?),
             }),
             ExprKind::Meta { meta, named, .. } => {
@@ -3771,7 +3974,7 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
                     let captures = captures.as_ref();
 
                     let args = iter!(cx; captures, |ident| {
-                        let (binding, slot, lookup) = cx.scopes.lookup(
+                        let (binding, slot, use_kind) = cx.scopes.lookup(
                             Location::new(cx.source_id, cx.span),
                             cx.scope,
                             cx.q.visitor,
@@ -3781,7 +3984,7 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
                         cx.insert_expr(ExprKind::Binding {
                             binding,
                             slot,
-                            lookup,
+                            use_kind,
                         })?
                     });
 
@@ -3884,7 +4087,7 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
                     todo!()
                 }
 
-                let (binding, slot, lookup) = cx.scopes.lookup(
+                let (binding, slot, use_kind) = cx.scopes.lookup(
                     Location::new(cx.source_id, cx.span),
                     cx.scope,
                     cx.q.visitor,
@@ -3894,7 +4097,7 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
                 cx.insert_expr(ExprKind::Binding {
                     binding,
                     slot,
-                    lookup,
+                    use_kind,
                 })?
             });
 
@@ -4639,9 +4842,7 @@ fn bind_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, pat: Pat<'hir>, expr: Slot) -> Result
         // in the array to be freed up.
         let items = iter!(cx; patterns.iter().rev(), |pat| {
             cx.allocator.free_array_item(cx.span)?;
-
-            let expr = todo!();
-
+            let expr = cx.insert_expr(ExprKind::Address { address: cx.allocator.array_address() })?;
             bind_pat(
                 cx,
                 *pat,
@@ -4650,6 +4851,7 @@ fn bind_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, pat: Pat<'hir>, expr: Slot) -> Result
         });
 
         Ok(cx.bound_pat(BoundPatKind::Vec {
+            address,
             expr,
             is_open,
             items,
@@ -4765,19 +4967,19 @@ fn bind_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, pat: Pat<'hir>, expr: Slot) -> Result
                     _ => {}
                 }
 
-                let address = cx.allocator.array_index();
-
+                let address = cx.allocator.array_address();
                 cx.allocator.alloc_array_items(patterns.len());
 
                 // NB we bind the arguments in reverse to allow for higher elements
                 // in the array to be freed up for subsequent bindings.
                 let items = iter!(cx; patterns.iter().rev(), |pat| {
                     cx.allocator.free_array_item(cx.span)?;
-                    let expr = todo!();
+                    let expr = cx.insert_expr(ExprKind::Address { address: cx.allocator.array_address() })?;
                     bind_pat(cx, *pat, expr)?
                 });
 
                 Ok(cx.bound_pat(BoundPatKind::AnonymousObject {
+                    address,
                     expr,
                     slot,
                     is_open,
@@ -4946,36 +5148,43 @@ fn struct_match_for<'a>(
 /// Walk over an expression to modify each expression that it touches.
 fn walk_expr_slots<T>(kind: ExprKind<'_>, mut op: T) -> Result<()>
 where
-    T: FnMut(Slot, Lookup) -> Result<()>,
+    T: FnMut(Slot, UseKind) -> Result<()>,
 {
     match kind {
         ExprKind::Empty => {}
         ExprKind::Address { .. } => {}
-        ExprKind::Binding { slot, lookup, .. } => {
+        ExprKind::Binding {
+            slot,
+            use_kind: lookup,
+            ..
+        } => {
             op(slot, lookup)?;
         }
         ExprKind::Assign {
-            lhs, lookup, rhs, ..
+            lhs,
+            use_kind: lookup,
+            rhs,
+            ..
         } => {
             op(lhs, lookup)?;
-            op(rhs, Lookup::Same)?;
+            op(rhs, UseKind::Same)?;
         }
         ExprKind::TupleFieldAccess { lhs, .. } => {
-            op(lhs, Lookup::Same)?;
+            op(lhs, UseKind::Same)?;
         }
         ExprKind::StructFieldAccess { lhs, .. } => {
-            op(lhs, Lookup::Same)?;
+            op(lhs, UseKind::Same)?;
         }
         ExprKind::StructFieldAccessGeneric { lhs, .. } => {
-            op(lhs, Lookup::Same)?;
+            op(lhs, UseKind::Same)?;
         }
         ExprKind::AssignStructField { lhs, rhs, .. } => {
-            op(lhs, Lookup::Same)?;
-            op(rhs, Lookup::Same)?;
+            op(lhs, UseKind::Same)?;
+            op(rhs, UseKind::Same)?;
         }
         ExprKind::AssignTupleField { lhs, rhs, .. } => {
-            op(lhs, Lookup::Same)?;
-            op(rhs, Lookup::Same)?;
+            op(lhs, UseKind::Same)?;
+            op(rhs, UseKind::Same)?;
         }
         ExprKind::Block { .. } => {
             // NB: statements in a block intentionally has *no* users, to
@@ -4983,98 +5192,98 @@ where
             // they have side effects.
         }
         ExprKind::Let { expr, .. } => {
-            op(expr, Lookup::Same)?;
+            op(expr, UseKind::Same)?;
         }
         ExprKind::Store { .. } => {}
         ExprKind::Bytes { .. } => {}
         ExprKind::String { .. } => {}
         ExprKind::Unary { expr, .. } => {
-            op(expr, Lookup::Same)?;
+            op(expr, UseKind::Same)?;
         }
         ExprKind::BinaryAssign { lhs, rhs, .. } => {
-            op(lhs, Lookup::Same)?;
-            op(rhs, Lookup::Same)?;
+            op(lhs, UseKind::Same)?;
+            op(rhs, UseKind::Same)?;
         }
         ExprKind::BinaryConditional { lhs, rhs, .. } => {
-            op(lhs, Lookup::Same)?;
-            op(rhs, Lookup::Same)?;
+            op(lhs, UseKind::Same)?;
+            op(rhs, UseKind::Same)?;
         }
         ExprKind::Binary { lhs, rhs, .. } => {
-            op(lhs, Lookup::Same)?;
-            op(rhs, Lookup::Same)?;
+            op(lhs, UseKind::Same)?;
+            op(rhs, UseKind::Same)?;
         }
         ExprKind::Index { target, .. } => {
-            op(target, Lookup::Same)?;
+            op(target, UseKind::Same)?;
         }
         ExprKind::Meta { .. } => {}
         ExprKind::Struct { exprs, .. } => {
             for &slot in exprs {
-                op(slot, Lookup::Same)?;
+                op(slot, UseKind::Same)?;
             }
         }
         ExprKind::Tuple { items } => {
             for &slot in items {
-                op(slot, Lookup::Same)?;
+                op(slot, UseKind::Same)?;
             }
         }
         ExprKind::Vec { items } => {
             for &slot in items {
-                op(slot, Lookup::Same)?;
+                op(slot, UseKind::Same)?;
             }
         }
         ExprKind::Range { from, to, .. } => {
-            op(from, Lookup::Same)?;
-            op(to, Lookup::Same)?;
+            op(from, UseKind::Same)?;
+            op(to, UseKind::Same)?;
         }
         ExprKind::Option { value } => {
             if let Some(slot) = value {
-                op(slot, Lookup::Same)?;
+                op(slot, UseKind::Same)?;
             }
         }
         ExprKind::CallAddress { address, args } => {
-            op(address, Lookup::Same)?;
+            op(address, UseKind::Same)?;
 
             for &slot in args {
-                op(slot, Lookup::Same)?;
+                op(slot, UseKind::Same)?;
             }
         }
         ExprKind::CallHash { args, .. } => {
             for &slot in args {
-                op(slot, Lookup::Same)?;
+                op(slot, UseKind::Same)?;
             }
         }
         ExprKind::CallInstance { lhs, args, .. } => {
-            op(lhs, Lookup::Same)?;
+            op(lhs, UseKind::Same)?;
 
             for &slot in args {
-                op(slot, Lookup::Same)?;
+                op(slot, UseKind::Same)?;
             }
         }
         ExprKind::CallExpr { expr, args } => {
-            op(expr, Lookup::Same)?;
+            op(expr, UseKind::Same)?;
 
             for &slot in args {
-                op(slot, Lookup::Same)?;
+                op(slot, UseKind::Same)?;
             }
         }
         ExprKind::Yield { expr } => {
             if let Some(slot) = expr {
-                op(slot, Lookup::Same)?;
+                op(slot, UseKind::Same)?;
             }
         }
         ExprKind::Await { expr } => {
-            op(expr, Lookup::Same)?;
+            op(expr, UseKind::Same)?;
         }
         ExprKind::Return { expr } => {
-            op(expr, Lookup::Same)?;
+            op(expr, UseKind::Same)?;
         }
         ExprKind::Try { expr } => {
-            op(expr, Lookup::Same)?;
+            op(expr, UseKind::Same)?;
         }
         ExprKind::Function { .. } => {}
         ExprKind::Closure { captures, .. } => {
             for &slot in captures {
-                op(slot, Lookup::Same)?;
+                op(slot, UseKind::Same)?;
             }
         }
     }

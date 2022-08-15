@@ -778,6 +778,7 @@ where
             Try { slot expr },
             Function { lit hash },
             Closure { lit hash, array captures },
+            Loop { lit condition, slot body, lit start, lit end, slot output },
         }
     }
 
@@ -1079,6 +1080,29 @@ enum ExprKind<'hir> {
         /// Captures to this closure.
         captures: &'hir [Slot],
     },
+    Loop {
+        /// The condition to advance the loop.
+        condition: LoopCondition<'hir>,
+        /// The body of the loop.
+        body: Slot,
+        /// The start label to use.
+        start: Label,
+        /// The end label.
+        end: Label,
+        /// The output slot.
+        output: Slot,
+    },
+}
+
+/// A loop condition.
+#[derive(Debug, Clone, Copy)]
+enum LoopCondition<'hir> {
+    /// A forever loop condition.
+    Forever,
+    /// A pattern condition.
+    Condition { expr: Slot, pat: Pat<'hir> },
+    /// An iterator condition.
+    Iterator { iter: Slot, binding: Pat<'hir> },
 }
 
 /// An expression that can be assembled.
@@ -1473,7 +1497,7 @@ impl<'hir> Scopes<'hir> {
         label: Option<Name>,
         start: Label,
         end: Label,
-        output: AssemblyAddress,
+        output: Slot,
     ) -> Result<ScopeId> {
         self.push_inner(
             span,
@@ -1675,7 +1699,7 @@ struct LoopControlFlow {
     label: Option<Name>,
     start: Label,
     end: Label,
-    output: AssemblyAddress,
+    output: Slot,
 }
 
 /// The kind of lookup that was performed.
@@ -1823,7 +1847,7 @@ impl<'hir> SlotStorage<'hir> {
 
             return Err(CompileError::msg(
                 span,
-                "cannot add user to slot {this:?} since it's sealed",
+                format_args!("cannot add user to slot {this:?} since it's sealed"),
             ));
         }
 
@@ -2181,6 +2205,7 @@ fn has_side_effects(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<bool> {
         ExprKind::Try { .. } => Ok(true),
         ExprKind::Function { .. } => Ok(true),
         ExprKind::Closure { .. } => Ok(true),
+        ExprKind::Loop { .. } => Ok(true),
     }
 }
 
@@ -2227,7 +2252,7 @@ fn asm<'hir>(
             asm_unary(cx, this, op, expr, output)?;
         }
         ExprKind::BinaryAssign { lhs, op, rhs } => {
-            asm_binary_assign(cx, lhs, op, rhs, output)?;
+            asm_binary_assign(cx, this, lhs, op, rhs, output)?;
         }
         ExprKind::BinaryConditional { lhs, op, rhs } => {
             asm_binary_conditional(cx, lhs, op, rhs, output)?;
@@ -2236,7 +2261,7 @@ fn asm<'hir>(
             asm_binary(cx, this, lhs, op, rhs, output)?;
         }
         ExprKind::Index { target, index } => {
-            asm_index(cx, target, index, output)?;
+            asm_index(cx, this, target, index, output)?;
         }
         ExprKind::Meta { meta, needs, named } => {
             asm_meta(cx, meta, needs, named, output)?;
@@ -2248,7 +2273,7 @@ fn asm<'hir>(
             asm_vec(cx, items, output)?;
         }
         ExprKind::Range { from, limits, to } => {
-            asm_range(cx, from, limits, to, output)?;
+            asm_range(cx, this, from, limits, to, output)?;
         }
         ExprKind::Tuple { items } => {
             asm_tuple(cx, items, output)?;
@@ -2309,6 +2334,15 @@ fn asm<'hir>(
         }
         ExprKind::Closure { hash, captures } => {
             asm_closure(cx, captures, hash, output)?;
+        }
+        ExprKind::Loop {
+            condition,
+            body,
+            start,
+            end,
+            output,
+        } => {
+            asm_loop(cx, condition, body, start, end, output)?;
         }
     }
 
@@ -2728,12 +2762,13 @@ fn asm<'hir>(
     #[instrument]
     fn asm_binary_assign<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         lhs: Slot,
         op: ast::BinOp,
         rhs: Slot,
         output: AssemblyAddress,
     ) -> Result<()> {
-        let lhs = cx.allocator.alloc_for(lhs);
+        let [lhs, rhs] = cx.addresses(this, [lhs, rhs], [output])?;
 
         let op = match op {
             ast::BinOp::AddAssign(..) => InstAssignOp::Add,
@@ -2752,8 +2787,8 @@ fn asm<'hir>(
         };
 
         cx.push(Inst::Assign {
-            lhs,
-            rhs: output,
+            lhs: *lhs,
+            rhs: *rhs,
             target: InstTarget::Offset,
             op,
             // NB: while an assign operation doesn't output anything, this
@@ -2768,6 +2803,7 @@ fn asm<'hir>(
             output,
         });
 
+        cx.free_iter([lhs, rhs])?;
         Ok(())
     }
 
@@ -2858,19 +2894,20 @@ fn asm<'hir>(
     #[instrument]
     fn asm_index<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         target: Slot,
         index: Slot,
         output: AssemblyAddress,
     ) -> Result<()> {
-        let index_output = cx.allocator.alloc();
-        asm(cx, target, output)?;
-        asm(cx, index, index_output)?;
+        let [address, index] = cx.addresses(this, [target, index], [output])?;
+
         cx.push(Inst::IndexGet {
-            address: output,
-            index: index_output,
+            address: *address,
+            index: *index,
             output,
         });
-        cx.allocator.free(cx.span, index_output)?;
+
+        cx.free_iter([address, index])?;
         Ok(())
     }
 
@@ -3074,23 +3111,22 @@ fn asm<'hir>(
     #[instrument]
     fn asm_range<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         from: Slot,
         limits: InstRangeLimits,
         to: Slot,
         output: AssemblyAddress,
     ) -> Result<()> {
-        let to_output = cx.allocator.alloc();
-        asm(cx, from, output)?;
-        asm(cx, from, to_output)?;
+        let [from, to] = cx.addresses(this, [from, to], [output])?;
 
         cx.push(Inst::Range {
-            from: output,
-            to: to_output,
+            from: *from,
+            to: *to,
             limits,
             output,
         });
 
-        cx.allocator.free(cx.span, to_output)?;
+        cx.free_iter([from, to])?;
         Ok(())
     }
 
@@ -3500,6 +3536,28 @@ fn asm<'hir>(
         array.free(cx)?;
         Ok(())
     }
+
+    /// Assemble a loop.
+    #[instrument]
+    fn asm_loop(
+        cx: &mut Ctxt<'_, '_>,
+        condition: LoopCondition<'_>,
+        body: Slot,
+        start: Label,
+        end: Label,
+        output: Slot,
+    ) -> Result<()> {
+        cx.label(start)?;
+
+        match condition {
+            LoopCondition::Forever => {}
+            LoopCondition::Condition { expr, pat } => {}
+            LoopCondition::Iterator { iter, binding } => {}
+        }
+
+        cx.label(end)?;
+        todo!()
+    }
 }
 
 /// Assemble a block.
@@ -3561,7 +3619,7 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
             hir::ExprKind::Range(hir) => range(cx, hir)?,
             hir::ExprKind::Group(hir) => expr(cx, hir, needs)?,
             hir::ExprKind::Select(..) => todo!(),
-            hir::ExprKind::Loop(..) => todo!(),
+            hir::ExprKind::Loop(hir) => loop_(cx, hir)?,
             hir::ExprKind::Break(..) => todo!(),
             hir::ExprKind::Continue(..) => todo!(),
             hir::ExprKind::Let(..) => todo!(),
@@ -4356,6 +4414,59 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
                 })?)
             }
         }
+    }
+
+    /// Convert a loop.
+    #[instrument]
+    fn loop_<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::ExprLoop<'hir>) -> Result<Slot> {
+        let label = match hir.label {
+            Some(label) => Some(cx.scopes.name(label.resolve(resolve_context!(cx.q))?)),
+            None => None,
+        };
+
+        let start = cx.new_label("loop_start");
+        let end = cx.new_label("loop_end");
+        let output = cx.insert_expr(ExprKind::Empty)?;
+        let scope = cx
+            .scopes
+            .push_loop(cx.span, Some(cx.scope), label, start, end, output)?;
+
+        let condition = match hir.condition {
+            hir::LoopCondition::Forever => LoopCondition::Forever,
+            hir::LoopCondition::Condition { condition } => {
+                let (expr, pat) = match *condition {
+                    hir::Condition::Expr(hir) => {
+                        let lit = cx.insert_expr(ExprKind::Store {
+                            value: InstValue::Bool(true),
+                        })?;
+                        (expr_value(cx, hir)?, cx.insert_pat(PatKind::Lit { lit }))
+                    }
+                    hir::Condition::ExprLet(hir) => {
+                        let expr = expr_value(cx, hir.expr)?;
+                        let pat = cx.with_scope(scope, |cx| pat(cx, hir.pat))?;
+                        (expr, pat)
+                    }
+                };
+
+                LoopCondition::Condition { expr, pat }
+            }
+            hir::LoopCondition::Iterator { binding, iter } => {
+                let iter = expr_value(cx, iter)?;
+                let binding = cx.with_scope(scope, |cx| pat(cx, binding))?;
+                LoopCondition::Iterator { binding, iter }
+            }
+        };
+
+        let body = cx.with_scope(scope, |cx| block(cx, hir.body))?;
+
+        cx.scopes.pop(cx.span, scope)?;
+
+        Ok(cx.insert_expr(ExprKind::Loop {
+            condition,
+            body,
+            start,
+            end,
+        })?)
     }
 }
 
@@ -5153,20 +5264,13 @@ where
     match kind {
         ExprKind::Empty => {}
         ExprKind::Address { .. } => {}
-        ExprKind::Binding {
-            slot,
-            use_kind: lookup,
-            ..
-        } => {
-            op(slot, lookup)?;
+        ExprKind::Binding { slot, use_kind, .. } => {
+            op(slot, use_kind)?;
         }
         ExprKind::Assign {
-            lhs,
-            use_kind: lookup,
-            rhs,
-            ..
+            lhs, use_kind, rhs, ..
         } => {
-            op(lhs, lookup)?;
+            op(lhs, use_kind)?;
             op(rhs, UseKind::Same)?;
         }
         ExprKind::TupleFieldAccess { lhs, .. } => {
@@ -5285,6 +5389,9 @@ where
             for &slot in captures {
                 op(slot, UseKind::Same)?;
             }
+        }
+        ExprKind::Loop { output, .. } => {
+            op(output, UseKind::Same)?;
         }
     }
 

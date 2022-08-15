@@ -273,5 +273,5 @@ mod collections {
     pub use hashbrown::{hash_map, HashMap};
     pub use hashbrown::{hash_set, HashSet};
     pub use linked_hash_map::{self, LinkedHashMap};
-    pub use std::collections::{btree_map, BTreeMap};
+    pub use std::collections::{btree_map, btree_set, BTreeMap, BTreeSet};
 }

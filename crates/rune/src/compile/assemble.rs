@@ -22,6 +22,7 @@ use crate::hash::ParametersBuilder;
 use crate::hir;
 use crate::parse::{ParseErrorKind, Resolve};
 use crate::query::{Named, Query, QueryConstFn, Used};
+use crate::runtime::Protocol;
 use crate::runtime::{
     Address, AssemblyInst as Inst, ConstValue, InstAssignOp, InstOp, InstRangeLimits, InstTarget,
     InstValue, InstVariant, PanicReason, TypeCheck,
@@ -194,6 +195,21 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         self.allocator
     }
 
+    /// Get the inherent address for a slot, or error if none such exists.
+    fn address_for(&mut self, expr: Slot) -> Result<AssemblyAddress> {
+        self.allocator.address_for(self.span, expr)
+    }
+
+    /// Allocate an address for an expression.
+    fn alloc_for(&mut self, expr: Slot) -> Result<AssemblyAddress> {
+        Ok(self.allocator.alloc_for(expr))
+    }
+
+    /// Free the inherent allocation associated with the slot.
+    fn alloc_free_for(&mut self, slot: Slot) -> Result<()> {
+        self.allocator.alloc_free_for(self.span, slot)
+    }
+
     /// Access slot storage for the given slot.
     fn slot(&self, slot: Slot) -> Result<&SlotStorage<'hir>> {
         self.scopes.slot_storage(self.span, slot)
@@ -227,7 +243,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     /// Add a slot user with custom use kind.
     fn add_slot_user_with(&mut self, slot: Slot, user: Slot, use_kind: UseKind) -> Result<()> {
         let span = self.span;
-        self.slot_mut(slot)?.add_user(span, user, use_kind);
+        self.slot_mut(slot)?.add_user(span, user, use_kind)?;
         // We can now remove this slot from the set of useless slots.
         self.useless.remove(&slot);
         Ok(())
@@ -271,6 +287,17 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         // Mark current statement inserted as potentially useless to sweep it up later.
         self.useless.insert(this);
         self.scopes.insert_expr(self.span, kind)
+    }
+
+    /// Insert an expression with an assembly address.
+    fn insert_expr_with_address(
+        &mut self,
+        kind: ExprKind<'hir>,
+        address: AssemblyAddress,
+    ) -> Result<Slot> {
+        let slot = self.insert_expr(kind)?;
+        self.allocator.expr_to_slot.insert(slot, address);
+        Ok(slot)
     }
 
     /// Free an expression.
@@ -496,12 +523,14 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
             slot: Slot,
             user: Slot,
         ) -> Result<UsedAddress> {
-            let span = cx.span;
-            let slot_mut = cx.slot_mut(slot)?;
-            let used = slot_mut.take_use(span, user)?;
+            let expr = cx.slot(slot)?.expr;
+            let used = cx.take_slot_use(slot, user)?;
 
-            let address = match slot_mut.expr.kind {
-                ExprKind::Address { address } => UsedAddress::new(address, slot, used),
+            let address = match expr.kind {
+                ExprKind::Address => {
+                    let address = cx.alloc_for(expr.slot)?;
+                    UsedAddress::new(address, slot, used)
+                }
                 ExprKind::Binding {
                     slot: followed_slot,
                     ..
@@ -510,7 +539,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
                     let address = if let Some(address) = tmp.next() {
                         address
                     } else {
-                        cx.allocator.alloc_for(slot)
+                        cx.alloc_for(slot)?
                     };
 
                     if used.is_pending() {
@@ -529,7 +558,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     fn free_iter<const N: usize>(&mut self, allocs: [UsedAddress; N]) -> Result<()> {
         for alloc in allocs {
             if alloc.used.is_last() {
-                self.allocator.free_for(self.span, alloc.slot)?;
+                self.alloc_free_for(alloc.slot)?;
             }
         }
 
@@ -568,8 +597,8 @@ impl Deref for UsedAddress {
 #[instrument]
 pub(crate) fn closure_from_block<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &hir::Block<'hir>,
-    captures: &[CaptureMeta],
+    _: &hir::Block<'hir>,
+    _: &[CaptureMeta],
 ) -> Result<()> {
     todo!()
 }
@@ -578,8 +607,8 @@ pub(crate) fn closure_from_block<'hir>(
 #[instrument]
 pub(crate) fn closure_from_expr_closure<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    hir: &hir::ExprClosure<'hir>,
-    captures: &[CaptureMeta],
+    _: &hir::ExprClosure<'hir>,
+    _: &[CaptureMeta],
 ) -> Result<()> {
     todo!()
 }
@@ -609,12 +638,12 @@ pub(crate) fn fn_from_item_fn<'hir>(
 
                     let name = cx.scopes.name(SELF);
                     let address = AssemblyAddress::Bottom(index);
-                    let slot = cx.insert_expr(ExprKind::Address { address })?;
+                    let slot = cx.insert_expr_with_address(ExprKind::Empty, address)?;
                     cx.declare(name, slot)?;
                 }
                 hir::FnArg::Pat(hir) => {
                     let address = AssemblyAddress::Bottom(index);
-                    let slot = cx.insert_expr(ExprKind::Address { address })?;
+                    let slot = cx.insert_expr_with_address(ExprKind::Empty, address)?;
                     patterns.push((hir, slot));
                 }
             }
@@ -630,7 +659,7 @@ pub(crate) fn fn_from_item_fn<'hir>(
     cx.scopes.pop(span, scope)?;
     debug_stdout(cx, address)?;
 
-    let output = cx.allocator.alloc_for(address);
+    let output = cx.alloc_for(address)?;
     asm(cx, address, output)?;
     cx.push(Inst::Return { address: output });
     Ok(())
@@ -640,152 +669,173 @@ pub(crate) fn fn_from_item_fn<'hir>(
 fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
     let out = std::io::stdout();
     let mut out = out.lock();
-    debug(&mut out, cx, slot, 0)?;
-    Ok(())
-}
 
-/// Debug a slot.
-fn debug<O>(o: &mut O, cx: &mut Ctxt<'_, '_>, slot: Slot, indent: usize) -> Result<()>
-where
-    O: std::io::Write,
-{
-    let storage = cx.scopes.slot_storage(cx.span, slot)?;
-    let span = storage.expr.span;
-    let i = std::iter::repeat(' ').take(indent).collect::<String>();
-    let err = io_err(span);
-    let users = storage.users.clone();
-    let same = storage.same;
-    let branches = storage.branches;
-    let expr = storage.expr;
+    let mut visited = HashSet::new();
 
-    macro_rules! field {
-        ($pad:literal, pat, $var:expr) => {
-            writeln!(o, "{i}{}{} = Pat {{", $pad, stringify!($var)).map_err(err)?;
-            debug_pat(o, cx, *$var, indent + 2 + $pad.len())?;
-            writeln!(o, "{i}{}}},", $pad).map_err(err)?;
-        };
-
-        ($pad:literal, slot, $var:expr) => {
-            writeln!(o, "{i}{}{} = {{", $pad, stringify!($var)).map_err(err)?;
-            debug(o, cx, $var, indent + 2 + $pad.len())?;
-            writeln!(o, "{i}{}}},", $pad).map_err(err)?;
-        };
-
-        ($pad:literal, lit, $var:expr) => {
-            writeln!(o, "{i}{}{} = {:?},", $pad, stringify!($var), $var).map_err(err)?;
-        };
-
-        ($pad:literal, binding, $var:expr) => {
-            writeln! {
-                o,
-                "{i}{}{} = {{ name = {name:?} }},",
-                $pad,
-                stringify!($var),
-                name = cx.scopes.name_to_string(span, $var.name)?
-            }
-            .map_err(err)?;
-        };
-
-        ($pad:literal, array, $var:expr) => {
-            let mut it = IntoIterator::into_iter($var);
-
-            let first = it.next();
-
-            if let Some(&slot) = first {
-                writeln!(o, "{i}{}{} = [", $pad, stringify!($var)).map_err(err)?;
-
-                debug(o, cx, slot, indent + 2 + $pad.len())?;
-
-                for &slot in it {
-                    debug(o, cx, slot, indent + 2 + $pad.len())?;
-                }
-
-                writeln!(o, "{i}{}],", $pad).map_err(err)?;
-            } else {
-                writeln!(o, "{i}{}{} = []", $pad, stringify!($var)).map_err(err)?;
-            }
-        };
-
-        ($pad:literal, option, $var:expr) => {
-            if let Some(slot) = $var {
-                writeln!(o, "{i}{}{} = Some(", $pad, stringify!($var)).map_err(err)?;
-                debug(o, cx, slot, indent + 2 + $pad.len())?;
-                writeln!(o, "{i}{}),", $pad).map_err(err)?;
-            } else {
-                writeln!(o, "{i}{}{} = None,", $pad, stringify!($var)).map_err(err)?;
-            }
-        };
-    }
-
-    macro_rules! variant {
-        ($name:ident { $($what:ident $field:ident),* }) => {{
-            writeln!(o, "{i}{}${} {{ same = {same:?}, branches = {branches:?}, users = {users:?} }} {{", stringify!($name), slot.index()).map_err(err)?;
-            $(field!("  ", $what, $field);)*
-            writeln!(o, "{i}}}").map_err(err)?;
-        }};
-
-        ($name:ident) => {{
-            writeln!(o, "{i}{}${} {{ same = {same:?}, branches = {branches:?}, users = {users:?} }},", stringify!($name), slot.index()).map_err(err)?;
-        }};
-    }
-
-    macro_rules! matches {
-        ($expr:expr, { $($name:ident $({ $($what:ident $field:ident),* $(,)? })?),* $(,)? }) => {{
-            match $expr {
-                $(
-                    ExprKind::$name { $($($field),*)* } => {
-                        variant!($name $({ $($what $field),* })*)
-                    }
-                )*
-            }
-        }};
-    }
-
-    matches! {
-        expr.kind, {
-            Empty,
-            Address { lit address },
-            Binding { binding binding, slot slot, lit use_kind },
-            TupleFieldAccess { slot lhs, lit index },
-            StructFieldAccess { slot lhs, lit field, lit hash },
-            StructFieldAccessGeneric { slot lhs, lit hash, lit generics },
-            Assign { binding binding, slot lhs, lit use_kind, slot rhs },
-            AssignStructField { slot lhs, lit field, slot rhs },
-            AssignTupleField { slot lhs, lit index, slot rhs },
-            Block { array statements, option tail },
-            Let { pat pat, slot expr },
-            Store { lit value },
-            Bytes { lit bytes },
-            String { lit string },
-            Unary { lit op, slot expr },
-            BinaryAssign { slot lhs, lit op, slot rhs },
-            BinaryConditional { slot lhs, lit op, slot rhs },
-            Binary { slot lhs, lit op, slot rhs },
-            Index { slot target, slot index },
-            Meta { lit meta, lit needs, lit named },
-            Struct { lit kind, array exprs },
-            Tuple { array items },
-            Vec { array items },
-            Range { slot from, lit limits, slot to },
-            Option { option value },
-            CallAddress { slot address, array args },
-            CallHash { lit hash, array args },
-            CallInstance { slot lhs, lit hash, array args },
-            CallExpr { slot expr, array args },
-            Yield { option expr },
-            Await { slot expr },
-            Return { slot expr },
-            Try { slot expr },
-            Function { lit hash },
-            Closure { lit hash, array captures },
-            Loop { lit condition, slot body, lit start, lit end, slot output },
-        }
-    }
-
+    debug(&mut out, cx, slot, 0, &mut visited)?;
     return Ok(());
 
+    /// Debug a slot.
+    fn debug<O>(
+        o: &mut O,
+        cx: &mut Ctxt<'_, '_>,
+        slot: Slot,
+        indent: usize,
+        visited: &mut HashSet<Slot>,
+    ) -> Result<()>
+    where
+        O: std::io::Write,
+    {
+        let i = std::iter::repeat(' ').take(indent).collect::<String>();
+        let storage = cx.scopes.slot_storage(cx.span, slot)?;
+        let span = storage.expr.span;
+        let err = io_err(span);
+        let users = storage.users.clone();
+        let same = storage.same;
+        let branches = storage.branches;
+        let expr = storage.expr;
+
+        if !visited.insert(slot) {
+            writeln!(o, "{i}{:?} *omitted*", slot).map_err(err)?;
+            return Ok(());
+        }
+
+        macro_rules! field {
+            ($pad:literal, pat, $var:expr) => {
+                writeln!(o, "{i}{}{} = Pat {{", $pad, stringify!($var)).map_err(err)?;
+                debug_pat(o, cx, *$var, indent + 2 + $pad.len(), visited)?;
+                writeln!(o, "{i}{}}},", $pad).map_err(err)?;
+            };
+
+            ($pad:literal, slot, $var:expr) => {
+                writeln!(o, "{i}{}{} = {{", $pad, stringify!($var)).map_err(err)?;
+                debug(o, cx, $var, indent + 2 + $pad.len(), visited)?;
+                writeln!(o, "{i}{}}},", $pad).map_err(err)?;
+            };
+
+            ($pad:literal, lit, $var:expr) => {
+                writeln!(o, "{i}{}{} = {:?},", $pad, stringify!($var), $var).map_err(err)?;
+            };
+
+            ($pad:literal, binding, $var:expr) => {
+                writeln! {
+                    o,
+                    "{i}{}{} = {{ name = {name:?} }},",
+                    $pad,
+                    stringify!($var),
+                    name = cx.scopes.name_to_string(span, $var.name)?
+                }
+                .map_err(err)?;
+            };
+
+            ($pad:literal, array, $var:expr) => {
+                let mut it = IntoIterator::into_iter($var);
+
+                let first = it.next();
+
+                if let Some(&slot) = first {
+                    writeln!(o, "{i}{}{} = [", $pad, stringify!($var)).map_err(err)?;
+
+                    debug(o, cx, slot, indent + 2 + $pad.len(), visited)?;
+
+                    for &slot in it {
+                        debug(o, cx, slot, indent + 2 + $pad.len(), visited)?;
+                    }
+
+                    writeln!(o, "{i}{}],", $pad).map_err(err)?;
+                } else {
+                    writeln!(o, "{i}{}{} = []", $pad, stringify!($var)).map_err(err)?;
+                }
+            };
+
+            ($pad:literal, [option $fn:ident], $var:expr) => {
+                if let Some(slot) = $var {
+                    writeln!(o, "{i}{}{} = Some(", $pad, stringify!($var)).map_err(err)?;
+                    $fn(o, cx, slot, indent + 2 + $pad.len(), visited)?;
+                    writeln!(o, "{i}{}),", $pad).map_err(err)?;
+                } else {
+                    writeln!(o, "{i}{}{} = None,", $pad, stringify!($var)).map_err(err)?;
+                }
+            };
+        }
+
+        macro_rules! variant {
+            ($name:ident) => {{
+                writeln!(o, "{i}{}${:?} {{ same = {same:?}, branches = {branches:?}, users = {users:?} }},", stringify!($name), slot).map_err(err)?;
+            }};
+
+            ($name:ident { $($what:tt $field:ident),* }) => {{
+                writeln!(o, "{i}{}${:?} {{ same = {same:?}, branches = {branches:?}, users = {users:?} }} {{", stringify!($name), slot).map_err(err)?;
+                $(field!("  ", $what, $field);)*
+                writeln!(o, "{i}}}").map_err(err)?;
+            }};
+        }
+
+        macro_rules! matches {
+            ($expr:expr, { $($name:ident $({ $($what:tt $field:ident),* $(,)? })?),* $(,)? }) => {{
+                match $expr {
+                    $(
+                        ExprKind::$name { $($($field),*)* } => {
+                            variant!($name $({ $($what $field),* })*)
+                        }
+                    )*
+                }
+            }};
+        }
+
+        matches! {
+            expr.kind, {
+                Empty,
+                Address,
+                Binding { binding binding, slot slot, lit use_kind },
+                TupleFieldAccess { slot lhs, lit index },
+                StructFieldAccess { slot lhs, lit field, lit hash },
+                StructFieldAccessGeneric { slot lhs, lit hash, lit generics },
+                Assign { binding binding, slot lhs, lit use_kind, slot rhs },
+                AssignStructField { slot lhs, lit field, slot rhs },
+                AssignTupleField { slot lhs, lit index, slot rhs },
+                Block { array statements, [option debug] tail },
+                Let { pat pat, slot expr },
+                Store { lit value },
+                Bytes { lit bytes },
+                String { lit string },
+                Unary { lit op, slot expr },
+                BinaryAssign { slot lhs, lit op, slot rhs },
+                BinaryConditional { slot lhs, lit op, slot rhs },
+                Binary { slot lhs, lit op, slot rhs },
+                Index { slot target, slot index },
+                Meta { lit meta, lit needs, lit named },
+                Struct { lit kind, array exprs },
+                Tuple { array items },
+                Vec { array items },
+                Range { slot from, lit limits, slot to },
+                Option { [option debug] value },
+                CallAddress { slot address, array args },
+                CallHash { lit hash, array args },
+                CallInstance { slot lhs, lit hash, array args },
+                CallExpr { slot expr, array args },
+                Yield { [option debug] expr },
+                Await { slot expr },
+                Return { slot expr },
+                Try { slot expr },
+                Function { lit hash },
+                Closure { lit hash, array captures },
+                Loop { lit condition, slot body, lit start, lit end },
+                Break { [option debug] value, lit label, slot loop_slot },
+            }
+        }
+
+        Ok(())
+    }
+
     /// Debug a patter.
-    fn debug_pat<O>(o: &mut O, cx: &mut Ctxt<'_, '_>, pat: Pat<'_>, indent: usize) -> Result<()>
+    fn debug_pat<O>(
+        o: &mut O,
+        cx: &mut Ctxt<'_, '_>,
+        pat: Pat<'_>,
+        indent: usize,
+        visited: &mut HashSet<Slot>,
+    ) -> Result<()>
     where
         O: std::io::Write,
     {
@@ -795,13 +845,13 @@ where
         macro_rules! field {
             ($pad:literal, pat, $var:expr) => {
                 writeln!(o, "{i}{}{} = Pat {{", $pad, stringify!($var)).map_err(err)?;
-                debug_pat(o, cx, $var, indent + 2);
+                debug_pat(o, cx, $var, indent + 2, visited);
                 writeln!(o, "{i}{}}},", $pad).map_err(err)?;
             };
 
             ($pad:literal, slot, $var:expr) => {
                 writeln!(o, "{i}{}{} = {{", $pad, stringify!($var)).map_err(err)?;
-                debug(o, cx, $var, indent + 2 + $pad.len())?;
+                debug(o, cx, $var, indent + 2 + $pad.len(), visited)?;
                 writeln!(o, "{i}{}}},", $pad).map_err(err)?;
             };
 
@@ -817,10 +867,10 @@ where
                 if let Some(&slot) = first {
                     writeln!(o, "{i}{}{} = [", $pad, stringify!($var)).map_err(err)?;
 
-                    $fun(o, cx, slot, indent + 2 + $pad.len())?;
+                    $fun(o, cx, slot, indent + 2 + $pad.len(), visited)?;
 
                     for &slot in it {
-                        $fun(o, cx, slot, indent + 2 + $pad.len())?;
+                        $fun(o, cx, slot, indent + 2 + $pad.len(), visited)?;
                     }
 
                     writeln!(o, "{i}{}],", $pad).map_err(err)?;
@@ -923,8 +973,8 @@ impl PatOutcome {
 enum ExprKind<'hir> {
     /// An empty value.
     Empty,
-    /// An expression referencing another address.
-    Address { address: AssemblyAddress },
+    /// An expression who's inherent address refers to a static address.
+    Address,
     /// An expression referencing a binding.
     Binding {
         binding: Binding,
@@ -1089,8 +1139,14 @@ enum ExprKind<'hir> {
         start: Label,
         /// The end label.
         end: Label,
-        /// The output slot.
-        output: Slot,
+    },
+    Break {
+        /// The value to break with.
+        value: Option<Slot>,
+        /// End label to jump to.
+        label: Label,
+        /// The loop slot to break to.
+        loop_slot: Slot,
     },
 }
 
@@ -1279,9 +1335,9 @@ impl Slot {
     {
         let expr = cx.scopes.expr(cx.span, self)?;
         let kind = map(cx, expr.kind)?;
-        cx.retain_expr_kind(kind, self)?;
         let replaced = mem::replace(&mut cx.scopes.expr_mut(cx.span, self)?.kind, kind);
         cx.release_expr_kind(replaced, self)?;
+        cx.retain_expr_kind(kind, self)?;
         Ok(self)
     }
 }
@@ -1355,40 +1411,6 @@ impl<'hir> Scopes<'hir> {
     /// Look up the mutable expression associated with the given slot.
     fn expr_mut(&mut self, span: Span, slot: Slot) -> Result<&mut Expr<'hir>> {
         Ok(&mut self.slot_mut(span, slot)?.expr)
-    }
-
-    /// Perform a shallow clone of a scope (without updating users) and return the id of the cloned scope.
-    fn clone_scope(&mut self, span: Span, scope: ScopeId) -> Result<ScopeId> {
-        let scope = match self.scopes.get(scope.0) {
-            Some(scope) => scope.clone(),
-            None => {
-                return Err(CompileError::msg(span, "missing scope"));
-            }
-        };
-
-        let scope = ScopeId(self.scopes.insert(scope));
-        Ok(scope)
-    }
-
-    /// Replace the contents of one scope with another.
-    fn replace_scope(&mut self, span: Span, old_scope: ScopeId, new_scope: ScopeId) -> Result<()> {
-        // NB: we're removing storage for the old scope.
-        let new_scope = match self.scopes.try_remove(new_scope.0) {
-            Some(scope) => scope,
-            None => {
-                return Err(CompileError::msg(span, "missing new scope"));
-            }
-        };
-
-        let old_scope = match self.scopes.get_mut(old_scope.0) {
-            Some(scope) => scope,
-            None => {
-                return Err(CompileError::msg(span, "missing old scope"));
-            }
-        };
-
-        *old_scope = new_scope;
-        Ok(())
     }
 
     /// Get the identifier for the next slot that will be inserted.
@@ -1497,7 +1519,7 @@ impl<'hir> Scopes<'hir> {
         label: Option<Name>,
         start: Label,
         end: Label,
-        output: Slot,
+        loop_slot: Slot,
     ) -> Result<ScopeId> {
         self.push_inner(
             span,
@@ -1506,7 +1528,7 @@ impl<'hir> Scopes<'hir> {
                 label,
                 start,
                 end,
-                output,
+                loop_slot,
             }),
         )
     }
@@ -1699,7 +1721,7 @@ struct LoopControlFlow {
     label: Option<Name>,
     start: Label,
     end: Label,
-    output: Slot,
+    loop_slot: Slot,
 }
 
 /// The kind of lookup that was performed.
@@ -1841,17 +1863,22 @@ struct SlotStorage<'hir> {
 
 impl<'hir> SlotStorage<'hir> {
     /// Add a single user.
-    fn add_user(&mut self, span: Span, slot: Slot, use_kind: UseKind) -> Result<()> {
-        if self.sealed.is_some() {
-            let this = self.expr.slot;
+    fn add_user(&mut self, span: Span, user: Slot, use_kind: UseKind) -> Result<()> {
+        let this = self.expr.slot;
 
+        if self.sealed.is_some() {
             return Err(CompileError::msg(
                 span,
-                format_args!("cannot add user to slot {this:?} since it's sealed"),
+                format_args!("cannot add user {user:?} to slot {this:?} since it's sealed"),
             ));
         }
 
-        self.users.insert(slot, use_kind);
+        if self.users.insert(user, use_kind).is_some() {
+            return Err(CompileError::msg(
+                span,
+                format_args!("cannot add user {user:?} to slot {this:?} since it already exists"),
+            ));
+        }
 
         match use_kind {
             UseKind::Same => {
@@ -2019,6 +2046,18 @@ impl Allocator {
     }
 
     /// Allocate a new output address slotted by the given expression address.
+    fn address_for(&mut self, span: Span, slot: Slot) -> Result<AssemblyAddress> {
+        if let Some(address) = self.expr_to_slot.get(&slot) {
+            return Ok(*address);
+        }
+
+        Err(CompileError::msg(
+            span,
+            format_args!("no inherent address allocated for slot {slot:?}"),
+        ))
+    }
+
+    /// Allocate a new output address slotted by the given expression address.
     fn alloc_for(&mut self, expr: Slot) -> AssemblyAddress {
         if let Some(address) = self.expr_to_slot.get(&expr) {
             return *address;
@@ -2030,7 +2069,7 @@ impl Allocator {
     }
 
     /// Free the implicit address associated with the given slot.
-    fn free_for(&mut self, span: Span, slot: Slot) -> Result<()> {
+    fn alloc_free_for(&mut self, span: Span, slot: Slot) -> Result<()> {
         // NB: We make freeing optional instead of a hard error, since we might
         // call this function even if an address has not been allocated for the
         // slot.
@@ -2206,147 +2245,158 @@ fn has_side_effects(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<bool> {
         ExprKind::Function { .. } => Ok(true),
         ExprKind::Closure { .. } => Ok(true),
         ExprKind::Loop { .. } => Ok(true),
+        ExprKind::Break { .. } => Ok(true),
     }
 }
 
 /// Assemble the given address.
+#[instrument]
 fn asm<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
     address: Slot,
     output: AssemblyAddress,
 ) -> Result<ExprOutcome> {
-    let slot = cx.scopes.slot_mut(cx.span, address)?;
+    let slot_mut = cx.scopes.slot_mut(cx.span, address)?;
 
-    if !slot.pending {
+    if !slot_mut.pending {
         return Err(CompileError::msg(
-            slot.expr.span,
+            slot_mut.expr.span,
             "slot {slot:?} is being built more than once",
         ));
     }
 
-    slot.pending = false;
-    let this = slot.expr.slot;
+    slot_mut.pending = false;
+    let expr = slot_mut.expr;
+    let this = expr.slot;
 
-    match slot.expr.kind {
-        ExprKind::Empty => {}
-        ExprKind::Address { address } => {
-            asm_address(cx, address, output);
+    return cx.with_span(expr.span, |cx| {
+        match expr.kind {
+            ExprKind::Empty => {}
+            ExprKind::Address => {
+                asm_address(cx, this, output)?;
+            }
+            ExprKind::Binding { binding, slot, .. } => {
+                asm_binding(cx, this, binding, slot, output)?;
+            }
+            ExprKind::Block { statements, tail } => {
+                asm_block(cx, statements, tail, output)?;
+            }
+            ExprKind::Let { pat, expr } => asm_let(cx, *pat, expr)?,
+            ExprKind::Store { value } => {
+                asm_store(cx, value, output)?;
+            }
+            ExprKind::Bytes { bytes } => {
+                asm_bytes(cx, bytes, output)?;
+            }
+            ExprKind::String { string } => {
+                asm_string(cx, string, output)?;
+            }
+            ExprKind::Unary { op, expr } => {
+                asm_unary(cx, this, op, expr, output)?;
+            }
+            ExprKind::BinaryAssign { lhs, op, rhs } => {
+                asm_binary_assign(cx, this, lhs, op, rhs, output)?;
+            }
+            ExprKind::BinaryConditional { lhs, op, rhs } => {
+                asm_binary_conditional(cx, lhs, op, rhs, output)?;
+            }
+            ExprKind::Binary { lhs, op, rhs } => {
+                asm_binary(cx, this, lhs, op, rhs, output)?;
+            }
+            ExprKind::Index { target, index } => {
+                asm_index(cx, this, target, index, output)?;
+            }
+            ExprKind::Meta { meta, needs, named } => {
+                asm_meta(cx, meta, needs, named, output)?;
+            }
+            ExprKind::Struct { kind, exprs } => {
+                asm_struct(cx, kind, exprs, output)?;
+            }
+            ExprKind::Vec { items } => {
+                asm_vec(cx, items, output)?;
+            }
+            ExprKind::Range { from, limits, to } => {
+                asm_range(cx, this, from, limits, to, output)?;
+            }
+            ExprKind::Tuple { items } => {
+                asm_tuple(cx, items, output)?;
+            }
+            ExprKind::Option { value } => {
+                asm_option(cx, value, output)?;
+            }
+            ExprKind::TupleFieldAccess { lhs, index } => {
+                asm_tuple_field_access(cx, lhs, index, output)?;
+            }
+            ExprKind::StructFieldAccess { lhs, field, .. } => {
+                asm_struct_field_access(cx, lhs, field, output)?;
+            }
+            ExprKind::StructFieldAccessGeneric { .. } => {
+                return Err(cx.error(CompileErrorKind::ExpectedExpr));
+            }
+            ExprKind::Assign {
+                binding, lhs, rhs, ..
+            } => {
+                asm_assign(cx, this, binding, lhs, rhs)?;
+            }
+            ExprKind::AssignStructField { lhs, field, rhs } => {
+                asm_assign_struct_field(cx, lhs, field, rhs, output)?;
+            }
+            ExprKind::AssignTupleField { lhs, index, rhs } => {
+                asm_assign_tuple_field(cx, lhs, index, rhs, output)?;
+            }
+            ExprKind::CallAddress {
+                address: function,
+                args,
+            } => {
+                asm_call_address(cx, function, args, output)?;
+            }
+            ExprKind::CallHash { hash, args } => {
+                asm_call_hash(cx, args, hash, output)?;
+            }
+            ExprKind::CallInstance { lhs, hash, args } => {
+                asm_call_instance(cx, lhs, args, hash, output)?;
+            }
+            ExprKind::CallExpr { expr, args } => {
+                asm_call_expr(cx, expr, args, output)?;
+            }
+            ExprKind::Yield { expr } => {
+                asm_yield(cx, expr, output)?;
+            }
+            ExprKind::Await { expr } => {
+                asm_await(cx, expr, output)?;
+            }
+            ExprKind::Return { expr } => {
+                asm_return(cx, expr, output)?;
+                return Ok(ExprOutcome::Unreachable);
+            }
+            ExprKind::Try { expr } => {
+                asm_try(cx, expr, output)?;
+            }
+            ExprKind::Function { hash } => {
+                asm_function(cx, hash, output);
+            }
+            ExprKind::Closure { hash, captures } => {
+                asm_closure(cx, captures, hash, output)?;
+            }
+            ExprKind::Loop {
+                condition,
+                body,
+                start,
+                end,
+            } => {
+                asm_loop(cx, this, condition, body, start, end, output)?;
+            }
+            ExprKind::Break {
+                value,
+                label,
+                loop_slot,
+            } => {
+                asm_break(cx, this, value, label, loop_slot, output)?;
+            }
         }
-        ExprKind::Binding { binding, slot, .. } => {
-            asm_binding(cx, this, binding, slot, output)?;
-        }
-        ExprKind::Block { statements, tail } => {
-            asm_block(cx, statements, tail, output)?;
-        }
-        ExprKind::Let { pat, expr } => asm_let(cx, *pat, expr)?,
-        ExprKind::Store { value } => {
-            asm_store(cx, value, output)?;
-        }
-        ExprKind::Bytes { bytes } => {
-            asm_bytes(cx, bytes, output)?;
-        }
-        ExprKind::String { string } => {
-            asm_string(cx, string, output)?;
-        }
-        ExprKind::Unary { op, expr } => {
-            asm_unary(cx, this, op, expr, output)?;
-        }
-        ExprKind::BinaryAssign { lhs, op, rhs } => {
-            asm_binary_assign(cx, this, lhs, op, rhs, output)?;
-        }
-        ExprKind::BinaryConditional { lhs, op, rhs } => {
-            asm_binary_conditional(cx, lhs, op, rhs, output)?;
-        }
-        ExprKind::Binary { lhs, op, rhs } => {
-            asm_binary(cx, this, lhs, op, rhs, output)?;
-        }
-        ExprKind::Index { target, index } => {
-            asm_index(cx, this, target, index, output)?;
-        }
-        ExprKind::Meta { meta, needs, named } => {
-            asm_meta(cx, meta, needs, named, output)?;
-        }
-        ExprKind::Struct { kind, exprs } => {
-            asm_struct(cx, kind, exprs, output)?;
-        }
-        ExprKind::Vec { items } => {
-            asm_vec(cx, items, output)?;
-        }
-        ExprKind::Range { from, limits, to } => {
-            asm_range(cx, this, from, limits, to, output)?;
-        }
-        ExprKind::Tuple { items } => {
-            asm_tuple(cx, items, output)?;
-        }
-        ExprKind::Option { value } => {
-            asm_option(cx, value, output)?;
-        }
-        ExprKind::TupleFieldAccess { lhs, index } => {
-            asm_tuple_field_access(cx, lhs, index, output)?;
-        }
-        ExprKind::StructFieldAccess { lhs, field, .. } => {
-            asm_struct_field_access(cx, lhs, field, output)?;
-        }
-        ExprKind::StructFieldAccessGeneric { .. } => {
-            return Err(cx.error(CompileErrorKind::ExpectedExpr));
-        }
-        ExprKind::Assign {
-            binding, lhs, rhs, ..
-        } => {
-            asm_assign(cx, this, binding, lhs, rhs)?;
-        }
-        ExprKind::AssignStructField { lhs, field, rhs } => {
-            asm_assign_struct_field(cx, lhs, field, rhs, output)?;
-        }
-        ExprKind::AssignTupleField { lhs, index, rhs } => {
-            asm_assign_tuple_field(cx, lhs, index, rhs, output)?;
-        }
-        ExprKind::CallAddress {
-            address: function,
-            args,
-        } => {
-            asm_call_address(cx, function, args, output)?;
-        }
-        ExprKind::CallHash { hash, args } => {
-            asm_call_hash(cx, args, hash, output)?;
-        }
-        ExprKind::CallInstance { lhs, hash, args } => {
-            asm_call_instance(cx, lhs, args, hash, output)?;
-        }
-        ExprKind::CallExpr { expr, args } => {
-            asm_call_expr(cx, expr, args, output)?;
-        }
-        ExprKind::Yield { expr } => {
-            asm_yield(cx, expr, output)?;
-        }
-        ExprKind::Await { expr } => {
-            asm_await(cx, expr, output)?;
-        }
-        ExprKind::Return { expr } => {
-            asm_return(cx, expr, output)?;
-            return Ok(ExprOutcome::Unreachable);
-        }
-        ExprKind::Try { expr } => {
-            asm_try(cx, expr, output)?;
-        }
-        ExprKind::Function { hash } => {
-            asm_function(cx, hash, output);
-        }
-        ExprKind::Closure { hash, captures } => {
-            asm_closure(cx, captures, hash, output)?;
-        }
-        ExprKind::Loop {
-            condition,
-            body,
-            start,
-            end,
-            output,
-        } => {
-            asm_loop(cx, condition, body, start, end, output)?;
-        }
-    }
 
-    return Ok(ExprOutcome::Output);
+        Ok(ExprOutcome::Output)
+    });
 
     /// Allocate space for the specified array.
     fn asm_array<'hir, I>(cx: &mut Ctxt<'_, 'hir>, expressions: I) -> Result<ArrayAddress>
@@ -2369,12 +2419,16 @@ fn asm<'hir>(
     #[instrument]
     fn asm_address<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
-        address: AssemblyAddress,
+        this: Slot,
         output: AssemblyAddress,
-    ) {
+    ) -> Result<()> {
+        let address = cx.address_for(this)?;
+
         if address != output {
             cx.push(Inst::Copy { address, output });
         }
+
+        Ok(())
     }
 
     #[instrument]
@@ -2394,7 +2448,7 @@ fn asm<'hir>(
             return Ok(());
         }
 
-        let address = cx.allocator.alloc_for(slot);
+        let address = cx.alloc_for(slot)?;
 
         if user.is_pending() {
             asm(cx, slot, address)?;
@@ -2501,9 +2555,9 @@ fn asm<'hir>(
                     // address and replace forward expressions with references
                     // to it.
                     _ => {
-                        let output = cx.allocator.alloc_for(name_expr);
+                        let output = cx.alloc_for(name_expr)?;
                         asm(cx, expr, output)?;
-                        cx.expr_mut(name_expr)?.kind = ExprKind::Address { address: output };
+                        cx.expr_mut(name_expr)?.kind = ExprKind::Address;
                     }
                 }
 
@@ -2511,7 +2565,7 @@ fn asm<'hir>(
             }
             BoundPatKind::Lit { lit, expr } => {
                 let user = cx.slot_mut(expr)?.use_summary();
-                let address = cx.allocator.alloc_for(expr);
+                let address = cx.alloc_for(expr)?;
 
                 if user.is_pending() {
                     asm(cx, expr, address)?;
@@ -2547,7 +2601,7 @@ fn asm<'hir>(
                 }
 
                 if user.is_last() {
-                    cx.allocator.free_for(cx.span, expr)?;
+                    cx.alloc_free_for(expr)?;
                 }
 
                 Ok(PatOutcome::Refutable)
@@ -2559,7 +2613,7 @@ fn asm<'hir>(
                 items,
             } => {
                 let expr_use = cx.slot_mut(expr)?.use_summary();
-                let expr_output = cx.allocator.alloc_for(expr);
+                let expr_output = cx.alloc_for(expr)?;
 
                 if expr_use.is_pending() {
                     asm(cx, expr, expr_output)?;
@@ -2579,7 +2633,7 @@ fn asm<'hir>(
                 }
 
                 if expr_use.is_last() {
-                    cx.allocator.free_for(cx.span, expr)?;
+                    cx.alloc_free_for(expr)?;
                 }
 
                 Ok(PatOutcome::Refutable)
@@ -2591,7 +2645,7 @@ fn asm<'hir>(
                 items,
             } => {
                 let expr_use = cx.slot_mut(expr)?.use_summary();
-                let expr_output = cx.allocator.alloc_for(expr);
+                let expr_output = cx.alloc_for(expr)?;
 
                 if expr_use.is_pending() {
                     asm(cx, expr, expr_output)?;
@@ -2611,7 +2665,7 @@ fn asm<'hir>(
                 }
 
                 if expr_use.is_last() {
-                    cx.allocator.free_for(cx.span, expr)?;
+                    cx.alloc_free_for(expr)?;
                 }
 
                 Ok(PatOutcome::Refutable)
@@ -2624,7 +2678,7 @@ fn asm<'hir>(
                 items,
             } => {
                 let expr_use = cx.slot_mut(expr)?.use_summary();
-                let expr_output = cx.allocator.alloc_for(expr);
+                let expr_output = cx.alloc_for(expr)?;
 
                 if expr_use.is_pending() {
                     asm(cx, expr, expr_output)?;
@@ -2650,7 +2704,7 @@ fn asm<'hir>(
                 items,
             } => {
                 let expr_use = cx.slot_mut(expr)?.use_summary();
-                let expr_output = cx.allocator.alloc_for(expr);
+                let expr_output = cx.alloc_for(expr)?;
 
                 if expr_use.is_pending() {
                     asm(cx, expr, expr_output)?;
@@ -2690,7 +2744,7 @@ fn asm<'hir>(
                 }
 
                 if expr_use.is_last() {
-                    cx.allocator.free_for(cx.span, expr)?;
+                    cx.alloc_free_for(expr)?;
                 }
 
                 Ok(PatOutcome::Refutable)
@@ -3273,17 +3327,17 @@ fn asm<'hir>(
         lhs: Slot,
         rhs: Slot,
     ) -> Result<()> {
-        let lhs_summary = cx.take_slot_use(lhs, this)?;
-        let rhs_summary = cx.take_slot_use(rhs, this)?;
+        let lhs_use = cx.take_slot_use(lhs, this)?;
+        let rhs_use = cx.take_slot_use(rhs, this)?;
 
-        let lhs_output = cx.allocator.alloc_for(lhs);
+        let lhs_output = cx.alloc_for(lhs)?;
 
-        if rhs_summary.is_only() {
+        if rhs_use.is_only() {
             asm(cx, rhs, lhs_output)?;
         } else {
-            let rhs_output = cx.allocator.alloc_for(rhs);
+            let rhs_output = cx.alloc_for(rhs)?;
 
-            if rhs_summary.is_pending() {
+            if rhs_use.is_pending() {
                 asm(cx, rhs, rhs_output)?;
             }
 
@@ -3297,13 +3351,17 @@ fn asm<'hir>(
                 comment,
             );
 
-            if rhs_summary.is_last() {
-                cx.allocator.free_for(cx.span, rhs)?;
+            if rhs_use.is_last() {
+                cx.alloc_free_for(lhs)?;
             }
         }
 
-        if lhs_summary.is_last() {
-            cx.allocator.free_for(cx.span, lhs)?;
+        if lhs_use.is_last() {
+            cx.alloc_free_for(lhs)?;
+        }
+
+        if rhs_use.is_last() {
+            cx.alloc_free_for(rhs)?;
         }
 
         Ok(())
@@ -3539,24 +3597,84 @@ fn asm<'hir>(
 
     /// Assemble a loop.
     #[instrument]
-    fn asm_loop(
-        cx: &mut Ctxt<'_, '_>,
-        condition: LoopCondition<'_>,
+    fn asm_loop<'hir>(
+        cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
+        condition: LoopCondition<'hir>,
         body: Slot,
         start: Label,
         end: Label,
-        output: Slot,
-    ) -> Result<()> {
-        cx.label(start)?;
+        output: AssemblyAddress,
+    ) -> Result<ExprOutcome> {
+        let cleanup = match condition {
+            LoopCondition::Forever => {
+                cx.label(start)?;
+                None
+            }
+            LoopCondition::Condition { expr, pat } => {
+                cx.label(start)?;
+                let bound_pat = bind_pat(cx, pat, expr)?;
+                asm_bound_pat(cx, bound_pat, end)?;
+                None
+            }
+            LoopCondition::Iterator { iter, binding } => {
+                let [iter_var] = cx.addresses(this, [iter], [])?;
 
-        match condition {
-            LoopCondition::Forever => {}
-            LoopCondition::Condition { expr, pat } => {}
-            LoopCondition::Iterator { iter, binding } => {}
+                cx.push(Inst::CallInstance {
+                    hash: *Protocol::INTO_ITER,
+                    address: *iter_var,
+                    count: 0,
+                    output: *iter_var,
+                });
+
+                let value_expr = cx.insert_expr(ExprKind::Empty)?;
+                let value_output = cx.alloc_for(value_expr)?;
+
+                cx.push(Inst::IterNext {
+                    address: *iter_var,
+                    label: end,
+                    output: value_output,
+                });
+
+                let bound_pat = bind_pat(cx, binding, value_expr)?;
+                asm_bound_pat(cx, bound_pat, end)?;
+                cx.label(start)?;
+                Some(iter_var)
+            }
+        };
+
+        let outcome = asm(cx, body, output)?;
+
+        cx.push(Inst::Jump { label: start });
+        cx.label(end)?;
+
+        if let Some(cleanup) = cleanup {
+            cx.free_iter([cleanup])?;
         }
 
-        cx.label(end)?;
-        todo!()
+        Ok(outcome)
+    }
+
+    /// Assemble a loop break.
+    #[instrument]
+    fn asm_break<'hir>(
+        cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
+        value: Option<Slot>,
+        label: Label,
+        loop_slot: Slot,
+        output: AssemblyAddress,
+    ) -> Result<ExprOutcome> {
+        if let Some(expr) = value {
+            let output = cx.alloc_for(expr)?;
+            let _ = cx.take_slot_use(expr, this)?;
+            let _ = cx.take_slot_use(loop_slot, this)?;
+            asm(cx, expr, output)?;
+        }
+
+        cx.push(Inst::Jump { label });
+
+        Ok(ExprOutcome::Empty)
     }
 }
 
@@ -3620,7 +3738,7 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
             hir::ExprKind::Group(hir) => expr(cx, hir, needs)?,
             hir::ExprKind::Select(..) => todo!(),
             hir::ExprKind::Loop(hir) => loop_(cx, hir)?,
-            hir::ExprKind::Break(..) => todo!(),
+            hir::ExprKind::Break(hir) => break_(cx, hir)?,
             hir::ExprKind::Continue(..) => todo!(),
             hir::ExprKind::Let(..) => todo!(),
             hir::ExprKind::If(..) => todo!(),
@@ -3700,7 +3818,6 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
     #[instrument]
     fn assign<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &'hir hir::ExprAssign<'hir>) -> Result<Slot> {
         let rhs = expr_value(cx, &hir.rhs)?;
-
         let this = expr_value(cx, &hir.lhs)?;
 
         this.map_expr(cx, |cx, kind| match kind {
@@ -4426,10 +4543,11 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
 
         let start = cx.new_label("loop_start");
         let end = cx.new_label("loop_end");
-        let output = cx.insert_expr(ExprKind::Empty)?;
+        let loop_slot = cx.insert_expr(ExprKind::Empty)?;
+
         let scope = cx
             .scopes
-            .push_loop(cx.span, Some(cx.scope), label, start, end, output)?;
+            .push_loop(cx.span, Some(cx.scope), label, start, end, loop_slot)?;
 
         let condition = match hir.condition {
             hir::LoopCondition::Forever => LoopCondition::Forever,
@@ -4461,12 +4579,77 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
 
         cx.scopes.pop(cx.span, scope)?;
 
-        Ok(cx.insert_expr(ExprKind::Loop {
-            condition,
-            body,
-            start,
-            end,
-        })?)
+        loop_slot.map_expr(cx, |cx, _| {
+            Ok(ExprKind::Loop {
+                condition,
+                body,
+                start,
+                end,
+            })
+        })
+    }
+
+    /// Convert a break.
+    #[instrument]
+    fn break_<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::ExprBreakValue<'hir>) -> Result<Slot> {
+        let kind = match *hir {
+            hir::ExprBreakValue::None => {
+                let (label, loop_slot) = if let Some(ControlFlow::Loop(control_flow)) = cx
+                    .scopes
+                    .find_ancestor(cx.scope, |flow| matches!(flow, ControlFlow::Loop { .. }))
+                {
+                    (control_flow.end, control_flow.loop_slot)
+                } else {
+                    return Err(cx.error(CompileErrorKind::BreakOutsideOfLoop));
+                };
+
+                ExprKind::Break {
+                    value: None,
+                    label,
+                    loop_slot,
+                }
+            }
+            hir::ExprBreakValue::Expr(hir) => {
+                let (label, loop_slot) = if let Some(ControlFlow::Loop(control_flow)) = cx
+                    .scopes
+                    .find_ancestor(cx.scope, |flow| matches!(flow, ControlFlow::Loop { .. }))
+                {
+                    (control_flow.end, control_flow.loop_slot)
+                } else {
+                    return Err(cx.error(CompileErrorKind::BreakOutsideOfLoop));
+                };
+
+                let expr = expr_value(cx, hir)?;
+
+                ExprKind::Break {
+                    value: Some(expr),
+                    label,
+                    loop_slot,
+                }
+            }
+            hir::ExprBreakValue::Label(ast) => {
+                let expected = cx.scopes.name(ast.resolve(resolve_context!(cx.q))?);
+
+                let (label, loop_slot) = if let Some(ControlFlow::Loop(control_flow)) =
+                    cx.scopes.find_ancestor(
+                        cx.scope,
+                        |flow| matches!(flow, ControlFlow::Loop(l) if l.label == Some(expected)),
+                    ) {
+                    (control_flow.end, control_flow.loop_slot)
+                } else {
+                    let name = cx.scopes.name_to_string(cx.span, expected)?;
+                    return Err(cx.error(CompileErrorKind::MissingLabel { label: name.into() }));
+                };
+
+                ExprKind::Break {
+                    value: None,
+                    label,
+                    loop_slot,
+                }
+            }
+        };
+
+        cx.insert_expr(kind)
     }
 }
 
@@ -4953,7 +5136,7 @@ fn bind_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, pat: Pat<'hir>, expr: Slot) -> Result
         // in the array to be freed up.
         let items = iter!(cx; patterns.iter().rev(), |pat| {
             cx.allocator.free_array_item(cx.span)?;
-            let expr = cx.insert_expr(ExprKind::Address { address: cx.allocator.array_address() })?;
+            let expr = cx.insert_expr_with_address(ExprKind::Address, cx.allocator.array_address())?;
             bind_pat(
                 cx,
                 *pat,
@@ -5019,7 +5202,7 @@ fn bind_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, pat: Pat<'hir>, expr: Slot) -> Result
                 // in the array to be freed up for subsequent bindings.
                 let items = iter!(cx; patterns.iter().rev(), |pat| {
                     cx.allocator.free_array_item(cx.span)?;
-                    let expr = cx.insert_expr(ExprKind::Address { address: cx.allocator.array_address() })?;
+                    let expr = cx.insert_expr_with_address(ExprKind::Address, cx.allocator.array_address())?;
                     bind_pat(cx, *pat, expr)?
                 });
 
@@ -5085,7 +5268,7 @@ fn bind_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, pat: Pat<'hir>, expr: Slot) -> Result
                 // in the array to be freed up for subsequent bindings.
                 let items = iter!(cx; patterns.iter().rev(), |pat| {
                     cx.allocator.free_array_item(cx.span)?;
-                    let expr = cx.insert_expr(ExprKind::Address { address: cx.allocator.array_address() })?;
+                    let expr = cx.insert_expr_with_address(ExprKind::Address, cx.allocator.array_address())?;
                     bind_pat(cx, *pat, expr)?
                 });
 
@@ -5263,7 +5446,7 @@ where
 {
     match kind {
         ExprKind::Empty => {}
-        ExprKind::Address { .. } => {}
+        ExprKind::Address => {}
         ExprKind::Binding { slot, use_kind, .. } => {
             op(slot, use_kind)?;
         }
@@ -5390,8 +5573,29 @@ where
                 op(slot, UseKind::Same)?;
             }
         }
-        ExprKind::Loop { output, .. } => {
-            op(output, UseKind::Same)?;
+        ExprKind::Loop {
+            condition, body, ..
+        } => {
+            match condition {
+                LoopCondition::Forever => {}
+                LoopCondition::Condition { expr, .. } => {
+                    op(expr, UseKind::Branch)?;
+                }
+                LoopCondition::Iterator { iter, .. } => {
+                    op(iter, UseKind::Branch)?;
+                }
+            }
+
+            op(body, UseKind::Same)?;
+        }
+        ExprKind::Break {
+            value, loop_slot, ..
+        } => {
+            if let Some(slot) = value {
+                op(slot, UseKind::Same)?;
+            }
+
+            op(loop_slot, UseKind::Branch)?;
         }
     }
 

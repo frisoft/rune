@@ -118,13 +118,17 @@ pub(crate) struct Ctxt<'a, 'hir> {
     /// Scope associated with the context.
     scope: ScopeId,
     /// Scopes declared in context.
-    scopes: Scopes<'hir>,
+    scopes: Scopes,
     /// State of code generation.
     state: CtxtState,
     /// A memory allocator.
     allocator: Allocator,
     /// Set of useless slots.
     useless: BTreeSet<Slot>,
+    /// All defined patterns and the expressions they are to be bound to.
+    patterns: Vec<(Pat<'hir>, Slot)>,
+    /// Keeping track of every slot.
+    expressions: Vec<Expr<'hir>>,
 }
 
 impl Spanned for Ctxt<'_, '_> {
@@ -157,6 +161,8 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
             state: CtxtState::default(),
             allocator: Allocator::new(),
             useless: BTreeSet::new(),
+            patterns: Vec::new(),
+            expressions: Vec::new(),
         }
     }
 
@@ -167,44 +173,90 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 
     /// Allocate a new output address slotted by the given expression address.
     fn address_for(&mut self, slot: Slot) -> Result<AssemblyAddress> {
-        if let Some(address) = self.slot(slot)?.address {
+        if let SlotAddress::Allocated(address) | SlotAddress::Passed(address) =
+            self.slot(slot)?.address
+        {
             return Ok(address);
+        }
+
+        Err(self.msg(format_args!(
+            "no inherent address allocated for slot {slot:?}"
+        )))
+    }
+
+    /// Pass an address for a slot.
+    fn slot_pass(&mut self, slot: Slot, address: AssemblyAddress) -> Result<SlotAddress> {
+        Ok(self.slot_mut(slot)?.pass(address))
+    }
+
+    /// Restore an address for a slot.
+    fn slot_restore(&mut self, slot: Slot, previous: SlotAddress) -> Result<()> {
+        self.slot_mut(slot)?.restore(previous);
+        Ok(())
+    }
+
+    /// Allocate a new output address slotted by the given expression address.
+    fn alloc_for(&mut self, slot: Slot) -> Result<AssemblyAddress> {
+        tracing::trace!(?slot, "allocating address");
+
+        let expr = self.slot_mut(slot)?;
+
+        if let SlotAddress::Allocated(address) | SlotAddress::Passed(address) = expr.address {
+            return Ok(address);
+        }
+
+        if matches!(expr.address, SlotAddress::Freed) {
+            return Err(self.msg(format_args!("trying to use freed address on slot {slot:?}")));
+        }
+
+        let address = self.allocator.alloc();
+        tracing::trace!(?slot, ?address, "allocating address");
+        self.slot_mut(slot)?.address = SlotAddress::Allocated(address);
+        Ok(address)
+    }
+
+    /// Free the implicit address associated with the given slot.
+    fn free_for(&mut self, slot: Slot) -> Result<()> {
+        let storage = self.slot_mut(slot)?;
+
+        // NB: We make freeing optional instead of a hard error, since we might
+        // call this function even if an address has not been allocated for the
+        // slot.
+        if let Some(address) = storage.address.free() {
+            tracing::trace!(?storage.slot, ?address, "freeing address");
+            self.allocator.free(self.span, address)?;
+        }
+
+        Ok(())
+    }
+
+    /// Load slot.
+    fn slot(&self, slot: Slot) -> Result<&Expr<'hir>> {
+        if let Some(expr) = self.expressions.get(slot.index()) {
+            return Ok(expr);
         }
 
         Err(CompileError::msg(
             self.span,
-            format_args!("no inherent address allocated for slot {slot:?}"),
+            format_args!("failed to look up slot {slot:?}"),
         ))
     }
 
-    /// Allocate an address for an expression.
-    fn alloc_for(&mut self, expr: Slot) -> Result<AssemblyAddress> {
-        self.scopes.alloc_for(self.span, expr, &mut self.allocator)
-    }
+    /// Load slot mutably.
+    fn slot_mut(&mut self, slot: Slot) -> Result<&mut Expr<'hir>> {
+        if let Some(expr) = self.expressions.get_mut(slot.index()) {
+            return Ok(expr);
+        }
 
-    /// Free the inherent allocation associated with the slot.
-    fn free_for(&mut self, slot: Slot) -> Result<()> {
-        self.scopes.free_for(self.span, slot, &mut self.allocator)
-    }
-
-    /// Access slot storage for the given slot.
-    fn slot(&self, slot: Slot) -> Result<&SlotStorage<'hir>> {
-        self.scopes.slot(self.span, slot)
-    }
-
-    /// Access slot storage mutably for the given slot.
-    fn slot_mut(&mut self, slot: Slot) -> Result<&mut SlotStorage<'hir>> {
-        self.scopes.slot_mut(self.span, slot)
+        Err(CompileError::msg(
+            self.span,
+            format_args!("failed to look up slot {slot:?}"),
+        ))
     }
 
     /// Declare a variable.
-    fn declare(&mut self, name: Name, address: Slot) -> Result<Option<Slot>> {
+    fn declare(&mut self, name: Name, address: Slot) -> Result<(Binding, Option<Slot>)> {
         self.scopes.declare(self.span, self.scope, name, address)
-    }
-
-    /// Get the identifier for the next slot that will be inserted.
-    fn next_slot(&self) -> Result<Slot> {
-        self.scopes.next_slot(self.span)
     }
 
     /// Add a slot user with custom use kind.
@@ -237,23 +289,40 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 
     /// Retain all slots referenced by the given expression.
     fn retain_expr_kind(&mut self, kind: ExprKind<'hir>, this: Slot) -> Result<()> {
-        walk_expr_slots(kind, |slot, use_kind| {
-            self.add_slot_user_with(slot, this, use_kind)
+        walk_expr_slots(self, kind, |cx, slot, use_kind| {
+            cx.add_slot_user_with(slot, this, use_kind)
         })
     }
 
     /// Release all slots referenced by the given expression.
     fn release_expr_kind(&mut self, kind: ExprKind<'hir>, this: Slot) -> Result<()> {
-        walk_expr_slots(kind, |slot, _| self.remove_slot_user(slot, this))
+        walk_expr_slots(self, kind, |cx, slot, _| cx.remove_slot_user(slot, this))
     }
 
     /// Insert a expression.
     fn insert_expr(&mut self, kind: ExprKind<'hir>) -> Result<Slot> {
-        let this = self.next_slot()?;
-        self.retain_expr_kind(kind, this)?;
+        let slot = match Slot::new(self.expressions.len()) {
+            Some(slot) => slot,
+            None => return Err(CompileError::msg(self.span, "ran out of expression slots")),
+        };
+
+        self.retain_expr_kind(kind, slot)?;
         // Mark current statement inserted as potentially useless to sweep it up later.
-        self.useless.insert(this);
-        self.scopes.insert_expr(self.span, kind)
+        self.useless.insert(slot);
+
+        self.expressions.push(Expr {
+            span: self.span,
+            slot,
+            kind,
+            uses: BTreeMap::new(),
+            address: SlotAddress::Empty,
+            same: 0,
+            branches: 0,
+            pending: true,
+            sealed: None,
+        });
+
+        Ok(slot)
     }
 
     /// Insert an expression with an assembly address.
@@ -263,25 +332,76 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         address: AssemblyAddress,
     ) -> Result<Slot> {
         let slot = self.insert_expr(kind)?;
-        self.slot_mut(slot)?.address = Some(address);
+        self.slot_mut(slot)?.address = SlotAddress::Passed(address);
         Ok(slot)
     }
 
     /// Free an expression.
     fn free_expr(&mut self, this: Slot) -> Result<()> {
+        tracing::trace!(?this, "freeing expression");
         let kind = self.slot(this)?.kind;
         self.release_expr_kind(kind, this)?;
         Ok(())
     }
 
     /// Insert a pattern.
-    fn insert_pat(&mut self, kind: PatKind<'hir>) -> Pat<'hir> {
+    fn insert_pat(&mut self, pat: Pat<'hir>, expr: Slot) -> Result<PatId> {
+        let id = match PatId::new(self.patterns.len()) {
+            Some(id) => id,
+            None => {
+                return Err(CompileError::msg(
+                    self.span,
+                    "ran out of pattern identifiers",
+                ))
+            }
+        };
+
+        self.patterns.push((pat, expr));
+        Ok(id)
+    }
+
+    /// Build a single pattern.
+    fn build_pat(&self, kind: PatKind<'hir>) -> Pat<'hir> {
         Pat::new(self.span, kind)
     }
 
-    /// Insert a bound pattern.
-    fn bound_pat(&mut self, kind: BoundPatKind<'hir>) -> BoundPat<'hir> {
-        BoundPat::new(self.span, kind)
+    /// Get a reference to a pattern by id.
+    fn pat(&self, pat: PatId) -> Result<&Pat<'hir>> {
+        match self.patterns.get(pat.index()) {
+            Some((pat, _)) => Ok(pat),
+            None => {
+                return Err(CompileError::msg(
+                    self.span,
+                    format_args!("missing pattern by id {pat:?}"),
+                ))
+            }
+        }
+    }
+
+    /// Get a reference to the expression that is associated with a pattern.
+    fn pat_expr(&self, pat: PatId) -> Result<Slot> {
+        match self.patterns.get(pat.index()) {
+            Some(&(_, expr)) => Ok(expr),
+            None => {
+                return Err(CompileError::msg(
+                    self.span,
+                    format_args!("missing pattern by id {pat:?}"),
+                ))
+            }
+        }
+    }
+
+    /// Get a mutable reference to a pattern by id.
+    fn pat_mut(&mut self, pat: PatId) -> Result<&mut Pat<'hir>> {
+        match self.patterns.get_mut(pat.index()) {
+            Some((pat, _)) => Ok(pat),
+            None => {
+                return Err(CompileError::msg(
+                    self.span,
+                    format_args!("missing pattern by id {pat:?}"),
+                ))
+            }
+        }
     }
 
     /// Access the meta for the given language item.
@@ -423,6 +543,14 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         CompileError::new(self.span, kind)
     }
 
+    /// Construct a compile error associated with the current scope.
+    fn msg<M>(&self, message: M) -> CompileError
+    where
+        M: fmt::Display,
+    {
+        CompileError::msg(self.span, message)
+    }
+
     /// Push an instruction using the current context as a span.
     fn push(&mut self, inst: Inst) {
         if !matches!(self.state, CtxtState::Unreachable { .. }) {
@@ -469,20 +597,17 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 
             // If only, assembled directly onto our desired output.
             if used.is_only() {
-                asm(self, slot, output)?;
-            } else if used.is_pending() {
-                let slot_output = self.alloc_for(slot)?;
-                asm(self, slot, slot_output)?;
-                self.push(Inst::Copy {
-                    address: slot_output,
-                    output,
-                });
+                asm_to_output(self, slot, output)?;
             } else {
-                let slot_output = self.alloc_for(slot)?;
-                self.push(Inst::Copy {
-                    address: slot_output,
-                    output,
-                });
+                // If we're not the only user, then assemble the expression into
+                // its slot and copy it from there.
+                if used.is_pending() {
+                    asm(self, slot)?;
+                }
+
+                let address = self.alloc_for(slot)?;
+
+                self.push(Inst::Copy { address, output });
             }
 
             if used.is_last() {
@@ -496,96 +621,51 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         Ok(UsedAddress::array(address, count))
     }
 
-    /// Allocate a collection of slots as addresses.
-    fn addresses<const N: usize, T>(
-        &mut self,
-        user: Slot,
-        slots: [Slot; N],
-        tmp: T,
-    ) -> Result<[UsedAddress; N]>
-    where
-        T: IntoIterator<Item = AssemblyAddress>,
-    {
-        let mut tmp = tmp.into_iter();
+    /// Allocate a collection of slot addresses from somewhere which doesn't have a slot.
+    fn implicit_addresses<const N: usize>(&mut self, slots: [Slot; N]) -> Result<[UsedAddress; N]> {
         let mut out = [mem::MaybeUninit::<UsedAddress>::uninit(); N];
 
+        let mut tmp = [].into_iter();
+
         for (slot, out) in slots.into_iter().zip(&mut out) {
-            let address = follow_slot(self, &mut tmp, slot, user)?;
+            let address = follow_slot(self, &mut tmp, slot, None)?;
             out.write(address);
         }
 
         // SAFETY: we just initialized the array above.
         let out = unsafe { array_assume_init(out) };
-        return Ok(out);
+        Ok(out)
+    }
 
-        pub unsafe fn array_assume_init<T, const N: usize>(
-            array: [mem::MaybeUninit<T>; N],
-        ) -> [T; N] {
-            let ret = (&array as *const _ as *const [T; N]).read();
-            ret
+    /// Allocate a collection of slots as addresses.
+    fn addresses<const N: usize>(
+        &mut self,
+        this: Slot,
+        slots: [Slot; N],
+    ) -> Result<([UsedAddress; N], AssemblyAddress)> {
+        let mut out = [mem::MaybeUninit::<UsedAddress>::uninit(); N];
+
+        let output = self.alloc_for(this)?;
+        let mut tmp = Some(output).into_iter();
+
+        for (slot, out) in slots.into_iter().zip(&mut out) {
+            let address = follow_slot(self, &mut tmp, slot, Some(this))?;
+            out.write(address);
         }
 
-        /// Recursively follow bindings to addresses if we are the only user.
-        fn follow_slot(
-            cx: &mut Ctxt<'_, '_>,
-            tmp: &mut impl Iterator<Item = AssemblyAddress>,
-            slot: Slot,
-            user: Slot,
-        ) -> Result<UsedAddress> {
-            let kind = cx.slot(slot)?.kind;
-            let used = cx.take_slot_use(slot, user)?;
-
-            let address = match kind {
-                ExprKind::Address => {
-                    let address = cx.alloc_for(slot)?;
-                    UsedAddress::new(address, slot, used)
-                }
-                ExprKind::Binding {
-                    slot: followed_slot,
-                    ..
-                } if used.is_only() => return follow_slot(cx, tmp, followed_slot, slot),
-                _ => {
-                    let address = if let Some(address) = tmp.next() {
-                        if used.is_pending() {
-                            asm(cx, slot, address)?;
-                        } else {
-                            let slot_address = cx.alloc_for(slot)?;
-
-                            cx.push(Inst::Copy {
-                                address: slot_address,
-                                output: address,
-                            });
-
-                            if used.is_last() {
-                                cx.free_for(slot)?;
-                            }
-                        }
-
-                        address
-                    } else {
-                        let address = cx.alloc_for(slot)?;
-
-                        if used.is_pending() {
-                            asm(cx, slot, address)?;
-                        }
-
-                        address
-                    };
-
-                    UsedAddress::new(address, slot, used)
-                }
-            };
-
-            Ok(address)
-        }
+        // SAFETY: we just initialized the array above.
+        let out = unsafe { array_assume_init(out) };
+        Ok((out, output))
     }
 
     /// Free a collection of allocated addresses.
     fn free_iter<const N: usize>(&mut self, allocs: [UsedAddress; N]) -> Result<()> {
         for alloc in allocs {
+            tracing::trace!(?alloc, "freeing");
+
             match alloc.kind {
-                UsedAddressKind::Slot(slot, used) => {
-                    if used.is_last() {
+                UsedAddressKind::Slot(slot, summary) => {
+                    if summary.is_last() {
                         self.free_for(slot)?;
                     }
                 }
@@ -599,8 +679,59 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     }
 }
 
+/// Helper function to recursively follow bindings to addresses if we are the
+/// only user.
+fn follow_slot(
+    cx: &mut Ctxt<'_, '_>,
+    tmp: &mut impl Iterator<Item = AssemblyAddress>,
+    slot: Slot,
+    user: Option<Slot>,
+) -> Result<UsedAddress> {
+    let kind = cx.slot(slot)?.kind;
+
+    let used = if let Some(user) = user {
+        Some(cx.take_slot_use(slot, user)?)
+    } else {
+        None
+    };
+
+    let summary = cx.slot_mut(slot)?.use_summary();
+    let is_only = used.map(|u| u.is_only()).unwrap_or_default();
+
+    match kind {
+        ExprKind::Address => {
+            let address = cx.alloc_for(slot)?;
+            Ok(UsedAddress::new(address, slot, summary))
+        }
+        ExprKind::Binding {
+            slot: followed_slot,
+            ..
+        } if is_only => return follow_slot(cx, tmp, followed_slot, Some(slot)),
+        _ => {
+            if summary.is_pending() && is_only {
+                if let Some(address) = tmp.next() {
+                    asm_to_output(cx, slot, address)?;
+                    return Ok(UsedAddress::new(address, slot, summary));
+                }
+            }
+
+            if summary.is_pending() {
+                asm(cx, slot)?;
+            }
+
+            Ok(UsedAddress::new(cx.alloc_for(slot)?, slot, summary))
+        }
+    }
+}
+
+/// Helper function to initialized an array of [mem::MaybeUninit].
+pub unsafe fn array_assume_init<T, const N: usize>(array: [mem::MaybeUninit<T>; N]) -> [T; N] {
+    let ret = (&array as *const _ as *const [T; N]).read();
+    ret
+}
+
 /// An address that might have been allocated..
-#[must_use]
+#[must_use = "Must be freed"]
 #[derive(Debug, Clone, Copy)]
 struct UsedAddress {
     address: AssemblyAddress,
@@ -609,10 +740,10 @@ struct UsedAddress {
 
 impl UsedAddress {
     /// A temporary address.
-    const fn new(address: AssemblyAddress, slot: Slot, used: SlotUse) -> Self {
+    const fn new(address: AssemblyAddress, slot: Slot, summary: UseSummary) -> Self {
         Self {
             address,
-            kind: UsedAddressKind::Slot(slot, used),
+            kind: UsedAddressKind::Slot(slot, summary),
         }
     }
 
@@ -644,7 +775,7 @@ impl Deref for UsedAddress {
 /// The kind of a [UsedAddress].
 #[derive(Debug, Clone, Copy)]
 enum UsedAddressKind {
-    Slot(Slot, SlotUse),
+    Slot(Slot, UseSummary),
     Array(usize),
 }
 
@@ -679,7 +810,7 @@ pub(crate) fn fn_from_item_fn<'hir>(
 
     let scope = cx.scopes.push(cx.span, None)?;
 
-    let address = cx.with_scope(scope, |cx| {
+    let slot = cx.with_scope(scope, |cx| {
         let mut first = true;
 
         let mut patterns = Vec::new();
@@ -712,12 +843,309 @@ pub(crate) fn fn_from_item_fn<'hir>(
     // Reserve the argument slots.
     cx.allocator.reserve(hir.span, hir.args.len())?;
     cx.scopes.pop(span, scope)?;
-    debug_stdout(cx, address)?;
 
-    let output = cx.alloc_for(address)?;
-    asm(cx, address, output)?;
-    cx.push(Inst::Return { address: output });
+    // Bind all patterns.
+    bind_pats(cx)?;
+
+    debug_stdout(cx, slot)?;
+    let [address] = cx.implicit_addresses([slot])?;
+    cx.push(Inst::Return { address: *address });
+    cx.free_iter([address])?;
     Ok(())
+}
+
+/// Bind all patterns available in the context.
+#[instrument]
+fn bind_pats(cx: &mut Ctxt<'_, '_>) -> Result<()> {
+    tracing::trace!("binding patterns");
+
+    let patterns = cx.patterns.clone();
+
+    for (index, (pat, slot)) in patterns.into_iter().enumerate() {
+        tracing::trace!("binding pattern {pat:?}");
+
+        let kind = bind_pat(cx, pat, slot)?;
+
+        if let Some(pat) = PatId::new(index) {
+            cx.pat_mut(pat)?.kind = kind;
+        }
+    }
+
+    return Ok(());
+
+    /// Bind the pattern in the *current* scope.
+    #[instrument]
+    fn bind_pat<'hir>(
+        cx: &mut Ctxt<'_, 'hir>,
+        pat: Pat<'hir>,
+        expr: Slot,
+    ) -> Result<PatKind<'hir>> {
+        return cx.with_span(pat.span, |cx| match pat.kind {
+            PatKind::Ignore => Ok(PatKind::Irrefutable),
+            PatKind::Lit { lit } => bind_pat_lit(cx, lit, expr),
+            PatKind::Name {
+                binding,
+                ghost_slot,
+            } => {
+                // Here we make the ghost expression reference the bound
+                // expression so it can be used.
+                let kind = ExprKind::Binding {
+                    binding,
+                    slot: expr,
+                    use_kind: UseKind::Same,
+                };
+                cx.slot_mut(ghost_slot)?.kind = kind;
+                cx.retain_expr_kind(kind, ghost_slot)?;
+                Ok(PatKind::Irrefutable)
+            }
+            PatKind::Meta { meta } => {
+                let type_match = match tuple_match_for(cx, meta) {
+                    Some((args, inst)) if args == 0 => inst,
+                    _ => return Err(cx.error(CompileErrorKind::UnsupportedPattern)),
+                };
+
+                Ok(PatKind::TypedSequence {
+                    type_match,
+                    expr,
+                    items: &[],
+                })
+            }
+            PatKind::Vec { items, is_open } => bind_pat_vec(cx, items, is_open, expr),
+            PatKind::Tuple {
+                kind,
+                items,
+                is_open,
+            } => bind_pat_tuple(cx, kind, items, is_open, expr),
+            PatKind::Object { kind, items } => bind_pat_object(cx, kind, items, expr),
+            _ => Err(cx.msg("trying to bind pattern which has already been bound")),
+        });
+    }
+
+    /// Bind a literal pattern.
+    #[instrument]
+    fn bind_pat_lit<'hir>(cx: &mut Ctxt<'_, 'hir>, lit: Slot, expr: Slot) -> Result<PatKind<'hir>> {
+        // Match irrefutable patterns.
+        match (cx.slot(lit)?.kind, cx.slot(expr)?.kind) {
+            (ExprKind::Store { value: a }, ExprKind::Store { value: b }) if a == b => {
+                return Ok(PatKind::Irrefutable);
+            }
+            (ExprKind::String { string: a }, ExprKind::String { string: b }) if a == b => {
+                return Ok(PatKind::Irrefutable);
+            }
+            (ExprKind::Bytes { bytes: a }, ExprKind::Bytes { bytes: b }) if a == b => {
+                return Ok(PatKind::Irrefutable);
+            }
+            _ => {}
+        }
+
+        Ok(PatKind::BoundLit { lit, expr })
+    }
+
+    /// Bind a vector pattern.
+    #[instrument]
+    fn bind_pat_vec<'hir>(
+        cx: &mut Ctxt<'_, 'hir>,
+        items: &'hir [Pat<'hir>],
+        is_open: bool,
+        expr: Slot,
+    ) -> Result<PatKind<'hir>> {
+        // Try a simpler form of pattern matching through syntactical reassignment.
+        match cx.slot(expr)?.kind {
+            ExprKind::Vec { items: expr_items }
+                if expr_items.len() == items.len()
+                    || expr_items.len() >= items.len() && is_open =>
+            {
+                let items = iter!(cx; items.iter().copied().zip(expr_items.iter().copied()), |(pat, expr)| {
+                    let kind = bind_pat(cx, pat, expr)?;
+                    cx.insert_pat(cx.build_pat(kind), expr)?
+                });
+
+                return Ok(PatKind::IrrefutableSequence { items });
+            }
+            _ => {}
+        }
+
+        let address = cx.allocator.array_address();
+        cx.allocator.alloc_array_items(items.len());
+
+        // NB we bind the arguments in reverse to allow for higher elements
+        // in the array to be freed up.
+
+        let items = iter!(cx; items.iter().copied().rev(), |pat| {
+            cx.allocator.free_array_item(cx.span)?;
+            let expr =
+                cx.insert_expr_with_address(ExprKind::Address, cx.allocator.array_address())?;
+            let kind = bind_pat(cx, pat, expr)?;
+            cx.insert_pat(cx.build_pat(kind), expr)?
+        });
+
+        Ok(PatKind::BoundVec {
+            address,
+            expr,
+            is_open,
+            items,
+        })
+    }
+
+    /// Bind a tuple pattern.
+    #[instrument]
+    fn bind_pat_tuple<'hir>(
+        cx: &mut Ctxt<'_, 'hir>,
+        kind: PatTupleKind,
+        items: &'hir [Pat<'hir>],
+        is_open: bool,
+        expr: Slot,
+    ) -> Result<PatKind<'hir>> {
+        match kind {
+            PatTupleKind::Typed { type_match } => {
+                let items = iter!(cx; items.iter().copied().enumerate().rev(), |(index, pat)| {
+                    let expr = cx.insert_expr(ExprKind::TupleFieldAccess { lhs: expr, index })?;
+                    let kind = bind_pat(cx, pat, expr)?;
+                    cx.insert_pat(cx.build_pat(kind), expr)?
+                });
+
+                Ok(PatKind::TypedSequence {
+                    type_match,
+                    expr,
+                    items,
+                })
+            }
+            PatTupleKind::Anonymous => {
+                // Try a simpler form of pattern matching through syntactical
+                // reassignment.
+                match cx.slot(expr)?.kind {
+                    ExprKind::Tuple { items: tuple_items }
+                        if tuple_items.len() == items.len()
+                            || is_open && tuple_items.len() >= items.len() =>
+                    {
+                        let items = iter!(cx; items.iter().copied().zip(tuple_items), |(pat, expr)| {
+                            let kind = bind_pat(cx, pat, *expr)?;
+                            cx.insert_pat(cx.build_pat(kind), *expr)?
+                        });
+
+                        return Ok(PatKind::IrrefutableSequence { items });
+                    }
+                    _ => {}
+                }
+
+                let address = cx.allocator.array_address();
+                cx.allocator.alloc_array_items(items.len());
+
+                // NB we bind the arguments in reverse to allow for higher elements
+                // in the array to be freed up for subsequent bindings.
+                let items = iter!(cx; items.iter().rev().copied(), |pat| {
+                    cx.allocator.free_array_item(cx.span)?;
+                    let expr = cx.insert_expr_with_address(
+                        ExprKind::Address,
+                        cx.allocator.array_address(),
+                    )?;
+                    let kind = bind_pat(cx, pat, expr)?;
+                    cx.insert_pat(cx.build_pat(kind), expr)?
+                });
+
+                Ok(PatKind::AnonymousTuple {
+                    expr,
+                    is_open,
+                    items,
+                    address,
+                })
+            }
+        }
+    }
+
+    /// Set up binding for pattern objects.
+    #[instrument]
+    fn bind_pat_object<'hir>(
+        cx: &mut Ctxt<'_, 'hir>,
+        kind: PatObjectKind<'hir>,
+        items: &'hir [Pat<'hir>],
+        expr: Slot,
+    ) -> Result<PatKind<'hir>> {
+        match kind {
+            PatObjectKind::Typed { type_match, keys } => {
+                let items = iter!(cx; keys.iter().zip(items.iter().copied()), |(&(field, hash), pat)| {
+                    let expr = cx.insert_expr(ExprKind::StructFieldAccess {
+                        lhs: expr,
+                        field,
+                        hash,
+                    })?;
+
+                    let kind = bind_pat(cx, pat, expr)?;
+                    cx.insert_pat(cx.build_pat(kind), expr)?
+                });
+
+                Ok(PatKind::TypedSequence {
+                    type_match,
+                    expr,
+                    items,
+                })
+            }
+            PatObjectKind::Anonymous { slot, is_open } => {
+                // Try a simpler form of pattern matching through syntactical
+                // reassignment.
+                match cx.slot(expr)?.kind {
+                    ExprKind::Struct {
+                        kind: ExprStructKind::Anonymous { slot: expr_slot },
+                        exprs,
+                    } if object_keys_match(&cx.q.unit, expr_slot, slot, is_open)
+                        .unwrap_or_default() =>
+                    {
+                        let items = iter!(cx; items.iter().copied().zip(exprs.iter().copied()), |(pat, expr)| {
+                            let kind = bind_pat(cx, pat, expr)?;
+                            cx.insert_pat(cx.build_pat(kind), expr)?
+                        });
+
+                        return Ok(PatKind::IrrefutableSequence { items });
+                    }
+                    _ => {}
+                }
+
+                let address = cx.allocator.array_address();
+                cx.allocator.alloc_array_items(items.len());
+
+                // NB we bind the arguments in reverse to allow for higher elements
+                // in the array to be freed up for subsequent bindings.
+                let items = iter!(cx; items.iter().rev().copied(), |pat| {
+                    cx.allocator.free_array_item(cx.span)?;
+                    let expr = cx.insert_expr_with_address(
+                        ExprKind::Address,
+                        cx.allocator.array_address(),
+                    )?;
+                    let kind = bind_pat(cx, pat, expr)?;
+                    cx.insert_pat(cx.build_pat(kind), expr)?
+                });
+
+                Ok(PatKind::AnonymousObject {
+                    address,
+                    expr,
+                    slot,
+                    is_open,
+                    items,
+                })
+            }
+        }
+    }
+
+    /// Test if object keys match.
+    fn object_keys_match(
+        unit: &UnitBuilder,
+        from_slot: usize,
+        to_slot: usize,
+        is_open: bool,
+    ) -> Option<bool> {
+        let from_keys = unit.get_static_object_keys(from_slot)?;
+        let to_keys = unit.get_static_object_keys(to_slot)?;
+
+        let mut from_keys = from_keys.iter().cloned().collect::<HashSet<_>>();
+
+        for key in to_keys {
+            if !from_keys.remove(key) {
+                return Some(false);
+            }
+        }
+
+        Some(is_open || from_keys.is_empty())
+    }
 }
 
 /// Debug a slot to stdout.
@@ -733,8 +1161,8 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
 
     while let Some(job) = task.queue.pop_front() {
         match job {
-            Job::Pat(index, pat) => {
-                debug_pat(&mut out, index, pat, &mut task)?;
+            Job::Pat(pat) => {
+                debug_pat(&mut out, cx, pat, &mut task)?;
             }
             Job::Slot(slot) => {
                 debug_slot(&mut out, cx, slot, &mut task)?;
@@ -744,13 +1172,13 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
 
     return Ok(());
 
-    struct Task<'hir> {
+    struct Task {
         patterns: usize,
         visited: HashSet<Slot>,
-        queue: VecDeque<Job<'hir>>,
+        queue: VecDeque<Job>,
     }
 
-    impl<'hir> Task<'hir> {
+    impl Task {
         fn slot(&mut self, slot: Slot) -> String {
             if self.visited.insert(slot) {
                 self.queue.push_back(Job::Slot(slot));
@@ -759,16 +1187,18 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
             format!("${}", slot.index())
         }
 
-        fn pat(&mut self, pat: Pat<'hir>) -> String {
-            let index = self.patterns;
-            self.queue.push_back(Job::Pat(index, pat));
-            self.patterns += 1;
-            format!("pat${}", index)
+        fn pat_id(&mut self, pat: PatId) -> String {
+            self.queue.push_back(Job::Pat(pat));
+            format!("pat${}", pat.index())
+        }
+
+        fn pat(&mut self, pat: Pat<'_>) -> String {
+            format!("{pat:?}")
         }
     }
 
-    enum Job<'hir> {
-        Pat(usize, Pat<'hir>),
+    enum Job {
+        Pat(PatId),
         Slot(Slot),
     }
 
@@ -777,20 +1207,20 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
         o: &mut O,
         cx: &mut Ctxt<'_, 'hir>,
         slot: Slot,
-        task: &mut Task<'hir>,
+        task: &mut Task,
     ) -> Result<()>
     where
         O: std::io::Write,
     {
-        let storage = cx.scopes.slot(cx.span, slot)?;
-        let span = storage.span;
+        let expr = cx.slot(slot)?;
+        let span = expr.span;
         let err = write_err(span);
 
-        let uses = format_uses(storage, span)?;
+        let uses = format_uses(expr, span)?;
 
-        let same = storage.same;
-        let branches = storage.branches;
-        let kind = storage.kind;
+        let same = expr.same;
+        let branches = expr.branches;
+        let kind = expr.kind;
 
         macro_rules! field {
             ($pad:literal, lit, $var:expr) => {
@@ -807,23 +1237,24 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
                     LoopCondition::Forever => {
                         writeln!(o, "{}{} = Forever,", $pad, stringify!($var)).map_err(err)?;
                     }
-                    LoopCondition::Condition { expr, pat } => {
-                        let expr = task.slot(expr);
-                        let pat = task.pat(pat);
+                    LoopCondition::Condition { pat } => {
+                        let pat = task.pat_id(pat);
+
                         writeln!(
                             o,
-                            "{}{} = Condition {{ expr = {expr}, pat = {pat} }},",
+                            "{}{} = Condition {{ pat = {pat} }},",
                             $pad,
                             stringify!($var)
                         )
                         .map_err(err)?;
                     }
-                    LoopCondition::Iterator { iter, binding } => {
+                    LoopCondition::Iterator { iter, pat } => {
                         let iter = task.slot(iter);
-                        let binding = task.pat(binding);
+                        let pat = task.pat_id(pat);
+
                         writeln!(
                             o,
-                            "{}{} = Iterator {{ iter = {iter}, binding = {binding} }},",
+                            "{}{} = Iterator {{ iter = {iter}, pat = {pat} }},",
                             $pad,
                             stringify!($var)
                         )
@@ -904,7 +1335,7 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
                 AssignStructField { slot lhs, lit field, slot rhs },
                 AssignTupleField { slot lhs, lit index, slot rhs },
                 Block { [array slot] statements, [option slot] tail },
-                Let { pat pat, slot expr },
+                Let { pat_id pat },
                 Store { lit value },
                 Bytes { lit bytes },
                 String { lit string },
@@ -943,19 +1374,30 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
     /// Debug a patter.
     fn debug_pat<'hir, O>(
         o: &mut O,
-        index: usize,
-        pat: Pat<'hir>,
-        task: &mut Task<'hir>,
+        cx: &mut Ctxt<'_, 'hir>,
+        pat: PatId,
+        task: &mut Task,
     ) -> Result<()>
     where
         O: std::io::Write,
     {
-        let err = write_err(pat.span);
+        let id = pat.index();
+        let expr = cx.pat_expr(pat)?;
+        let pat = cx.pat(pat)?;
+        let span = pat.span;
+        let kind = pat.kind;
+        let err = write_err(span);
+        let expr = task.slot(expr);
 
         macro_rules! field {
             ($pad:literal, lit, $var:expr) => {
                 writeln!(o, "{}{} = {:?},", $pad, stringify!($var), $var).map_err(err)?;
             };
+
+            ($pad:literal, binding, $var:expr) => {{
+                let name = cx.scopes.name_to_string(span, $var.name)?;
+                writeln!(o, "{}{} = {name:?},", $pad, stringify!($var)).map_err(err)?;
+            }};
 
             ($pad:literal, $fn:ident, $var:expr) => {{
                 let name = task.$fn($var);
@@ -986,13 +1428,13 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
 
         macro_rules! variant {
             ($name:ident) => {{
-                writeln!(o, "pat${index} = {name},", name = stringify!($name)).map_err(err)?;
+                writeln!(o, "pat${id} = {name} = {expr},", name = stringify!($name)).map_err(err)?;
             }};
 
             ($name:ident { $($what:tt $field:ident),* }) => {{
-                writeln!(o, "pat${index} = {name} {{", name = stringify!($name)).map_err(err)?;
+                writeln!(o, "pat${id} = {name} {{", name = stringify!($name)).map_err(err)?;
                 $(field!("  ", $what, $field);)*
-                writeln!(o, "}}").map_err(err)?;
+                writeln!(o, "}} = {expr}").map_err(err)?;
             }};
         }
 
@@ -1009,10 +1451,10 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
         }
 
         matches! {
-            pat.kind, {
+            kind, {
                 Ignore,
                 Lit { slot lit },
-                Name { lit name, slot name_expr },
+                Name { binding binding, slot ghost_slot },
                 Meta { lit meta },
                 Vec {
                     [array pat] items,
@@ -1020,12 +1462,39 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
                 },
                 Tuple {
                     lit kind,
-                    [array pat] patterns,
+                    [array pat] items,
                     lit is_open,
                 },
                 Object {
                     lit kind,
-                    [array pat] patterns,
+                    [array pat] items,
+                },
+                Irrefutable,
+                IrrefutableSequence { [array pat_id] items },
+                BoundLit { slot lit, slot expr },
+                BoundVec {
+                    lit address,
+                    slot expr,
+                    lit is_open,
+                    [array pat_id] items,
+                },
+                AnonymousTuple {
+                    lit address,
+                    slot expr,
+                    lit is_open,
+                    [array pat_id] items,
+                },
+                AnonymousObject {
+                    lit address,
+                    slot expr,
+                    lit slot,
+                    lit is_open,
+                    [array pat_id] items,
+                },
+                TypedSequence {
+                    lit type_match,
+                    slot expr,
+                    [array pat_id] items,
                 },
             }
         }
@@ -1033,7 +1502,7 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
         Ok(())
     }
 
-    fn format_uses(storage: &SlotStorage<'_>, span: Span) -> Result<String> {
+    fn format_uses(expr: &Expr<'_>, span: Span) -> Result<String> {
         use std::fmt::Write as _;
 
         let mut users = String::new();
@@ -1041,7 +1510,7 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
 
         let mut first = true;
 
-        let mut it = storage.uses.iter().peekable();
+        let mut it = expr.uses.iter().peekable();
 
         while let Some((slot, use_kind)) = it.next() {
             if mem::take(&mut first) {
@@ -1094,10 +1563,13 @@ enum ExprKind<'hir> {
     Empty,
     /// An expression who's inherent address refers to a static address.
     Address,
-    /// An expression referencing a binding.
+    /// An expression referencing a different expression.
     Binding {
+        /// The name of the binding (if applicable).
         binding: Binding,
+        /// The slot being referenced.
         slot: Slot,
+        /// The kind of binding.
         use_kind: UseKind,
     },
     /// An assignment to a binding.
@@ -1141,9 +1613,7 @@ enum ExprKind<'hir> {
     },
     Let {
         /// The assembled pattern.
-        pat: Pat<'hir>,
-        /// The expression being bound.
-        expr: Slot,
+        pat: PatId,
     },
     /// A literal value.
     Store { value: InstValue },
@@ -1251,7 +1721,7 @@ enum ExprKind<'hir> {
     },
     Loop {
         /// The condition to advance the loop.
-        condition: LoopCondition<'hir>,
+        condition: LoopCondition,
         /// The body of the loop.
         body: Slot,
         /// The start label to use.
@@ -1281,13 +1751,13 @@ enum ExprKind<'hir> {
 
 /// A loop condition.
 #[derive(Debug, Clone, Copy)]
-enum LoopCondition<'hir> {
+enum LoopCondition {
     /// A forever loop condition.
     Forever,
     /// A pattern condition.
-    Condition { expr: Slot, pat: Pat<'hir> },
+    Condition { pat: PatId },
     /// An iterator condition.
-    Iterator { iter: Slot, binding: Pat<'hir> },
+    Iterator { iter: Slot, pat: PatId },
 }
 
 /// An expression that can be assembled.
@@ -1314,7 +1784,7 @@ enum PatKind<'hir> {
     /// A literal value.
     Lit { lit: Slot },
     /// A path pattern.
-    Name { name: &'hir str, name_expr: Slot },
+    Name { binding: Binding, ghost_slot: Slot },
     /// A meta binding.
     Meta { meta: &'hir PrivMeta },
     /// A vector pattern.
@@ -1325,72 +1795,47 @@ enum PatKind<'hir> {
     /// A tuple pattern.
     Tuple {
         kind: PatTupleKind,
-        patterns: &'hir [Pat<'hir>],
+        items: &'hir [Pat<'hir>],
         is_open: bool,
     },
     /// An object pattern.
     Object {
         kind: PatObjectKind<'hir>,
-        patterns: &'hir [Pat<'hir>],
+        items: &'hir [Pat<'hir>],
     },
-}
-
-/// A bound pattern.
-#[must_use]
-#[derive(Debug, Clone, Copy)]
-struct BoundPat<'hir> {
-    /// The span of the assembled bound pattern.
-    span: Span,
-    /// The kind of the bound pattern.
-    kind: BoundPatKind<'hir>,
-}
-
-impl<'hir> BoundPat<'hir> {
-    const fn new(span: Span, kind: BoundPatKind<'hir>) -> Self {
-        Self { span, kind }
-    }
-}
-
-/// The kind of a bound pattern.
-#[derive(Debug, Clone, Copy)]
-enum BoundPatKind<'hir> {
+    /// Bound irrefutable pattern.
     Irrefutable,
-    IrrefutableSequence {
-        items: &'hir [BoundPat<'hir>],
-    },
-    /// Bind an expression to the given address.
-    Expr {
-        name: &'hir str,
-        name_expr: Slot,
-        expr: Slot,
-    },
-    Lit {
-        lit: Slot,
-        expr: Slot,
-    },
-    Vec {
+    /// An irrefutable sequence.
+    IrrefutableSequence { items: &'hir [PatId] },
+    /// A bound literal pattern.
+    BoundLit { lit: Slot, expr: Slot },
+    /// A bound vector.
+    BoundVec {
         address: AssemblyAddress,
         expr: Slot,
         is_open: bool,
-        items: &'hir [BoundPat<'hir>],
+        items: &'hir [PatId],
     },
+    /// A bound anonymous tuple.
     AnonymousTuple {
         address: AssemblyAddress,
         expr: Slot,
         is_open: bool,
-        items: &'hir [BoundPat<'hir>],
+        items: &'hir [PatId],
     },
+    /// A bound anonymous object.
     AnonymousObject {
         address: AssemblyAddress,
         expr: Slot,
         slot: usize,
         is_open: bool,
-        items: &'hir [BoundPat<'hir>],
+        items: &'hir [PatId],
     },
+    /// A bound typed sequence.
     TypedSequence {
         type_match: TypeMatch,
         expr: Slot,
-        items: &'hir [BoundPat<'hir>],
+        items: &'hir [PatId],
     },
 }
 
@@ -1476,13 +1921,34 @@ impl fmt::Debug for Slot {
     }
 }
 
+/// A pattern identifier.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+struct PatId(NonZeroUsize);
+
+impl PatId {
+    /// Construct a new pattern identifier.
+    fn new(value: usize) -> Option<Self> {
+        Some(Self(NonZeroUsize::new(value.wrapping_add(1))?))
+    }
+
+    /// Get the index that the pattern identifier corresponds to.
+    fn index(&self) -> usize {
+        self.0.get().wrapping_sub(1)
+    }
+}
+
+impl fmt::Debug for PatId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("PatId").field(&self.index()).finish()
+    }
+}
+
 /// Scopes to use when compiling.
 #[derive(Default)]
-struct Scopes<'hir> {
+struct Scopes {
     /// Stack of scopes.
     scopes: slab::Slab<Scope>,
-    /// Keeping track of every slot.
-    slots: Vec<SlotStorage<'hir>>,
     /// The collection of known names in the scope, so that we can generate the
     /// [BindingName] identifier.
     names_by_id: Vec<Box<str>>,
@@ -1490,106 +1956,14 @@ struct Scopes<'hir> {
     names_by_name: HashMap<Box<str>, Name>,
 }
 
-impl<'hir> Scopes<'hir> {
+impl Scopes {
     /// Construct an empty scope.
     fn new() -> Self {
         Self {
             scopes: slab::Slab::new(),
-            slots: Vec::new(),
             names_by_id: Vec::new(),
             names_by_name: HashMap::new(),
         }
-    }
-
-    /// Allocate a new output address slotted by the given expression address.
-    fn alloc_for(
-        &mut self,
-        span: Span,
-        slot: Slot,
-        allocator: &mut Allocator,
-    ) -> Result<AssemblyAddress> {
-        let slot = self.slot_mut(span, slot)?;
-        Ok(*slot.address.get_or_insert_with(|| allocator.alloc()))
-    }
-
-    /// Free the implicit address associated with the given slot.
-    fn free_for(&mut self, span: Span, slot: Slot, allocator: &mut Allocator) -> Result<()> {
-        let slot = self.slot_mut(span, slot)?;
-
-        // NB: We make freeing optional instead of a hard error, since we might
-        // call this function even if an address has not been allocated for the
-        // slot.
-        if let Some(address) = slot.address.take() {
-            allocator.free(span, address)?;
-        }
-
-        Ok(())
-    }
-
-    /// Load slot storage for the given slot.
-    fn slot(&self, span: Span, slot: Slot) -> Result<&SlotStorage<'hir>> {
-        let slot = match self.slots.get(slot.index()) {
-            Some(slot) => slot,
-            None => {
-                return Err(CompileError::msg(
-                    span,
-                    format_args!("failed to look up slot {slot:?}"),
-                ))
-            }
-        };
-
-        Ok(slot)
-    }
-
-    /// Load slot storage mutably for the given slot.
-    fn slot_mut(&mut self, span: Span, slot: Slot) -> Result<&mut SlotStorage<'hir>> {
-        let slot = match self.slots.get_mut(slot.index()) {
-            Some(slot) => slot,
-            None => {
-                return Err(CompileError::msg(
-                    span,
-                    format_args!("failed to look up slot {slot:?}"),
-                ))
-            }
-        };
-
-        Ok(slot)
-    }
-
-    /// Get the identifier for the next slot that will be inserted.
-    fn next_slot(&self, span: Span) -> Result<Slot> {
-        match Slot::new(self.slots.len()) {
-            Some(slot) => Ok(slot),
-            None => return Err(CompileError::msg(span, "ran out of slots")),
-        }
-    }
-
-    /// Insert an expression and return its slot address.
-    fn insert_expr(&mut self, span: Span, kind: ExprKind<'hir>) -> Result<Slot> {
-        self.insert_with(span, |_| kind)
-    }
-
-    /// Allocate an alot address associated with an unknown type.
-    #[tracing::instrument(skip_all)]
-    fn insert_with<T>(&mut self, span: Span, builder: T) -> Result<Slot>
-    where
-        T: FnOnce(Slot) -> ExprKind<'hir>,
-    {
-        let slot = self.next_slot(span)?;
-
-        self.slots.push(SlotStorage {
-            span,
-            slot,
-            kind: builder(slot),
-            uses: BTreeMap::new(),
-            address: None,
-            same: 0,
-            branches: 0,
-            pending: true,
-            sealed: None,
-        });
-
-        Ok(slot)
     }
 
     /// Declare a variable with an already known address.
@@ -1600,7 +1974,7 @@ impl<'hir> Scopes<'hir> {
         scope: ScopeId,
         name: Name,
         slot: Slot,
-    ) -> Result<Option<Slot>> {
+    ) -> Result<(Binding, Option<Slot>)> {
         let top = match self.scopes.get_mut(scope.0) {
             Some(scope) => scope,
             None => {
@@ -1613,7 +1987,8 @@ impl<'hir> Scopes<'hir> {
 
         tracing::trace!(?scope, ?name, ?slot);
         let replaced = top.names.insert(name, slot);
-        Ok(replaced)
+        let binding = Binding { name, scope };
+        Ok((binding, replaced))
     }
 
     fn push_inner(
@@ -1812,12 +2187,11 @@ impl<'hir> Scopes<'hir> {
     }
 }
 
-impl<'hir> fmt::Debug for Scopes<'hir> {
+impl fmt::Debug for Scopes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         return f
             .debug_struct("Scopes")
             .field("scopes", &ScopesIter(&self.scopes))
-            .field("slots", &self.slots)
             .field("names_by_id", &self.names_by_id)
             .field("names_by_name", &self.names_by_name)
             .finish();
@@ -1991,8 +2365,36 @@ struct SlotSealed {
     total: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SlotAddress {
+    /// Address is empty.
+    Empty,
+    /// Address is freed and must not be used again.
+    Freed,
+    /// An allocated address that should be freed here.
+    Allocated(AssemblyAddress),
+    /// A passed-in address.
+    Passed(AssemblyAddress),
+}
+
+impl SlotAddress {
+    /// Free the current slot address effectively setting it to empty and return
+    /// the assembly address that should be freed.
+    fn free(&mut self) -> Option<AssemblyAddress> {
+        if matches!(self, SlotAddress::Passed(..)) {
+            return None;
+        }
+
+        if let SlotAddress::Allocated(address) = mem::replace(self, SlotAddress::Freed) {
+            Some(address)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
-struct SlotStorage<'hir> {
+struct Expr<'hir> {
     /// The span associated with the slot.
     span: Span,
     /// The output address of the expression.
@@ -2002,7 +2404,7 @@ struct SlotStorage<'hir> {
     /// The downstream users of this slot.
     uses: BTreeMap<Slot, UseKind>,
     /// The implicit address of the slot.
-    address: Option<AssemblyAddress>,
+    address: SlotAddress,
     /// The number of pending users.
     same: usize,
     /// Branches used.
@@ -2013,10 +2415,25 @@ struct SlotStorage<'hir> {
     sealed: Option<SlotSealed>,
 }
 
-impl<'hir> SlotStorage<'hir> {
+impl<'hir> Expr<'hir> {
+    /// Replace the current slot address temporarily with another address. This
+    /// implies that the address is "passed" and shouldn't be freed.
+    fn pass(&mut self, address: AssemblyAddress) -> SlotAddress {
+        tracing::trace!(?self.slot, ?address, "passing in address");
+        mem::replace(&mut self.address, SlotAddress::Passed(address))
+    }
+
+    /// Restore a previously passed address to a freed state.
+    fn restore(&mut self, previous: SlotAddress) {
+        tracing::trace!(?self.slot, ?previous, "restoring passed in address");
+        self.address = previous;
+    }
+
     /// Add a single user.
     fn add_user(&mut self, span: Span, user: Slot, use_kind: UseKind) -> Result<()> {
         let this = self.slot;
+
+        tracing::trace!(?this, ?user, "adding user");
 
         if self.sealed.is_some() {
             return Err(CompileError::msg(
@@ -2045,14 +2462,17 @@ impl<'hir> SlotStorage<'hir> {
     }
 
     /// Remove a single user.
-    fn remove_user(&mut self, span: Span, slot: Slot) -> Result<UseKind> {
-        let use_kind = match self.uses.remove(&slot) {
+    fn remove_user(&mut self, span: Span, user: Slot) -> Result<UseKind> {
+        let this = self.slot;
+
+        tracing::trace!(?this, ?user, "removing user");
+
+        let use_kind = match self.uses.remove(&user) {
             Some(use_kind) => use_kind,
             None => {
-                let this = self.slot;
                 return Err(CompileError::msg(
                     span,
-                    format_args!("{slot:?} is not a user of slot {this:?}"),
+                    format_args!("{user:?} is not a user of slot {this:?}"),
                 ));
             }
         };
@@ -2354,14 +2774,23 @@ fn has_side_effects(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<bool> {
     }
 }
 
-/// Assemble the given address.
+/// Assemble a value with a custom output address.
 #[instrument]
-fn asm<'hir>(
+fn asm_to_output<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    address: Slot,
+    this: Slot,
     output: AssemblyAddress,
 ) -> Result<ExprOutcome> {
-    let slot_mut = cx.scopes.slot_mut(cx.span, address)?;
+    let previous = cx.slot_pass(this, output)?;
+    let result = asm(cx, this);
+    cx.slot_restore(this, previous)?;
+    result
+}
+
+/// Assemble the given address.
+#[instrument]
+fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: Slot) -> Result<ExprOutcome> {
+    let slot_mut = cx.slot_mut(this)?;
 
     if !slot_mut.pending {
         return Err(CompileError::msg(
@@ -2374,68 +2803,67 @@ fn asm<'hir>(
 
     let span = slot_mut.span;
     let kind = slot_mut.kind;
-    let this = slot_mut.slot;
 
     return cx.with_span(span, |cx| {
         match kind {
             ExprKind::Empty => {}
             ExprKind::Address => {
-                asm_address(cx, this, output)?;
+                asm_address(cx, this)?;
             }
             ExprKind::Binding { binding, slot, .. } => {
-                asm_binding(cx, this, binding, slot, output)?;
+                asm_binding(cx, this, binding, slot)?;
             }
             ExprKind::Block { statements, tail } => {
-                asm_block(cx, statements, tail, output)?;
+                asm_block(cx, this, statements, tail)?;
             }
-            ExprKind::Let { pat, expr } => asm_let(cx, pat, expr)?,
+            ExprKind::Let { pat } => asm_let(cx, pat)?,
             ExprKind::Store { value } => {
-                asm_store(cx, value, output)?;
+                asm_store(cx, this, value)?;
             }
             ExprKind::Bytes { bytes } => {
-                asm_bytes(cx, bytes, output)?;
+                asm_bytes(cx, this, bytes)?;
             }
             ExprKind::String { string } => {
-                asm_string(cx, string, output)?;
+                asm_string(cx, this, string)?;
             }
             ExprKind::Unary { op, expr } => {
-                asm_unary(cx, this, op, expr, output)?;
+                asm_unary(cx, this, op, expr)?;
             }
             ExprKind::BinaryAssign { lhs, op, rhs } => {
-                asm_binary_assign(cx, this, lhs, op, rhs, output)?;
+                asm_binary_assign(cx, this, lhs, op, rhs)?;
             }
             ExprKind::BinaryConditional { lhs, op, rhs } => {
-                asm_binary_conditional(cx, lhs, op, rhs, output)?;
+                asm_binary_conditional(cx, this, lhs, op, rhs)?;
             }
             ExprKind::Binary { lhs, op, rhs } => {
-                asm_binary(cx, this, lhs, op, rhs, output)?;
+                asm_binary(cx, this, lhs, op, rhs)?;
             }
             ExprKind::Index { target, index } => {
-                asm_index(cx, this, target, index, output)?;
+                asm_index(cx, this, target, index)?;
             }
             ExprKind::Meta { meta, needs, named } => {
-                asm_meta(cx, meta, needs, named, output)?;
+                asm_meta(cx, this, meta, needs, named)?;
             }
             ExprKind::Struct { kind, exprs } => {
-                asm_struct(cx, this, kind, exprs, output)?;
+                asm_struct(cx, this, kind, exprs)?;
             }
             ExprKind::Vec { items } => {
-                asm_vec(cx, this, items, output)?;
+                asm_vec(cx, this, items)?;
             }
             ExprKind::Range { from, limits, to } => {
-                asm_range(cx, this, from, limits, to, output)?;
+                asm_range(cx, this, from, limits, to)?;
             }
             ExprKind::Tuple { items } => {
-                asm_tuple(cx, this, items, output)?;
+                asm_tuple(cx, this, items)?;
             }
             ExprKind::Option { value } => {
-                asm_option(cx, this, value, output)?;
+                asm_option(cx, this, value)?;
             }
             ExprKind::TupleFieldAccess { lhs, index } => {
-                asm_tuple_field_access(cx, this, lhs, index, output)?;
+                asm_tuple_field_access(cx, this, lhs, index)?;
             }
             ExprKind::StructFieldAccess { lhs, field, .. } => {
-                asm_struct_field_access(cx, this, lhs, field, output)?;
+                asm_struct_field_access(cx, this, lhs, field)?;
             }
             ExprKind::StructFieldAccessGeneric { .. } => {
                 return Err(cx.error(CompileErrorKind::ExpectedExpr));
@@ -2446,44 +2874,44 @@ fn asm<'hir>(
                 asm_assign(cx, this, binding, lhs, rhs)?;
             }
             ExprKind::AssignStructField { lhs, field, rhs } => {
-                asm_assign_struct_field(cx, lhs, field, rhs, output)?;
+                asm_assign_struct_field(cx, this, lhs, field, rhs)?;
             }
             ExprKind::AssignTupleField { lhs, index, rhs } => {
-                asm_assign_tuple_field(cx, lhs, index, rhs, output)?;
+                asm_assign_tuple_field(cx, this, lhs, index, rhs)?;
             }
             ExprKind::CallAddress {
                 address: function,
                 args,
             } => {
-                asm_call_address(cx, this, function, args, output)?;
+                asm_call_address(cx, this, function, args)?;
             }
             ExprKind::CallHash { hash, args } => {
-                asm_call_hash(cx, this, args, hash, output)?;
+                asm_call_hash(cx, this, args, hash)?;
             }
             ExprKind::CallInstance { lhs, hash, args } => {
-                asm_call_instance(cx, lhs, args, hash, output)?;
+                asm_call_instance(cx, this, lhs, args, hash)?;
             }
             ExprKind::CallExpr { expr, args } => {
-                asm_call_expr(cx, this, expr, args, output)?;
+                asm_call_expr(cx, this, expr, args)?;
             }
             ExprKind::Yield { expr } => {
-                asm_yield(cx, this, expr, output)?;
+                asm_yield(cx, this, expr)?;
             }
             ExprKind::Await { expr } => {
-                asm_await(cx, this, expr, output)?;
+                asm_await(cx, this, expr)?;
             }
             ExprKind::Return { expr } => {
-                asm_return(cx, this, expr, output)?;
+                asm_return(cx, this, expr)?;
                 return Ok(ExprOutcome::Unreachable);
             }
             ExprKind::Try { expr } => {
-                asm_try(cx, this, expr, output)?;
+                asm_try(cx, this, expr)?;
             }
             ExprKind::Function { hash } => {
-                asm_function(cx, hash, output);
+                asm_function(cx, this, hash)?;
             }
             ExprKind::Closure { hash, captures } => {
-                asm_closure(cx, this, captures, hash, output)?;
+                asm_closure(cx, this, captures, hash)?;
             }
             ExprKind::Loop {
                 condition,
@@ -2491,7 +2919,7 @@ fn asm<'hir>(
                 start,
                 end,
             } => {
-                asm_loop(cx, this, condition, body, start, end, output)?;
+                asm_loop(cx, this, condition, body, start, end)?;
             }
             ExprKind::Break {
                 value,
@@ -2504,10 +2932,10 @@ fn asm<'hir>(
                 asm_continue(cx, label)?;
             }
             ExprKind::StringConcat { exprs } => {
-                asm_string_concat(cx, this, exprs, output)?;
+                asm_string_concat(cx, this, exprs)?;
             }
             ExprKind::Format { spec, expr } => {
-                asm_format(cx, this, spec, expr, output)?;
+                asm_format(cx, this, spec, expr)?;
             }
         }
 
@@ -2515,18 +2943,8 @@ fn asm<'hir>(
     });
 
     #[instrument]
-    fn asm_address<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        this: Slot,
-        output: AssemblyAddress,
-    ) -> Result<()> {
-        let address = cx.address_for(this)?;
-
-        if address != output {
-            cx.push(Inst::Copy { address, output });
-        }
-
-        Ok(())
+    fn asm_address<'hir>(cx: &mut Ctxt<'_, 'hir>, this: Slot) -> Result<()> {
+        Err(cx.msg("cannot assemble address expressions"))
     }
 
     #[instrument]
@@ -2535,58 +2953,35 @@ fn asm<'hir>(
         this: Slot,
         binding: Binding,
         slot: Slot,
-        output: AssemblyAddress,
     ) -> Result<()> {
-        let user = cx.take_slot_use(slot, this)?;
-
-        // We are the one and only user, so assemble the referenced binding
-        // directly on our output.
-        if user.is_only() {
-            asm(cx, slot, output)?;
-            return Ok(());
-        }
-
-        let address = cx.alloc_for(slot)?;
-
-        if user.is_pending() {
-            asm(cx, slot, address)?;
-        }
-
-        let name = cx.scopes.name_to_string(cx.span, binding.name)?;
-        let comment = format!("copy `{name}`");
-        cx.push_with_comment(Inst::Copy { address, output }, comment);
-
-        // We are the last user, so free the address being held.
-        if user.is_last() {
-            cx.allocator.free(cx.span, address)?;
-        }
-
-        Ok(())
+        todo!("asm_binding")
     }
 
     #[instrument]
     fn asm_block<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         statements: &[Slot],
         tail: Option<Slot>,
-        output: AssemblyAddress,
     ) -> Result<()> {
-        for address in statements {
-            asm(cx, *address, output)?;
+        for &slot in statements {
+            let ([address], _) = cx.addresses(this, [slot])?;
+            cx.free_iter([address])?;
         }
 
         if let Some(tail) = tail {
-            asm(cx, tail, output)?;
+            let ([address], _) = cx.addresses(this, [tail])?;
+            cx.free_iter([address])?;
         }
 
         Ok(())
     }
 
     #[instrument]
-    fn asm_let<'hir>(cx: &mut Ctxt<'_, 'hir>, pat: Pat<'hir>, expr: Slot) -> Result<()> {
+    fn asm_let<'hir>(cx: &mut Ctxt<'_, 'hir>, pat: PatId) -> Result<()> {
         let panic_label = cx.new_label("let_panic");
 
-        if let PatOutcome::Refutable = asm_pat(cx, pat, expr, panic_label)? {
+        if let PatOutcome::Refutable = asm_pat(cx, pat, panic_label)? {
             let end = cx.new_label("pat_end");
             cx.push(Inst::Jump { label: end });
             cx.label(panic_label)?;
@@ -2600,80 +2995,29 @@ fn asm<'hir>(
     }
 
     #[instrument]
-    fn asm_pat<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        pat: Pat<'hir>,
-        expr: Slot,
-        label: Label,
-    ) -> Result<PatOutcome> {
-        let bound_pat = bind_pat(cx, pat, expr)?;
-        asm_bound_pat(cx, bound_pat, label)
-    }
+    fn asm_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, pat: PatId, label: Label) -> Result<PatOutcome> {
+        let pat = cx.pat(pat)?;
+        let span = pat.span;
+        let kind = pat.kind;
 
-    #[instrument]
-    fn asm_bound_pat<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        bound_pat: BoundPat<'hir>,
-        label: Label,
-    ) -> Result<PatOutcome> {
-        cx.with_span(bound_pat.span, |cx| match bound_pat.kind {
-            BoundPatKind::Irrefutable => Ok(PatOutcome::Irrefutable),
-            BoundPatKind::IrrefutableSequence { items } => {
+        cx.with_span(span, |cx| match kind {
+            PatKind::Irrefutable => Ok(PatOutcome::Irrefutable),
+            PatKind::IrrefutableSequence { items } => {
                 let mut outcome = PatOutcome::Irrefutable;
 
-                for bound_pat in items {
-                    outcome = outcome.combine(asm_bound_pat(cx, *bound_pat, label)?);
+                for pat in items {
+                    outcome = outcome.combine(asm_pat(cx, *pat, label)?);
                 }
 
                 Ok(outcome)
             }
-            BoundPatKind::Expr {
-                name_expr, expr, ..
-            } => {
-                let summary = cx.slot_mut(name_expr)?.use_summary();
-
-                match (summary.same, summary.branches) {
-                    // Assemble eagerly *in case* there are no users.
-                    (0, 0) => {
-                        // If an expression can have side effects it has to be
-                        // executed.
-                        if has_side_effects(cx, expr)? {
-                            let output = cx.allocator.alloc();
-                            asm(cx, expr, output)?;
-                            cx.allocator.free(cx.span, output)?;
-                        }
-                    }
-                    // In case there are exactly *1* user, forward this
-                    // expression to that user.
-                    (1, 0) => {
-                        let kind = cx.slot(expr)?.kind;
-                        // TODO: also merge users.
-                        cx.slot_mut(name_expr)?.kind = kind;
-                    }
-                    // For more users, assemble this expression on its output
-                    // address and replace forward expressions with references
-                    // to it.
-                    _ => {
-                        let output = cx.alloc_for(name_expr)?;
-                        asm(cx, expr, output)?;
-                        cx.slot_mut(name_expr)?.kind = ExprKind::Address;
-                    }
-                }
-
-                Ok(PatOutcome::Irrefutable)
-            }
-            BoundPatKind::Lit { lit, expr } => {
-                let user = cx.slot_mut(expr)?.use_summary();
-                let address = cx.alloc_for(expr)?;
-
-                if user.is_pending() {
-                    asm(cx, expr, address)?;
-                }
+            PatKind::BoundLit { lit, expr } => {
+                let [expr] = cx.implicit_addresses([expr])?;
 
                 match cx.slot(lit)?.kind {
                     ExprKind::Store { value } => {
                         cx.push(Inst::MatchValue {
-                            address,
+                            address: *expr,
                             value,
                             label,
                         });
@@ -2681,7 +3025,7 @@ fn asm<'hir>(
                     ExprKind::String { string } => {
                         let slot = cx.q.unit.new_static_string(cx.span, string)?;
                         cx.push(Inst::MatchString {
-                            address,
+                            address: *expr,
                             slot,
                             label,
                         });
@@ -2689,7 +3033,7 @@ fn asm<'hir>(
                     ExprKind::Bytes { bytes } => {
                         let slot = cx.q.unit.new_static_bytes(cx.span, bytes)?;
                         cx.push(Inst::MatchBytes {
-                            address,
+                            address: *expr,
                             slot,
                             label,
                         });
@@ -2699,27 +3043,19 @@ fn asm<'hir>(
                     }
                 }
 
-                if user.is_last() {
-                    cx.free_for(expr)?;
-                }
-
+                cx.free_iter([expr])?;
                 Ok(PatOutcome::Refutable)
             }
-            BoundPatKind::Vec {
+            PatKind::BoundVec {
                 address,
                 expr,
                 is_open,
                 items,
             } => {
-                let expr_use = cx.slot_mut(expr)?.use_summary();
-                let expr_output = cx.alloc_for(expr)?;
-
-                if expr_use.is_pending() {
-                    asm(cx, expr, expr_output)?;
-                }
+                let [expr] = cx.implicit_addresses([expr])?;
 
                 cx.push(Inst::MatchSequence {
-                    address: expr_output,
+                    address: *expr,
                     type_check: TypeCheck::Vec,
                     len: items.len(),
                     exact: !is_open,
@@ -2727,31 +3063,24 @@ fn asm<'hir>(
                     output: address,
                 });
 
-                for &pat in items {
-                    asm_bound_pat(cx, pat, label)?;
-                }
+                cx.free_iter([expr])?;
 
-                if expr_use.is_last() {
-                    cx.free_for(expr)?;
+                for &pat in items {
+                    asm_pat(cx, pat, label)?;
                 }
 
                 Ok(PatOutcome::Refutable)
             }
-            BoundPatKind::AnonymousTuple {
+            PatKind::AnonymousTuple {
                 address,
                 expr,
                 is_open,
                 items,
             } => {
-                let expr_use = cx.slot_mut(expr)?.use_summary();
-                let expr_output = cx.alloc_for(expr)?;
-
-                if expr_use.is_pending() {
-                    asm(cx, expr, expr_output)?;
-                }
+                let [expr] = cx.implicit_addresses([expr])?;
 
                 cx.push(Inst::MatchSequence {
-                    address: expr_output,
+                    address: *expr,
                     type_check: TypeCheck::Tuple,
                     len: items.len(),
                     exact: !is_open,
@@ -2759,64 +3088,54 @@ fn asm<'hir>(
                     output: address,
                 });
 
-                for &pat in items {
-                    asm_bound_pat(cx, pat, label)?;
-                }
+                cx.free_iter([expr])?;
 
-                if expr_use.is_last() {
-                    cx.free_for(expr)?;
+                for &pat in items {
+                    asm_pat(cx, pat, label)?;
                 }
 
                 Ok(PatOutcome::Refutable)
             }
-            BoundPatKind::AnonymousObject {
+            PatKind::AnonymousObject {
                 address,
                 expr,
                 slot,
                 is_open,
                 items,
             } => {
-                let expr_use = cx.slot_mut(expr)?.use_summary();
-                let expr_output = cx.alloc_for(expr)?;
-
-                if expr_use.is_pending() {
-                    asm(cx, expr, expr_output)?;
-                }
+                let [expr] = cx.implicit_addresses([expr])?;
 
                 cx.push(Inst::MatchObject {
-                    address,
+                    address: *expr,
                     slot,
                     exact: !is_open,
                     label,
                     output: address,
                 });
 
+                cx.free_iter([expr])?;
+
                 for &pat in items {
-                    asm_bound_pat(cx, pat, label)?;
+                    asm_pat(cx, pat, label)?;
                 }
 
                 Ok(PatOutcome::Refutable)
             }
-            BoundPatKind::TypedSequence {
+            PatKind::TypedSequence {
                 type_match,
                 expr,
                 items,
             } => {
-                let expr_use = cx.slot_mut(expr)?.use_summary();
-                let expr_output = cx.alloc_for(expr)?;
-
-                if expr_use.is_pending() {
-                    asm(cx, expr, expr_output)?;
-                }
+                let [expr] = cx.implicit_addresses([expr])?;
 
                 match type_match {
                     TypeMatch::BuiltIn { type_check } => cx.push(Inst::MatchBuiltIn {
-                        address: expr_output,
+                        address: *expr,
                         type_check,
                         label,
                     }),
                     TypeMatch::Type { type_hash } => cx.push(Inst::MatchType {
-                        address: expr_output,
+                        address: *expr,
                         type_hash,
                         label,
                     }),
@@ -2828,7 +3147,7 @@ fn asm<'hir>(
                         let output = cx.allocator.next_address();
 
                         cx.push(Inst::MatchVariant {
-                            address: expr_output,
+                            address: *expr,
                             variant_hash,
                             enum_hash,
                             index,
@@ -2838,47 +3157,37 @@ fn asm<'hir>(
                     }
                 }
 
-                for &pat in items {
-                    asm_bound_pat(cx, pat, label)?;
-                }
+                cx.free_iter([expr])?;
 
-                if expr_use.is_last() {
-                    cx.free_for(expr)?;
+                for &pat in items {
+                    asm_pat(cx, pat, label)?;
                 }
 
                 Ok(PatOutcome::Refutable)
             }
+            _ => Err(cx.msg("trying to assemble pattern which hasn't been bound")),
         })
     }
 
     #[instrument]
-    fn asm_store<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        value: InstValue,
-        output: AssemblyAddress,
-    ) -> Result<()> {
+    fn asm_store<'hir>(cx: &mut Ctxt<'_, 'hir>, this: Slot, value: InstValue) -> Result<()> {
+        let ([], output) = cx.addresses(this, [])?;
         cx.push(Inst::Store { value, output });
         Ok(())
     }
 
     #[instrument]
-    fn asm_bytes<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        bytes: &[u8],
-        output: AssemblyAddress,
-    ) -> Result<()> {
+    fn asm_bytes<'hir>(cx: &mut Ctxt<'_, 'hir>, this: Slot, bytes: &[u8]) -> Result<()> {
         let slot = cx.q.unit.new_static_bytes(cx.span, bytes)?;
+        let ([], output) = cx.addresses(this, [])?;
         cx.push(Inst::Bytes { slot, output });
         Ok(())
     }
 
     #[instrument]
-    fn asm_string<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        string: &str,
-        output: AssemblyAddress,
-    ) -> Result<()> {
+    fn asm_string<'hir>(cx: &mut Ctxt<'_, 'hir>, this: Slot, string: &str) -> Result<()> {
         let slot = cx.q.unit.new_static_string(cx.span, string)?;
+        let ([], output) = cx.addresses(this, [])?;
         cx.push(Inst::String { slot, output });
         Ok(())
     }
@@ -2889,9 +3198,8 @@ fn asm<'hir>(
         this: Slot,
         op: ExprUnOp,
         expr: Slot,
-        output: AssemblyAddress,
     ) -> Result<()> {
-        let [address] = cx.addresses(this, [expr], [output])?;
+        let ([address], output) = cx.addresses(this, [expr])?;
 
         match op {
             ExprUnOp::Neg => {
@@ -2919,9 +3227,8 @@ fn asm<'hir>(
         lhs: Slot,
         op: ast::BinOp,
         rhs: Slot,
-        output: AssemblyAddress,
     ) -> Result<()> {
-        let [lhs, rhs] = cx.addresses(this, [lhs, rhs], [output])?;
+        let ([lhs, rhs], output) = cx.addresses(this, [lhs, rhs])?;
 
         let op = match op {
             ast::BinOp::AddAssign(..) => InstAssignOp::Add,
@@ -2963,25 +3270,28 @@ fn asm<'hir>(
     #[instrument]
     fn asm_binary_conditional<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         lhs: Slot,
         op: ast::BinOp,
         rhs: Slot,
-        output: AssemblyAddress,
     ) -> Result<()> {
         let end_label = cx.new_label("conditional_end");
 
-        cx.with_state_checkpoint(|cx| asm(cx, lhs, output))?;
+        let lhs = cx.with_state_checkpoint(|cx| {
+            let ([lhs], _) = cx.addresses(this, [lhs])?;
+            Ok(lhs)
+        })?;
 
         match op {
             ast::BinOp::And(..) => {
                 cx.push(Inst::JumpIfNot {
-                    address: output,
+                    address: *lhs,
                     label: end_label,
                 });
             }
             ast::BinOp::Or(..) => {
                 cx.push(Inst::JumpIf {
-                    address: output,
+                    address: *lhs,
                     label: end_label,
                 });
             }
@@ -2990,7 +3300,14 @@ fn asm<'hir>(
             }
         }
 
-        cx.with_state_checkpoint(|cx| asm(cx, rhs, output))?;
+        cx.free_iter([lhs])?;
+
+        let rhs = cx.with_state_checkpoint(|cx| {
+            let ([rhs], _) = cx.addresses(this, [rhs])?;
+            Ok(rhs)
+        })?;
+
+        cx.free_iter([rhs])?;
         cx.label(end_label)?;
         Ok(())
     }
@@ -3003,7 +3320,6 @@ fn asm<'hir>(
         lhs: Slot,
         op: ast::BinOp,
         rhs: Slot,
-        output: AssemblyAddress,
     ) -> Result<()> {
         let op = match op {
             ast::BinOp::Eq(..) => InstOp::Eq,
@@ -3031,7 +3347,7 @@ fn asm<'hir>(
             }
         };
 
-        let [lhs, rhs] = cx.addresses(this, [lhs, rhs], [output])?;
+        let ([lhs, rhs], output) = cx.addresses(this, [lhs, rhs])?;
 
         cx.push(Inst::Op {
             op,
@@ -3050,9 +3366,8 @@ fn asm<'hir>(
         this: Slot,
         target: Slot,
         index: Slot,
-        output: AssemblyAddress,
     ) -> Result<()> {
-        let [address, index] = cx.addresses(this, [target, index], [output])?;
+        let ([address, index], output) = cx.addresses(this, [target, index])?;
 
         cx.push(Inst::IndexGet {
             address: *address,
@@ -3068,10 +3383,10 @@ fn asm<'hir>(
     #[instrument]
     fn asm_meta<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         meta: &PrivMeta,
         needs: Needs,
         named: &'hir Named<'hir>,
-        output: AssemblyAddress,
     ) -> Result<ExprOutcome> {
         let outcome = if let Needs::Value = needs {
             match &meta.kind {
@@ -3086,6 +3401,8 @@ fn asm<'hir>(
                     ..
                 } => {
                     named.assert_not_generic()?;
+
+                    let ([], output) = cx.addresses(this, [])?;
 
                     cx.push_with_comment(
                         Inst::Call {
@@ -3109,6 +3426,8 @@ fn asm<'hir>(
                 } if tuple.args == 0 => {
                     named.assert_not_generic()?;
 
+                    let ([], output) = cx.addresses(this, [])?;
+
                     cx.push_with_comment(
                         Inst::Call {
                             hash: tuple.hash,
@@ -3127,6 +3446,8 @@ fn asm<'hir>(
                 } => {
                     named.assert_not_generic()?;
 
+                    let ([], output) = cx.addresses(this, [])?;
+
                     cx.push_with_comment(
                         Inst::LoadFn {
                             hash: tuple.hash,
@@ -3142,6 +3463,8 @@ fn asm<'hir>(
                     ..
                 } => {
                     named.assert_not_generic()?;
+
+                    let ([], output) = cx.addresses(this, [])?;
 
                     cx.push_with_comment(
                         Inst::LoadFn {
@@ -3162,6 +3485,8 @@ fn asm<'hir>(
                         *type_hash
                     };
 
+                    let ([], output) = cx.addresses(this, [])?;
+
                     cx.push_with_comment(Inst::LoadFn { hash, output }, meta.info(cx.q.pool));
                     ExprOutcome::Output
                 }
@@ -3170,7 +3495,8 @@ fn asm<'hir>(
                 } => {
                     named.assert_not_generic()?;
                     let expr = const_value(cx, value)?;
-                    asm(cx, expr, output)?
+                    let ([], output) = cx.addresses(this, [])?;
+                    asm_to_output(cx, expr, output)?
                 }
                 _ => {
                     return Err(cx.error(CompileErrorKind::ExpectedMeta {
@@ -3192,6 +3518,8 @@ fn asm<'hir>(
                 }
             };
 
+            let ([], output) = cx.addresses(this, [])?;
+
             cx.push(Inst::Store {
                 value: InstValue::Type(type_hash),
                 output,
@@ -3209,8 +3537,8 @@ fn asm<'hir>(
         this: Slot,
         kind: ExprStructKind,
         exprs: &[Slot],
-        output: AssemblyAddress,
     ) -> Result<()> {
+        let ([], output) = cx.addresses(this, [])?;
         let address = cx.array(this, exprs.iter().copied())?;
 
         match kind {
@@ -3247,12 +3575,8 @@ fn asm<'hir>(
     }
 
     #[instrument]
-    fn asm_vec<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        this: Slot,
-        items: &[Slot],
-        output: AssemblyAddress,
-    ) -> Result<()> {
+    fn asm_vec<'hir>(cx: &mut Ctxt<'_, 'hir>, this: Slot, items: &[Slot]) -> Result<()> {
+        let ([], output) = cx.addresses(this, [])?;
         let address = cx.array(this, items.iter().copied())?;
 
         cx.push(Inst::Vec {
@@ -3272,9 +3596,8 @@ fn asm<'hir>(
         from: Slot,
         limits: InstRangeLimits,
         to: Slot,
-        output: AssemblyAddress,
     ) -> Result<()> {
-        let [from, to] = cx.addresses(this, [from, to], [output])?;
+        let ([from, to], output) = cx.addresses(this, [from, to])?;
 
         cx.push(Inst::Range {
             from: *from,
@@ -3288,22 +3611,15 @@ fn asm<'hir>(
     }
 
     #[instrument]
-    fn asm_tuple<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        this: Slot,
-        items: &[Slot],
-        output: AssemblyAddress,
-    ) -> Result<()> {
+    fn asm_tuple<'hir>(cx: &mut Ctxt<'_, 'hir>, this: Slot, items: &[Slot]) -> Result<()> {
         match items {
             &[a] => {
-                let [a] = cx.addresses(this, [a], [output])?;
-
+                let ([a], output) = cx.addresses(this, [a])?;
                 cx.push(Inst::Tuple1 { args: [*a], output });
-
                 cx.free_iter([a])?;
             }
             &[a, b] => {
-                let [a, b] = cx.addresses(this, [a, b], [output])?;
+                let ([a, b], output) = cx.addresses(this, [a, b])?;
 
                 cx.push(Inst::Tuple2 {
                     args: [*a, *b],
@@ -3313,7 +3629,7 @@ fn asm<'hir>(
                 cx.free_iter([a, b])?;
             }
             &[a, b, c] => {
-                let [a, b, c] = cx.addresses(this, [a, b, c], [output])?;
+                let ([a, b, c], output) = cx.addresses(this, [a, b, c])?;
 
                 cx.push(Inst::Tuple3 {
                     args: [*a, *b, *c],
@@ -3323,7 +3639,7 @@ fn asm<'hir>(
                 cx.free_iter([a, b, c])?;
             }
             &[a, b, c, d] => {
-                let [a, b, c, d] = cx.addresses(this, [a, b, c, d], [output])?;
+                let ([a, b, c, d], output) = cx.addresses(this, [a, b, c, d])?;
 
                 cx.push(Inst::Tuple4 {
                     args: [*a, *b, *c, *d],
@@ -3333,6 +3649,7 @@ fn asm<'hir>(
                 cx.free_iter([a, b, c, d])?;
             }
             args => {
+                let ([], output) = cx.addresses(this, [])?;
                 let address = cx.array(this, args.iter().copied())?;
 
                 cx.push(Inst::Tuple {
@@ -3349,15 +3666,10 @@ fn asm<'hir>(
     }
 
     #[instrument]
-    fn asm_option<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        this: Slot,
-        value: Option<Slot>,
-        output: AssemblyAddress,
-    ) -> Result<()> {
+    fn asm_option<'hir>(cx: &mut Ctxt<'_, 'hir>, this: Slot, value: Option<Slot>) -> Result<()> {
         match value {
             Some(value) => {
-                let [address] = cx.addresses(this, [value], [output])?;
+                let ([address], output) = cx.addresses(this, [value])?;
 
                 cx.push(Inst::Variant {
                     address: *address,
@@ -3368,6 +3680,8 @@ fn asm<'hir>(
                 cx.free_iter([address])?;
             }
             None => {
+                let ([], output) = cx.addresses(this, [])?;
+
                 cx.push(Inst::Variant {
                     address: output,
                     variant: InstVariant::None,
@@ -3385,9 +3699,8 @@ fn asm<'hir>(
         this: Slot,
         lhs: Slot,
         index: usize,
-        output: AssemblyAddress,
     ) -> Result<()> {
-        let [address] = cx.addresses(this, [lhs], [output])?;
+        let ([address], output) = cx.addresses(this, [lhs])?;
 
         cx.push(Inst::TupleIndexGet {
             address: *address,
@@ -3405,9 +3718,8 @@ fn asm<'hir>(
         this: Slot,
         lhs: Slot,
         field: &str,
-        output: AssemblyAddress,
     ) -> Result<()> {
-        let [address] = cx.addresses(this, [lhs], [output])?;
+        let ([address], output) = cx.addresses(this, [lhs])?;
 
         let slot = cx.q.unit.new_static_string(cx.span, field)?;
 
@@ -3429,93 +3741,49 @@ fn asm<'hir>(
         lhs: Slot,
         rhs: Slot,
     ) -> Result<()> {
-        let lhs_use = cx.take_slot_use(lhs, this)?;
-        let rhs_use = cx.take_slot_use(rhs, this)?;
-
-        let lhs_output = cx.alloc_for(lhs)?;
-
-        if rhs_use.is_only() {
-            asm(cx, rhs, lhs_output)?;
-        } else {
-            let rhs_output = cx.alloc_for(rhs)?;
-
-            if rhs_use.is_pending() {
-                asm(cx, rhs, rhs_output)?;
-            }
-
-            let name = cx.scopes.name_to_string(cx.span, binding.name)?;
-            let comment = format!("copy `{name}`");
-            cx.push_with_comment(
-                Inst::Copy {
-                    address: rhs_output,
-                    output: lhs_output,
-                },
-                comment,
-            );
-
-            if rhs_use.is_last() {
-                cx.free_for(lhs)?;
-            }
-        }
-
-        if lhs_use.is_last() {
-            cx.free_for(lhs)?;
-        }
-
-        if rhs_use.is_last() {
-            cx.free_for(rhs)?;
-        }
-
-        Ok(())
+        todo!()
     }
 
     #[instrument]
     fn asm_assign_struct_field<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         lhs: Slot,
         field: &str,
         rhs: Slot,
-        output: AssemblyAddress,
     ) -> Result<()> {
-        let rhs_output = cx.allocator.alloc();
-
-        asm(cx, lhs, output)?;
-        asm(cx, rhs, rhs_output)?;
-
+        let ([lhs, rhs], output) = cx.addresses(this, [lhs, rhs])?;
         let slot = cx.q.unit.new_static_string(cx.span, field)?;
 
         cx.push(Inst::ObjectIndexSet {
-            address: output,
-            value: rhs_output,
+            address: *lhs,
+            value: *rhs,
             slot,
             output,
         });
 
-        cx.allocator.free(cx.span, rhs_output)?;
+        cx.free_iter([lhs, rhs])?;
         Ok(())
     }
 
     #[instrument]
     fn asm_assign_tuple_field<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         lhs: Slot,
         index: usize,
         rhs: Slot,
-        output: AssemblyAddress,
     ) -> Result<()> {
-        let rhs_output = cx.allocator.alloc();
-
-        asm(cx, lhs, output)?;
-        asm(cx, rhs, rhs_output)?;
+        let ([lhs, rhs], output) = cx.addresses(this, [lhs, rhs])?;
 
         cx.push(Inst::TupleIndexSet {
-            address: output,
-            value: rhs_output,
+            address: *lhs,
+            value: *rhs,
             index,
             output,
         });
 
-        cx.allocator.free(cx.span, rhs_output)?;
+        cx.free_iter([lhs, rhs])?;
         Ok(())
     }
 
@@ -3525,9 +3793,8 @@ fn asm<'hir>(
         this: Slot,
         function: Slot,
         args: &[Slot],
-        output: AssemblyAddress,
     ) -> Result<()> {
-        let [function] = cx.addresses(this, [function], [output])?;
+        let ([function], output) = cx.addresses(this, [function])?;
         let address = cx.array(this, args.iter().copied())?;
 
         cx.push(Inst::CallFn {
@@ -3547,8 +3814,8 @@ fn asm<'hir>(
         this: Slot,
         args: &[Slot],
         hash: Hash,
-        output: AssemblyAddress,
     ) -> Result<()> {
+        let ([], output) = cx.addresses(this, [])?;
         let array = cx.array(this, args.iter().copied())?;
 
         cx.push(Inst::Call {
@@ -3565,22 +3832,23 @@ fn asm<'hir>(
     #[instrument]
     fn asm_call_instance<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         lhs: Slot,
         args: &[Slot],
         hash: Hash,
-        output: AssemblyAddress,
     ) -> Result<()> {
+        let ([], output) = cx.addresses(this, [])?;
         let address = cx.allocator.array_address();
 
         {
             let output = cx.allocator.array_address();
-            asm(cx, lhs, output)?;
+            asm_to_output(cx, lhs, output)?;
             cx.allocator.alloc_array_item();
         }
 
-        for hir in args {
+        for &slot in args {
             let output = cx.allocator.array_address();
-            asm(cx, *hir, output)?;
+            asm_to_output(cx, slot, output)?;
             cx.allocator.alloc_array_item();
         }
 
@@ -3601,57 +3869,47 @@ fn asm<'hir>(
         this: Slot,
         expr: Slot,
         args: &[Slot],
-        output: AssemblyAddress,
     ) -> Result<()> {
-        asm(cx, expr, output)?;
+        let ([function], output) = cx.addresses(this, [expr])?;
         let array = cx.array(this, args.iter().copied())?;
 
         cx.push(Inst::CallFn {
-            function: output,
+            function: *function,
             address: *array,
             count: array.count(),
             output,
         });
 
-        cx.free_iter([array])?;
+        cx.free_iter([function, array])?;
         Ok(())
     }
 
     #[instrument]
-    fn asm_yield<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        this: Slot,
-        expr: Option<Slot>,
-        output: AssemblyAddress,
-    ) -> Result<()> {
+    fn asm_yield<'hir>(cx: &mut Ctxt<'_, 'hir>, this: Slot, expr: Option<Slot>) -> Result<()> {
         Ok(match expr {
             Some(expr) => {
-                let [address] = cx.addresses(this, [expr], [output])?;
+                let ([address], output) = cx.addresses(this, [expr])?;
 
                 cx.push(Inst::Yield {
-                    address: output,
+                    address: *address,
                     output,
                 });
 
                 cx.free_iter([address])?;
             }
             None => {
+                let ([], output) = cx.addresses(this, [])?;
                 cx.push(Inst::YieldUnit { output });
             }
         })
     }
 
     #[instrument]
-    fn asm_await<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        this: Slot,
-        expr: Slot,
-        output: AssemblyAddress,
-    ) -> Result<()> {
-        let [address] = cx.addresses(this, [expr], [output])?;
+    fn asm_await<'hir>(cx: &mut Ctxt<'_, 'hir>, this: Slot, expr: Slot) -> Result<()> {
+        let ([address], output) = cx.addresses(this, [expr])?;
 
         cx.push(Inst::Await {
-            address: output,
+            address: *address,
             output,
         });
 
@@ -3660,26 +3918,16 @@ fn asm<'hir>(
     }
 
     #[instrument]
-    fn asm_return<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        this: Slot,
-        expr: Slot,
-        output: AssemblyAddress,
-    ) -> Result<()> {
-        let [address] = cx.addresses(this, [expr], [output])?;
+    fn asm_return<'hir>(cx: &mut Ctxt<'_, 'hir>, this: Slot, expr: Slot) -> Result<()> {
+        let ([address], _) = cx.addresses(this, [expr])?;
         cx.push(Inst::Return { address: *address });
         cx.free_iter([address])?;
         Ok(())
     }
 
     #[instrument]
-    fn asm_try<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        this: Slot,
-        expr: Slot,
-        output: AssemblyAddress,
-    ) -> Result<()> {
-        let [address] = cx.addresses(this, [expr], [output])?;
+    fn asm_try<'hir>(cx: &mut Ctxt<'_, 'hir>, this: Slot, expr: Slot) -> Result<()> {
+        let ([address], output) = cx.addresses(this, [expr])?;
 
         cx.push(Inst::Try {
             address: *address,
@@ -3691,8 +3939,10 @@ fn asm<'hir>(
     }
 
     #[instrument]
-    fn asm_function<'hir>(cx: &mut Ctxt<'_, 'hir>, hash: Hash, output: AssemblyAddress) {
+    fn asm_function<'hir>(cx: &mut Ctxt<'_, 'hir>, this: Slot, hash: Hash) -> Result<()> {
+        let ([], output) = cx.addresses(this, [])?;
         cx.push(Inst::LoadFn { hash, output });
+        Ok(())
     }
 
     #[instrument]
@@ -3701,8 +3951,8 @@ fn asm<'hir>(
         this: Slot,
         captures: &[Slot],
         hash: Hash,
-        output: AssemblyAddress,
     ) -> Result<()> {
+        let ([], output) = cx.addresses(this, [])?;
         let array = cx.array(this, captures.iter().copied())?;
 
         cx.push(Inst::Closure {
@@ -3721,56 +3971,52 @@ fn asm<'hir>(
     fn asm_loop<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
         this: Slot,
-        condition: LoopCondition<'hir>,
+        condition: LoopCondition,
         body: Slot,
         start: Label,
         end: Label,
-        output: AssemblyAddress,
     ) -> Result<ExprOutcome> {
         let cleanup = match condition {
             LoopCondition::Forever => {
                 cx.label(start)?;
                 None
             }
-            LoopCondition::Condition { expr, pat } => {
+            LoopCondition::Condition { pat } => {
                 cx.label(start)?;
-                let bound_pat = bind_pat(cx, pat, expr)?;
-                asm_bound_pat(cx, bound_pat, end)?;
+                asm_pat(cx, pat, end)?;
                 None
             }
-            LoopCondition::Iterator { iter, binding } => {
-                let [iter_var] = cx.addresses(this, [iter], [])?;
+            LoopCondition::Iterator { iter, pat } => {
+                let value = cx.pat_expr(pat)?;
+                let [iter, value] = cx.implicit_addresses([iter, value])?;
 
                 cx.push(Inst::CallInstance {
                     hash: *Protocol::INTO_ITER,
-                    address: *iter_var,
+                    address: *iter,
                     count: 0,
-                    output: *iter_var,
+                    output: *iter,
                 });
 
-                let value_expr = cx.insert_expr(ExprKind::Empty)?;
-                let value_output = cx.alloc_for(value_expr)?;
+                cx.label(start)?;
 
                 cx.push(Inst::IterNext {
-                    address: *iter_var,
+                    address: *iter,
                     label: end,
-                    output: value_output,
+                    output: *value,
                 });
 
-                let bound_pat = bind_pat(cx, binding, value_expr)?;
-                asm_bound_pat(cx, bound_pat, end)?;
-                cx.label(start)?;
-                Some(iter_var)
+                asm_pat(cx, pat, end)?;
+                Some((iter, value))
             }
         };
 
-        let outcome = asm(cx, body, output)?;
+        let outcome = asm(cx, body)?;
 
         cx.push(Inst::Jump { label: start });
         cx.label(end)?;
 
-        if let Some(cleanup) = cleanup {
-            cx.free_iter([cleanup])?;
+        if let Some((iter, value)) = cleanup {
+            cx.free_iter([iter, value])?;
         }
 
         Ok(outcome)
@@ -3790,10 +4036,9 @@ fn asm<'hir>(
             let loop_slot_used = cx.take_slot_use(loop_slot, this)?;
 
             let output = cx.alloc_for(loop_slot)?;
-            asm(cx, expr, output)?;
+            asm_to_output(cx, expr, output)?;
 
             if loop_slot_used.is_last() {
-                dbg!("FREE LOOP");
                 cx.free_for(loop_slot)?;
             }
 
@@ -3819,8 +4064,8 @@ fn asm<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
         this: Slot,
         exprs: &[Slot],
-        output: AssemblyAddress,
     ) -> Result<ExprOutcome> {
+        let ([], output) = cx.addresses(this, [])?;
         let address = cx.array(this, exprs.iter().copied())?;
 
         cx.push(Inst::StringConcat {
@@ -3841,9 +4086,8 @@ fn asm<'hir>(
         this: Slot,
         spec: &FormatSpec,
         expr: Slot,
-        output: AssemblyAddress,
     ) -> Result<ExprOutcome> {
-        let [address] = cx.addresses(this, [expr], [output])?;
+        let ([address], output) = cx.addresses(this, [expr])?;
 
         cx.push(Inst::Format {
             address: *address,
@@ -3864,8 +4108,8 @@ fn block<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Block<'hir>) -> Result<Slot> 
             let address = match *stmt {
                 hir::Stmt::Local(hir) => {
                     let expr = expr_value(cx, hir.expr)?;
-                    let pat = pat(cx, hir.pat)?;
-                    cx.insert_expr(ExprKind::Let { pat, expr })?
+                    let pat = pat(cx, hir.pat, expr)?;
+                    cx.insert_expr(ExprKind::Let { pat })?
                 }
                 hir::Stmt::Expr(hir) => expr_value(cx, hir)?,
             };
@@ -4729,26 +4973,28 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
         let condition = match hir.condition {
             hir::LoopCondition::Forever => LoopCondition::Forever,
             hir::LoopCondition::Condition { condition } => {
-                let (expr, pat) = match *condition {
+                let pat = match *condition {
                     hir::Condition::Expr(hir) => {
                         let lit = cx.insert_expr(ExprKind::Store {
                             value: InstValue::Bool(true),
                         })?;
-                        (expr_value(cx, hir)?, cx.insert_pat(PatKind::Lit { lit }))
+                        let expr = expr_value(cx, hir)?;
+                        cx.insert_pat(cx.build_pat(PatKind::Lit { lit }), expr)?
                     }
                     hir::Condition::ExprLet(hir) => {
                         let expr = expr_value(cx, hir.expr)?;
-                        let pat = cx.with_scope(scope, |cx| pat(cx, hir.pat))?;
-                        (expr, pat)
+                        cx.with_scope(scope, |cx| pat(cx, hir.pat, expr))?
                     }
                 };
 
-                LoopCondition::Condition { expr, pat }
+                LoopCondition::Condition { pat }
             }
             hir::LoopCondition::Iterator { binding, iter } => {
                 let iter = expr_value(cx, iter)?;
-                let binding = cx.with_scope(scope, |cx| pat(cx, binding))?;
-                LoopCondition::Iterator { binding, iter }
+                let value = cx.insert_expr(ExprKind::Empty)?;
+                let pat = cx.with_scope(scope, |cx| pat(cx, binding, value))?;
+
+                LoopCondition::Iterator { iter, pat }
             }
         };
 
@@ -5053,9 +5299,10 @@ fn const_value<'hir>(cx: &mut Ctxt<'_, 'hir>, value: &ConstValue) -> Result<Slot
 }
 
 /// Assemble a pattern.
-fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Pat<'hir>) -> Result<Pat<'hir>> {
+fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Pat<'hir>, expr: Slot) -> Result<PatId> {
     let mut removed = HashMap::new();
-    return pat(cx, hir, &mut removed);
+    let kind = pat(cx, hir, &mut removed)?;
+    return cx.insert_pat(kind, expr);
 
     #[instrument]
     fn pat<'hir>(
@@ -5064,17 +5311,17 @@ fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Pat<'hir>) -> Result<Pat<'hir>>
         removed: &mut HashMap<Name, Span>,
     ) -> Result<Pat<'hir>> {
         return cx.with_span(hir.span(), |cx| {
-            let slot = match hir.kind {
+            let kind = match hir.kind {
                 hir::PatKind::PatPath(hir) => pat_binding(cx, hir, removed)?,
-                hir::PatKind::PatIgnore => cx.insert_pat(PatKind::Ignore),
+                hir::PatKind::PatIgnore => cx.build_pat(PatKind::Ignore),
                 hir::PatKind::PatLit(hir) => {
                     let lit = expr_value(cx, hir)?;
-                    cx.insert_pat(PatKind::Lit { lit })
+                    cx.build_pat(PatKind::Lit { lit })
                 }
                 hir::PatKind::PatVec(hir) => {
                     let items = iter!(cx; hir.items, |hir| pat(cx, hir, removed)?);
 
-                    cx.insert_pat(PatKind::Vec {
+                    cx.build_pat(PatKind::Vec {
                         items,
                         is_open: hir.is_open,
                     })
@@ -5083,7 +5330,7 @@ fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Pat<'hir>) -> Result<Pat<'hir>>
                 hir::PatKind::PatObject(hir) => pat_object(cx, hir, removed)?,
             };
 
-            Ok(slot)
+            Ok(kind)
         });
     }
 
@@ -5164,11 +5411,11 @@ fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Pat<'hir>) -> Result<Pat<'hir>>
             None => PatTupleKind::Anonymous,
         };
 
-        let patterns = iter!(cx; hir.items, |hir| pat(cx, hir, removed)?);
+        let items = iter!(cx; hir.items, |hir| pat(cx, hir, removed)?);
 
-        Ok(cx.insert_pat(PatKind::Tuple {
+        Ok(cx.build_pat(PatKind::Tuple {
             kind,
-            patterns,
+            items,
             is_open: hir.is_open,
         }))
     }
@@ -5270,7 +5517,7 @@ fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Pat<'hir>) -> Result<Pat<'hir>>
             }
         };
 
-        let patterns = iter!(cx; hir.bindings, |binding| {
+        let items = iter!(cx; hir.bindings, |binding| {
             if let Some(hir) = binding.pat {
                 pat(cx, hir, removed)?
             } else {
@@ -5278,7 +5525,7 @@ fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Pat<'hir>) -> Result<Pat<'hir>>
             }
         });
 
-        Ok(cx.insert_pat(PatKind::Object { kind, patterns }))
+        Ok(cx.build_pat(PatKind::Object { kind, items }))
     }
 
     /// Assemble a binding pattern which is *just* a variable captured from an object.
@@ -5305,29 +5552,30 @@ fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Pat<'hir>) -> Result<Pat<'hir>>
         hir: &hir::Path<'hir>,
         removed: &mut HashMap<Name, Span>,
     ) -> Result<Pat<'hir>> {
-        let pat = match pat_path(cx, hir)? {
+        let kind = match pat_path(cx, hir)? {
             PatPath::Name { name } => {
-                let name_expr = cx.insert_expr(ExprKind::Empty)?;
+                let ghost_slot = cx.insert_expr(ExprKind::Empty)?;
 
-                {
-                    let name = cx.scopes.name(name);
-                    let replaced = cx.scopes.declare(cx.span, cx.scope, name, name_expr)?;
+                let name = cx.scopes.name(name);
+                let (binding, replaced) = cx.declare(name, ghost_slot)?;
 
-                    if replaced.is_some() {
-                        if let Some(span) = removed.insert(name, cx.span) {
-                            return Err(cx.error(CompileErrorKind::DuplicateBinding {
-                                previous_span: span,
-                            }));
-                        }
+                if replaced.is_some() {
+                    if let Some(span) = removed.insert(name, cx.span) {
+                        return Err(cx.error(CompileErrorKind::DuplicateBinding {
+                            previous_span: span,
+                        }));
                     }
                 }
 
-                cx.insert_pat(PatKind::Name { name, name_expr })
+                PatKind::Name {
+                    binding,
+                    ghost_slot,
+                }
             }
-            PatPath::Meta { meta } => cx.insert_pat(PatKind::Meta { meta }),
+            PatPath::Meta { meta } => PatKind::Meta { meta },
         };
 
-        Ok(pat)
+        Ok(cx.build_pat(kind))
     }
 }
 
@@ -5364,262 +5612,6 @@ fn generics_parameters<'hir>(
     }
 
     Ok(parameters.finish())
-}
-
-/// Bind the pattern in the *current* scope.
-#[instrument]
-fn bind_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, pat: Pat<'hir>, expr: Slot) -> Result<BoundPat<'hir>> {
-    return cx.with_span(pat.span, |cx| match pat.kind {
-        PatKind::Ignore => Ok(cx.bound_pat(BoundPatKind::Irrefutable)),
-        PatKind::Lit { lit } => bind_pat_lit(cx, lit, expr),
-        PatKind::Name { name, name_expr } => Ok(cx.bound_pat(BoundPatKind::Expr {
-            name,
-            name_expr,
-            expr,
-        })),
-        PatKind::Meta { meta } => {
-            let type_match = match tuple_match_for(cx, meta) {
-                Some((args, inst)) if args == 0 => inst,
-                _ => return Err(cx.error(CompileErrorKind::UnsupportedPattern)),
-            };
-
-            Ok(cx.bound_pat(BoundPatKind::TypedSequence {
-                type_match,
-                expr,
-                items: &[],
-            }))
-        }
-        PatKind::Vec { items, is_open } => bind_pat_vec(cx, items, is_open, expr),
-        PatKind::Tuple {
-            kind,
-            patterns,
-            is_open,
-        } => bind_pat_tuple(cx, kind, patterns, is_open, expr),
-        PatKind::Object { kind, patterns } => bind_pat_object(cx, kind, patterns, expr),
-    });
-
-    /// Bind a literal pattern.
-    #[instrument]
-    fn bind_pat_lit<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        lit: Slot,
-        expr: Slot,
-    ) -> Result<BoundPat<'hir>> {
-        // Match irrefutable patterns.
-        match (cx.slot(lit)?.kind, cx.slot(expr)?.kind) {
-            (ExprKind::Store { value: a }, ExprKind::Store { value: b }) if a == b => {
-                return Ok(cx.bound_pat(BoundPatKind::Irrefutable));
-            }
-            (ExprKind::String { string: a }, ExprKind::String { string: b }) if a == b => {
-                return Ok(cx.bound_pat(BoundPatKind::Irrefutable));
-            }
-            (ExprKind::Bytes { bytes: a }, ExprKind::Bytes { bytes: b }) if a == b => {
-                return Ok(cx.bound_pat(BoundPatKind::Irrefutable));
-            }
-            _ => {}
-        }
-
-        Ok(cx.bound_pat(BoundPatKind::Lit { lit, expr }))
-    }
-
-    /// Bind a vector pattern.
-    #[instrument]
-    fn bind_pat_vec<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        patterns: &'hir [Pat<'hir>],
-        is_open: bool,
-        expr: Slot,
-    ) -> Result<BoundPat<'hir>> {
-        // Try a simpler form of pattern matching through syntactical reassignment.
-        match cx.slot(expr)?.kind {
-            ExprKind::Vec { items: expr_items }
-                if expr_items.len() == patterns.len()
-                    || expr_items.len() >= patterns.len() && is_open =>
-            {
-                let items = iter!(cx; patterns.iter().copied().zip(expr_items.iter().copied()), |(pat, expr)| {
-                    bind_pat(cx, pat, expr)?
-                });
-
-                return Ok(cx.bound_pat(BoundPatKind::IrrefutableSequence { items }));
-            }
-            _ => {}
-        }
-
-        let address = cx.allocator.array_address();
-
-        cx.allocator.alloc_array_items(patterns.len());
-
-        // NB we bind the arguments in reverse to allow for higher elements
-        // in the array to be freed up.
-        let items = iter!(cx; patterns.iter().rev(), |pat| {
-            cx.allocator.free_array_item(cx.span)?;
-            let expr = cx.insert_expr_with_address(ExprKind::Address, cx.allocator.array_address())?;
-            bind_pat(
-                cx,
-                *pat,
-                expr,
-            )?
-        });
-
-        Ok(cx.bound_pat(BoundPatKind::Vec {
-            address,
-            expr,
-            is_open,
-            items,
-        }))
-    }
-
-    /// Bind a tuple pattern.
-    #[instrument]
-    fn bind_pat_tuple<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        kind: PatTupleKind,
-        patterns: &'hir [Pat<'hir>],
-        is_open: bool,
-        expr: Slot,
-    ) -> Result<BoundPat<'hir>> {
-        match kind {
-            PatTupleKind::Typed { type_match } => {
-                let items = iter!(cx; patterns.iter().enumerate().rev(), |(index, pat)| {
-                    let expr = cx.insert_expr(ExprKind::TupleFieldAccess {
-                        lhs: expr,
-                        index,
-                    })?;
-
-                    bind_pat(cx, *pat, expr)?
-                });
-
-                Ok(cx.bound_pat(BoundPatKind::TypedSequence {
-                    type_match,
-                    expr,
-                    items,
-                }))
-            }
-            PatTupleKind::Anonymous => {
-                // Try a simpler form of pattern matching through syntactical
-                // reassignment.
-                match cx.slot(expr)?.kind {
-                    ExprKind::Tuple { items: tuple_items }
-                        if tuple_items.len() == patterns.len()
-                            || is_open && tuple_items.len() >= patterns.len() =>
-                    {
-                        let items = iter!(cx; patterns.iter().zip(tuple_items), |(pat, expr)| {
-                            bind_pat(cx, *pat, *expr)?
-                        });
-
-                        return Ok(cx.bound_pat(BoundPatKind::IrrefutableSequence { items }));
-                    }
-                    _ => {}
-                }
-
-                let address = cx.allocator.array_address();
-                cx.allocator.alloc_array_items(patterns.len());
-
-                // NB we bind the arguments in reverse to allow for higher elements
-                // in the array to be freed up for subsequent bindings.
-                let items = iter!(cx; patterns.iter().rev(), |pat| {
-                    cx.allocator.free_array_item(cx.span)?;
-                    let expr = cx.insert_expr_with_address(ExprKind::Address, cx.allocator.array_address())?;
-                    bind_pat(cx, *pat, expr)?
-                });
-
-                Ok(cx.bound_pat(BoundPatKind::AnonymousTuple {
-                    expr,
-                    is_open,
-                    items,
-                    address,
-                }))
-            }
-        }
-    }
-
-    /// Set up binding for pattern objects.
-    #[instrument]
-    fn bind_pat_object<'hir>(
-        cx: &mut Ctxt<'_, 'hir>,
-        kind: PatObjectKind<'hir>,
-        patterns: &'hir [Pat<'hir>],
-        expr: Slot,
-    ) -> Result<BoundPat<'hir>> {
-        match kind {
-            PatObjectKind::Typed { type_match, keys } => {
-                let items = iter!(cx; keys.iter().zip(patterns), |(&(field, hash), pat)| {
-                    let expr = cx.insert_expr(ExprKind::StructFieldAccess {
-                        lhs: expr,
-                        field,
-                        hash,
-                    })?;
-
-                    bind_pat(cx, *pat, expr)?
-                });
-
-                Ok(cx.bound_pat(BoundPatKind::TypedSequence {
-                    type_match,
-                    expr,
-                    items,
-                }))
-            }
-            PatObjectKind::Anonymous { slot, is_open } => {
-                // Try a simpler form of pattern matching through syntactical
-                // reassignment.
-                match cx.slot(expr)?.kind {
-                    ExprKind::Struct {
-                        kind: ExprStructKind::Anonymous { slot: expr_slot },
-                        exprs,
-                    } if object_keys_match(&cx.q.unit, expr_slot, slot, is_open)
-                        .unwrap_or_default() =>
-                    {
-                        let items = iter!(cx; patterns.iter().zip(exprs), |(pat, expr)| {
-                            bind_pat(cx, *pat, *expr)?
-                        });
-
-                        return Ok(cx.bound_pat(BoundPatKind::IrrefutableSequence { items }));
-                    }
-                    _ => {}
-                }
-
-                let address = cx.allocator.array_address();
-                cx.allocator.alloc_array_items(patterns.len());
-
-                // NB we bind the arguments in reverse to allow for higher elements
-                // in the array to be freed up for subsequent bindings.
-                let items = iter!(cx; patterns.iter().rev(), |pat| {
-                    cx.allocator.free_array_item(cx.span)?;
-                    let expr = cx.insert_expr_with_address(ExprKind::Address, cx.allocator.array_address())?;
-                    bind_pat(cx, *pat, expr)?
-                });
-
-                Ok(cx.bound_pat(BoundPatKind::AnonymousObject {
-                    address,
-                    expr,
-                    slot,
-                    is_open,
-                    items,
-                }))
-            }
-        }
-    }
-
-    /// Test if object keys match.
-    fn object_keys_match(
-        unit: &UnitBuilder,
-        from_slot: usize,
-        to_slot: usize,
-        is_open: bool,
-    ) -> Option<bool> {
-        let from_keys = unit.get_static_object_keys(from_slot)?;
-        let to_keys = unit.get_static_object_keys(to_slot)?;
-
-        let mut from_keys = from_keys.iter().cloned().collect::<HashSet<_>>();
-
-        for key in to_keys {
-            if !from_keys.remove(key) {
-                return Some(false);
-            }
-        }
-
-        Some(is_open || from_keys.is_empty())
-    }
 }
 
 /// Coerce an aerna allocation error.
@@ -5757,159 +5749,166 @@ fn struct_match_for<'a>(
 }
 
 /// Walk over an expression to modify each expression that it touches.
-fn walk_expr_slots<T>(kind: ExprKind<'_>, mut op: T) -> Result<()>
+fn walk_expr_slots<T>(cx: &mut Ctxt<'_, '_>, kind: ExprKind<'_>, mut op: T) -> Result<()>
 where
-    T: FnMut(Slot, UseKind) -> Result<()>,
+    T: FnMut(&mut Ctxt<'_, '_>, Slot, UseKind) -> Result<()>,
 {
     match kind {
         ExprKind::Empty => {}
         ExprKind::Address => {}
         ExprKind::Binding { slot, use_kind, .. } => {
-            op(slot, use_kind)?;
+            op(cx, slot, use_kind)?;
         }
         ExprKind::Assign {
             lhs, use_kind, rhs, ..
         } => {
-            op(lhs, use_kind)?;
-            op(rhs, UseKind::Same)?;
+            op(cx, lhs, use_kind)?;
+            op(cx, rhs, UseKind::Same)?;
         }
         ExprKind::TupleFieldAccess { lhs, .. } => {
-            op(lhs, UseKind::Same)?;
+            op(cx, lhs, UseKind::Same)?;
         }
         ExprKind::StructFieldAccess { lhs, .. } => {
-            op(lhs, UseKind::Same)?;
+            op(cx, lhs, UseKind::Same)?;
         }
         ExprKind::StructFieldAccessGeneric { lhs, .. } => {
-            op(lhs, UseKind::Same)?;
+            op(cx, lhs, UseKind::Same)?;
         }
         ExprKind::AssignStructField { lhs, rhs, .. } => {
-            op(lhs, UseKind::Same)?;
-            op(rhs, UseKind::Same)?;
+            op(cx, lhs, UseKind::Same)?;
+            op(cx, rhs, UseKind::Same)?;
         }
         ExprKind::AssignTupleField { lhs, rhs, .. } => {
-            op(lhs, UseKind::Same)?;
-            op(rhs, UseKind::Same)?;
+            op(cx, lhs, UseKind::Same)?;
+            op(cx, rhs, UseKind::Same)?;
         }
-        ExprKind::Block { .. } => {
-            // NB: statements in a block intentionally has *no* users, to
-            // ensure that they are swept away during optimization unless
-            // they have side effects.
+        ExprKind::Block {
+            statements, tail, ..
+        } => {
+            for &slot in statements {
+                op(cx, slot, UseKind::Same)?;
+            }
+
+            if let Some(slot) = tail {
+                op(cx, slot, UseKind::Same)?;
+            }
         }
-        ExprKind::Let { expr, .. } => {
-            op(expr, UseKind::Same)?;
+        ExprKind::Let { pat } => {
+            let expr = cx.pat_expr(pat)?;
+            op(cx, expr, UseKind::Same)?;
         }
         ExprKind::Store { .. } => {}
         ExprKind::Bytes { .. } => {}
         ExprKind::String { .. } => {}
         ExprKind::Unary { expr, .. } => {
-            op(expr, UseKind::Same)?;
+            op(cx, expr, UseKind::Same)?;
         }
         ExprKind::BinaryAssign { lhs, rhs, .. } => {
-            op(lhs, UseKind::Same)?;
-            op(rhs, UseKind::Same)?;
+            op(cx, lhs, UseKind::Same)?;
+            op(cx, rhs, UseKind::Same)?;
         }
         ExprKind::BinaryConditional { lhs, rhs, .. } => {
-            op(lhs, UseKind::Same)?;
-            op(rhs, UseKind::Same)?;
+            op(cx, lhs, UseKind::Same)?;
+            op(cx, rhs, UseKind::Same)?;
         }
         ExprKind::Binary { lhs, rhs, .. } => {
-            op(lhs, UseKind::Same)?;
-            op(rhs, UseKind::Same)?;
+            op(cx, lhs, UseKind::Same)?;
+            op(cx, rhs, UseKind::Same)?;
         }
         ExprKind::Index { target, .. } => {
-            op(target, UseKind::Same)?;
+            op(cx, target, UseKind::Same)?;
         }
         ExprKind::Meta { .. } => {}
         ExprKind::Struct { exprs, .. } => {
             for &slot in exprs {
-                op(slot, UseKind::Same)?;
+                op(cx, slot, UseKind::Same)?;
             }
         }
         ExprKind::Tuple { items } => {
             for &slot in items {
-                op(slot, UseKind::Same)?;
+                op(cx, slot, UseKind::Same)?;
             }
         }
         ExprKind::Vec { items } => {
             for &slot in items {
-                op(slot, UseKind::Same)?;
+                op(cx, slot, UseKind::Same)?;
             }
         }
         ExprKind::Range { from, to, .. } => {
-            op(from, UseKind::Same)?;
-            op(to, UseKind::Same)?;
+            op(cx, from, UseKind::Same)?;
+            op(cx, to, UseKind::Same)?;
         }
         ExprKind::Option { value } => {
             if let Some(slot) = value {
-                op(slot, UseKind::Same)?;
+                op(cx, slot, UseKind::Same)?;
             }
         }
         ExprKind::CallAddress { address, args } => {
-            op(address, UseKind::Same)?;
+            op(cx, address, UseKind::Same)?;
 
             for &slot in args {
-                op(slot, UseKind::Same)?;
+                op(cx, slot, UseKind::Same)?;
             }
         }
         ExprKind::CallHash { args, .. } => {
             for &slot in args {
-                op(slot, UseKind::Same)?;
+                op(cx, slot, UseKind::Same)?;
             }
         }
         ExprKind::CallInstance { lhs, args, .. } => {
-            op(lhs, UseKind::Same)?;
+            op(cx, lhs, UseKind::Same)?;
 
             for &slot in args {
-                op(slot, UseKind::Same)?;
+                op(cx, slot, UseKind::Same)?;
             }
         }
         ExprKind::CallExpr { expr, args } => {
-            op(expr, UseKind::Same)?;
+            op(cx, expr, UseKind::Same)?;
 
             for &slot in args {
-                op(slot, UseKind::Same)?;
+                op(cx, slot, UseKind::Same)?;
             }
         }
         ExprKind::Yield { expr } => {
             if let Some(slot) = expr {
-                op(slot, UseKind::Same)?;
+                op(cx, slot, UseKind::Same)?;
             }
         }
         ExprKind::Await { expr } => {
-            op(expr, UseKind::Same)?;
+            op(cx, expr, UseKind::Same)?;
         }
         ExprKind::Return { expr } => {
-            op(expr, UseKind::Same)?;
+            op(cx, expr, UseKind::Same)?;
         }
         ExprKind::Try { expr } => {
-            op(expr, UseKind::Same)?;
+            op(cx, expr, UseKind::Same)?;
         }
         ExprKind::Function { .. } => {}
         ExprKind::Closure { captures, .. } => {
             for &slot in captures {
-                op(slot, UseKind::Same)?;
+                op(cx, slot, UseKind::Same)?;
             }
         }
         ExprKind::Loop { body, .. } => {
-            op(body, UseKind::Same)?;
+            op(cx, body, UseKind::Same)?;
         }
         ExprKind::Break {
             value, loop_slot, ..
         } => {
             if let Some(slot) = value {
-                op(slot, UseKind::Same)?;
+                op(cx, slot, UseKind::Same)?;
             }
 
-            op(loop_slot, UseKind::Branch)?;
+            op(cx, loop_slot, UseKind::Branch)?;
         }
         ExprKind::Continue { .. } => {}
         ExprKind::StringConcat { exprs } => {
             for &slot in exprs {
-                op(slot, UseKind::Same)?;
+                op(cx, slot, UseKind::Same)?;
             }
         }
         ExprKind::Format { expr, .. } => {
-            op(expr, UseKind::Same)?;
+            op(cx, expr, UseKind::Same)?;
         }
     }
 

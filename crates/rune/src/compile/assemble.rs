@@ -2,8 +2,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::mem;
 use std::num::NonZeroUsize;
-use std::ops::Deref;
-use std::ops::Neg as _;
+use std::ops::{Deref, Neg as _};
 use std::vec;
 
 use num::ToPrimitive;
@@ -11,7 +10,7 @@ use rune_macros::__instrument_hir as instrument;
 
 use crate::arena::{Arena, ArenaAllocError, ArenaWriteSliceOutOfBounds};
 use crate::ast::{self, Span, Spanned};
-use crate::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use crate::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use crate::compile::UnitBuilder;
 use crate::compile::{
     ir, Assembly, AssemblyAddress, CaptureMeta, CompileError, CompileErrorKind, CompileVisitor,
@@ -88,34 +87,6 @@ enum Needs {
 const SELF: &str = "self";
 
 type Result<T> = std::result::Result<T, CompileError>;
-
-/// An address which is associated with an array.
-struct ArrayAddress {
-    index: usize,
-    count: usize,
-}
-
-impl ArrayAddress {
-    const fn new(index: usize, count: usize) -> Self {
-        Self { index, count }
-    }
-
-    /// Coerce into assembly address.
-    fn address(&self) -> AssemblyAddress {
-        AssemblyAddress::Array(self.index)
-    }
-
-    /// Get the number of elements in the allocated address.
-    fn count(&self) -> usize {
-        self.count
-    }
-
-    /// Free an arrey address.
-    fn free<'hir>(self, cx: &mut Ctxt<'_, 'hir>) -> Result<()> {
-        cx.allocator.free_array(cx.span, self.count)?;
-        Ok(())
-    }
-}
 
 #[derive(Debug, Clone, Copy, Default)]
 enum CtxtState {
@@ -212,9 +183,8 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     }
 
     /// Free the inherent allocation associated with the slot.
-    fn alloc_free_for(&mut self, slot: Slot) -> Result<()> {
-        self.scopes
-            .alloc_free_for(self.span, slot, &mut self.allocator)
+    fn free_for(&mut self, slot: Slot) -> Result<()> {
+        self.scopes.free_for(self.span, slot, &mut self.allocator)
     }
 
     /// Access slot storage for the given slot.
@@ -258,7 +228,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         let storage = self.slot_mut(slot)?;
         storage.remove_user(span, user)?;
 
-        if storage.users.is_empty() {
+        if storage.uses.is_empty() {
             self.useless.insert(slot);
         }
 
@@ -485,7 +455,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     }
 
     /// Allocate an array of addresses.
-    fn array<I>(&mut self, expressions: I) -> Result<UsedAddress>
+    fn array<I>(&mut self, this: Slot, expressions: I) -> Result<UsedAddress>
     where
         I: IntoIterator<Item = Slot>,
     {
@@ -494,7 +464,31 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 
         for slot in expressions {
             let output = self.allocator.array_address();
-            asm(self, slot, output)?;
+
+            let used = self.take_slot_use(slot, this)?;
+
+            // If only, assembled directly onto our desired output.
+            if used.is_only() {
+                asm(self, slot, output)?;
+            } else if used.is_pending() {
+                let slot_output = self.alloc_for(slot)?;
+                asm(self, slot, slot_output)?;
+                self.push(Inst::Copy {
+                    address: slot_output,
+                    output,
+                });
+            } else {
+                let slot_output = self.alloc_for(slot)?;
+                self.push(Inst::Copy {
+                    address: slot_output,
+                    output,
+                });
+            }
+
+            if used.is_last() {
+                self.free_for(slot)?;
+            }
+
             self.allocator.alloc_array_item();
             count += 1;
         }
@@ -552,14 +546,31 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
                 } if used.is_only() => return follow_slot(cx, tmp, followed_slot, slot),
                 _ => {
                     let address = if let Some(address) = tmp.next() {
+                        if used.is_pending() {
+                            asm(cx, slot, address)?;
+                        } else {
+                            let slot_address = cx.alloc_for(slot)?;
+
+                            cx.push(Inst::Copy {
+                                address: slot_address,
+                                output: address,
+                            });
+
+                            if used.is_last() {
+                                cx.free_for(slot)?;
+                            }
+                        }
+
                         address
                     } else {
-                        cx.alloc_for(slot)?
-                    };
+                        let address = cx.alloc_for(slot)?;
 
-                    if used.is_pending() {
-                        asm(cx, slot, address)?;
-                    }
+                        if used.is_pending() {
+                            asm(cx, slot, address)?;
+                        }
+
+                        address
+                    };
 
                     UsedAddress::new(address, slot, used)
                 }
@@ -575,7 +586,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
             match alloc.kind {
                 UsedAddressKind::Slot(slot, used) => {
                     if used.is_last() {
-                        self.alloc_free_for(slot)?;
+                        self.free_for(slot)?;
                     }
                 }
                 UsedAddressKind::Array(count) => {
@@ -610,6 +621,14 @@ impl UsedAddress {
         Self {
             address,
             kind: UsedAddressKind::Array(count),
+        }
+    }
+
+    /// Get the number of elements in this sequence of addresses.
+    fn count(&self) -> usize {
+        match self.kind {
+            UsedAddressKind::Slot(..) => 1,
+            UsedAddressKind::Array(count) => count,
         }
     }
 }
@@ -706,104 +725,158 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
     let out = std::io::stdout();
     let mut out = out.lock();
 
-    let mut visited = HashSet::new();
+    let mut task = Task {
+        patterns: 0,
+        visited: HashSet::new(),
+        queue: VecDeque::from_iter([Job::Slot(slot)]),
+    };
 
-    debug(&mut out, cx, slot, 0, &mut visited)?;
+    while let Some(job) = task.queue.pop_front() {
+        match job {
+            Job::Pat(index, pat) => {
+                debug_pat(&mut out, index, pat, &mut task)?;
+            }
+            Job::Slot(slot) => {
+                debug_slot(&mut out, cx, slot, &mut task)?;
+            }
+        }
+    }
+
     return Ok(());
 
+    struct Task<'hir> {
+        patterns: usize,
+        visited: HashSet<Slot>,
+        queue: VecDeque<Job<'hir>>,
+    }
+
+    impl<'hir> Task<'hir> {
+        fn slot(&mut self, slot: Slot) -> String {
+            if self.visited.insert(slot) {
+                self.queue.push_back(Job::Slot(slot));
+            }
+
+            format!("${}", slot.index())
+        }
+
+        fn pat(&mut self, pat: Pat<'hir>) -> String {
+            let index = self.patterns;
+            self.queue.push_back(Job::Pat(index, pat));
+            self.patterns += 1;
+            format!("pat${}", index)
+        }
+    }
+
+    enum Job<'hir> {
+        Pat(usize, Pat<'hir>),
+        Slot(Slot),
+    }
+
     /// Debug a slot.
-    fn debug<O>(
+    fn debug_slot<'hir, O>(
         o: &mut O,
-        cx: &mut Ctxt<'_, '_>,
+        cx: &mut Ctxt<'_, 'hir>,
         slot: Slot,
-        indent: usize,
-        visited: &mut HashSet<Slot>,
+        task: &mut Task<'hir>,
     ) -> Result<()>
     where
         O: std::io::Write,
     {
-        let i = std::iter::repeat(' ').take(indent).collect::<String>();
         let storage = cx.scopes.slot(cx.span, slot)?;
         let span = storage.span;
-        let err = io_err(span);
-        let users = storage.users.clone();
+        let err = write_err(span);
+
+        let uses = format_uses(storage, span)?;
+
         let same = storage.same;
         let branches = storage.branches;
         let kind = storage.kind;
 
-        if !visited.insert(slot) {
-            writeln!(o, "{i}{:?} *omitted*", slot).map_err(err)?;
-            return Ok(());
-        }
-
         macro_rules! field {
-            ($pad:literal, pat, $var:expr) => {
-                writeln!(o, "{i}{}{} = Pat {{", $pad, stringify!($var)).map_err(err)?;
-                debug_pat(o, cx, *$var, indent + 2 + $pad.len(), visited)?;
-                writeln!(o, "{i}{}}},", $pad).map_err(err)?;
-            };
-
-            ($pad:literal, slot, $var:expr) => {
-                writeln!(o, "{i}{}{} = {{", $pad, stringify!($var)).map_err(err)?;
-                debug(o, cx, $var, indent + 2 + $pad.len(), visited)?;
-                writeln!(o, "{i}{}}},", $pad).map_err(err)?;
-            };
-
             ($pad:literal, lit, $var:expr) => {
-                writeln!(o, "{i}{}{} = {:?},", $pad, stringify!($var), $var).map_err(err)?;
+                writeln!(o, "{}{} = {:?},", $pad, stringify!($var), $var).map_err(err)?;
             };
 
-            ($pad:literal, binding, $var:expr) => {
-                writeln! {
-                    o,
-                    "{i}{}{} = {{ name = {name:?} }},",
-                    $pad,
-                    stringify!($var),
-                    name = cx.scopes.name_to_string(span, $var.name)?
+            ($pad:literal, binding, $var:expr) => {{
+                let name = cx.scopes.name_to_string(span, $var.name)?;
+                writeln!(o, "{}{} = {name:?},", $pad, stringify!($var)).map_err(err)?;
+            }};
+
+            ($pad:literal, condition, $var:expr) => {
+                match $var {
+                    LoopCondition::Forever => {
+                        writeln!(o, "{}{} = Forever,", $pad, stringify!($var)).map_err(err)?;
+                    }
+                    LoopCondition::Condition { expr, pat } => {
+                        let expr = task.slot(expr);
+                        let pat = task.pat(pat);
+                        writeln!(
+                            o,
+                            "{}{} = Condition {{ expr = {expr}, pat = {pat} }},",
+                            $pad,
+                            stringify!($var)
+                        )
+                        .map_err(err)?;
+                    }
+                    LoopCondition::Iterator { iter, binding } => {
+                        let iter = task.slot(iter);
+                        let binding = task.pat(binding);
+                        writeln!(
+                            o,
+                            "{}{} = Iterator {{ iter = {iter}, binding = {binding} }},",
+                            $pad,
+                            stringify!($var)
+                        )
+                        .map_err(err)?;
+                    }
                 }
-                .map_err(err)?;
             };
+
+            ($pad:literal, $fn:ident, $var:expr) => {{
+                let name = task.$fn($var);
+                writeln!(o, "{}{} = {name},", $pad, stringify!($var)).map_err(err)?;
+            }};
 
             ($pad:literal, [array $fn:ident], $var:expr) => {
                 let mut it = IntoIterator::into_iter($var);
 
                 let first = it.next();
 
-                if let Some(&slot) = first {
-                    writeln!(o, "{i}{}{} = [", $pad, stringify!($var)).map_err(err)?;
+                if let Some(&value) = first {
+                    writeln!(o, "{}{} = [", $pad, stringify!($var)).map_err(err)?;
+                    let name = task.$fn(value);
+                    writeln!(o, "{}  {name},", $pad).map_err(err)?;
 
-                    $fn(o, cx, slot, indent + 2 + $pad.len(), visited)?;
-
-                    for &slot in it {
-                        $fn(o, cx, slot, indent + 2 + $pad.len(), visited)?;
+                    for &value in it {
+                        let name = task.$fn(value);
+                        writeln!(o, "{}  {name},", $pad).map_err(err)?;
                     }
 
-                    writeln!(o, "{i}{}],", $pad).map_err(err)?;
+                    writeln!(o, "{}],", $pad).map_err(err)?;
                 } else {
-                    writeln!(o, "{i}{}{} = []", $pad, stringify!($var)).map_err(err)?;
+                    writeln!(o, "{}{} = [],", $pad, stringify!($var)).map_err(err)?;
                 }
             };
 
             ($pad:literal, [option $fn:ident], $var:expr) => {
-                if let Some(slot) = $var {
-                    writeln!(o, "{i}{}{} = Some(", $pad, stringify!($var)).map_err(err)?;
-                    $fn(o, cx, slot, indent + 2 + $pad.len(), visited)?;
-                    writeln!(o, "{i}{}),", $pad).map_err(err)?;
+                if let Some(value) = $var {
+                    let name = task.$fn(value);
+                    writeln!(o, "{}{} = Some({name}),", $pad, stringify!($var)).map_err(err)?;
                 } else {
-                    writeln!(o, "{i}{}{} = None,", $pad, stringify!($var)).map_err(err)?;
+                    writeln!(o, "{}{} = None,", $pad, stringify!($var)).map_err(err)?;
                 }
             };
         }
 
         macro_rules! variant {
             ($name:ident) => {{
-                writeln!(o, "{i}{}${:?} {{ same = {same:?}, branches = {branches:?}, users = {users:?} }},", stringify!($name), slot).map_err(err)?;
+                writeln!(o, "${} = {} {{ same = {same:?}, branches = {branches:?}, uses = {uses} }},", slot.index(), stringify!($name)).map_err(err)?;
             }};
 
             ($name:ident { $($what:tt $field:ident),* }) => {{
-                writeln!(o, "{i}{}${:?} {{ same = {same:?}, branches = {branches:?}, users = {users:?} }} {{", stringify!($name), slot).map_err(err)?;
+                writeln!(o, "${} = {} {{ same = {same:?}, branches = {branches:?}, uses = {uses} }} {{", slot.index(), stringify!($name)).map_err(err)?;
                 $(field!("  ", $what, $field);)*
-                writeln!(o, "{i}}}").map_err(err)?;
+                writeln!(o, "}}").map_err(err)?;
             }};
         }
 
@@ -830,7 +903,7 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
                 Assign { binding binding, slot lhs, lit use_kind, slot rhs },
                 AssignStructField { slot lhs, lit field, slot rhs },
                 AssignTupleField { slot lhs, lit index, slot rhs },
-                Block { [array debug] statements, [option debug] tail },
+                Block { [array slot] statements, [option slot] tail },
                 Let { pat pat, slot expr },
                 Store { lit value },
                 Bytes { lit bytes },
@@ -841,25 +914,25 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
                 Binary { slot lhs, lit op, slot rhs },
                 Index { slot target, slot index },
                 Meta { lit meta, lit needs, lit named },
-                Struct { lit kind, [array debug] exprs },
-                Tuple { [array debug] items },
-                Vec { [array debug] items },
+                Struct { lit kind, [array slot] exprs },
+                Tuple { [array slot] items },
+                Vec { [array slot] items },
                 Range { slot from, lit limits, slot to },
-                Option { [option debug] value },
-                CallAddress { slot address, [array debug] args },
-                CallHash { lit hash, [array debug] args },
-                CallInstance { slot lhs, lit hash, [array debug] args },
-                CallExpr { slot expr, [array debug] args },
-                Yield { [option debug] expr },
+                Option { [option slot] value },
+                CallAddress { slot address, [array slot] args },
+                CallHash { lit hash, [array slot] args },
+                CallInstance { slot lhs, lit hash, [array slot] args },
+                CallExpr { slot expr, [array slot] args },
+                Yield { [option slot] expr },
                 Await { slot expr },
                 Return { slot expr },
                 Try { slot expr },
                 Function { lit hash },
-                Closure { lit hash, [array debug] captures },
-                Loop { lit condition, slot body, lit start, lit end },
-                Break { [option debug] value, lit label, slot loop_slot },
+                Closure { lit hash, [array slot] captures },
+                Loop { condition condition, slot body, lit start, lit end },
+                Break { [option slot] value, lit label, slot loop_slot },
                 Continue { lit label },
-                StringConcat { [array debug] exprs },
+                StringConcat { [array slot] exprs },
                 Format { lit spec, slot expr },
             }
         }
@@ -868,66 +941,58 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
     }
 
     /// Debug a patter.
-    fn debug_pat<O>(
+    fn debug_pat<'hir, O>(
         o: &mut O,
-        cx: &mut Ctxt<'_, '_>,
-        pat: Pat<'_>,
-        indent: usize,
-        visited: &mut HashSet<Slot>,
+        index: usize,
+        pat: Pat<'hir>,
+        task: &mut Task<'hir>,
     ) -> Result<()>
     where
         O: std::io::Write,
     {
-        let i = std::iter::repeat(' ').take(indent).collect::<String>();
-        let err = io_err(pat.span);
+        let err = write_err(pat.span);
 
         macro_rules! field {
-            ($pad:literal, pat, $var:expr) => {
-                writeln!(o, "{i}{}{} = Pat {{", $pad, stringify!($var)).map_err(err)?;
-                debug_pat(o, cx, $var, indent + 2, visited);
-                writeln!(o, "{i}{}}},", $pad).map_err(err)?;
-            };
-
-            ($pad:literal, slot, $var:expr) => {
-                writeln!(o, "{i}{}{} = {{", $pad, stringify!($var)).map_err(err)?;
-                debug(o, cx, $var, indent + 2 + $pad.len(), visited)?;
-                writeln!(o, "{i}{}}},", $pad).map_err(err)?;
-            };
-
             ($pad:literal, lit, $var:expr) => {
-                writeln!(o, "{i}{}{} = {:?},", $pad, stringify!($var), $var).map_err(err)?;
+                writeln!(o, "{}{} = {:?},", $pad, stringify!($var), $var).map_err(err)?;
             };
 
-            ($pad:literal, [array $fun:ident], $var:expr) => {
+            ($pad:literal, $fn:ident, $var:expr) => {{
+                let name = task.$fn($var);
+                writeln!(o, "{}{} = {name},", $pad, stringify!($var)).map_err(err)?;
+            }};
+
+            ($pad:literal, [array $fn:ident], $var:expr) => {
                 let mut it = IntoIterator::into_iter($var);
 
                 let first = it.next();
 
-                if let Some(&slot) = first {
-                    writeln!(o, "{i}{}{} = [", $pad, stringify!($var)).map_err(err)?;
+                if let Some(&value) = first {
+                    writeln!(o, "{}{} = [", $pad, stringify!($var)).map_err(err)?;
+                    let name = task.$fn(value);
+                    writeln!(o, "{}  {name},", $pad).map_err(err)?;
 
-                    $fun(o, cx, slot, indent + 2 + $pad.len(), visited)?;
-
-                    for &slot in it {
-                        $fun(o, cx, slot, indent + 2 + $pad.len(), visited)?;
+                    for &value in it {
+                        let name = task.$fn(value);
+                        writeln!(o, "{}  {name},", $pad).map_err(err)?;
                     }
 
-                    writeln!(o, "{i}{}],", $pad).map_err(err)?;
+                    writeln!(o, "{}],", $pad).map_err(err)?;
                 } else {
-                    writeln!(o, "{i}{}{} = []", $pad, stringify!($var)).map_err(err)?;
+                    writeln!(o, "{}{} = [],", $pad, stringify!($var)).map_err(err)?;
                 }
             };
         }
 
         macro_rules! variant {
             ($name:ident) => {{
-                writeln!(o, "{i}{name},", name = stringify!($name)).map_err(err)?;
+                writeln!(o, "pat${index} = {name},", name = stringify!($name)).map_err(err)?;
             }};
 
             ($name:ident { $($what:tt $field:ident),* }) => {{
-                writeln!(o, "{i}{name} {{", name = stringify!($name)).map_err(err)?;
+                writeln!(o, "pat${index} = {name} {{", name = stringify!($name)).map_err(err)?;
                 $(field!("  ", $what, $field);)*
-                writeln!(o, "{i}}}").map_err(err)?;
+                writeln!(o, "}}").map_err(err)?;
             }};
         }
 
@@ -950,17 +1015,17 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
                 Name { lit name, slot name_expr },
                 Meta { lit meta },
                 Vec {
-                    [array debug_pat] items,
+                    [array pat] items,
                     lit is_open,
                 },
                 Tuple {
                     lit kind,
-                    [array debug_pat] patterns,
+                    [array pat] patterns,
                     lit is_open,
                 },
                 Object {
                     lit kind,
-                    [array debug_pat] patterns,
+                    [array pat] patterns,
                 },
             }
         }
@@ -968,7 +1033,40 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, slot: Slot) -> Result<()> {
         Ok(())
     }
 
-    fn io_err(span: Span) -> impl FnOnce(std::io::Error) -> CompileError + Copy {
+    fn format_uses(storage: &SlotStorage<'_>, span: Span) -> Result<String> {
+        use std::fmt::Write as _;
+
+        let mut users = String::new();
+        users.push('{');
+
+        let mut first = true;
+
+        let mut it = storage.uses.iter().peekable();
+
+        while let Some((slot, use_kind)) = it.next() {
+            if mem::take(&mut first) {
+                users.push(' ');
+            }
+
+            write!(users, "${} = {use_kind:?}", slot.index()).map_err(write_err(span))?;
+
+            if it.peek().is_some() {
+                write!(users, ", ").map_err(write_err(span))?;
+            }
+        }
+
+        if !first {
+            users.push(' ');
+        }
+
+        users.push('}');
+        Ok(users)
+    }
+
+    fn write_err<E>(span: Span) -> impl FnOnce(E) -> CompileError + Copy
+    where
+        E: fmt::Display,
+    {
         move |e| CompileError::msg(span, e)
     }
 }
@@ -1043,7 +1141,7 @@ enum ExprKind<'hir> {
     },
     Let {
         /// The assembled pattern.
-        pat: &'hir Pat<'hir>,
+        pat: Pat<'hir>,
         /// The expression being bound.
         expr: Slot,
     },
@@ -1415,7 +1513,7 @@ impl<'hir> Scopes<'hir> {
     }
 
     /// Free the implicit address associated with the given slot.
-    fn alloc_free_for(&mut self, span: Span, slot: Slot, allocator: &mut Allocator) -> Result<()> {
+    fn free_for(&mut self, span: Span, slot: Slot, allocator: &mut Allocator) -> Result<()> {
         let slot = self.slot_mut(span, slot)?;
 
         // NB: We make freeing optional instead of a hard error, since we might
@@ -1483,7 +1581,7 @@ impl<'hir> Scopes<'hir> {
             span,
             slot,
             kind: builder(slot),
-            users: BTreeMap::new(),
+            uses: BTreeMap::new(),
             address: None,
             same: 0,
             branches: 0,
@@ -1902,7 +2000,7 @@ struct SlotStorage<'hir> {
     /// The kind of the expression.
     kind: ExprKind<'hir>,
     /// The downstream users of this slot.
-    users: BTreeMap<Slot, UseKind>,
+    uses: BTreeMap<Slot, UseKind>,
     /// The implicit address of the slot.
     address: Option<AssemblyAddress>,
     /// The number of pending users.
@@ -1927,7 +2025,7 @@ impl<'hir> SlotStorage<'hir> {
             ));
         }
 
-        if self.users.insert(user, use_kind).is_some() {
+        if self.uses.insert(user, use_kind).is_some() {
             return Err(CompileError::msg(
                 span,
                 format_args!("cannot add user {user:?} to slot {this:?} since it already exists"),
@@ -1948,7 +2046,7 @@ impl<'hir> SlotStorage<'hir> {
 
     /// Remove a single user.
     fn remove_user(&mut self, span: Span, slot: Slot) -> Result<UseKind> {
-        let use_kind = match self.users.remove(&slot) {
+        let use_kind = match self.uses.remove(&slot) {
             Some(use_kind) => use_kind,
             None => {
                 let this = self.slot;
@@ -1975,7 +2073,7 @@ impl<'hir> SlotStorage<'hir> {
     /// called for or use is taken.
     fn seal(&mut self) -> SlotSealed {
         *self.sealed.get_or_insert_with(|| SlotSealed {
-            total: self.users.len(),
+            total: self.uses.len(),
         })
     }
 
@@ -2105,24 +2203,6 @@ impl Allocator {
                     format_args!("missing slot to free `{slot}`"),
                 ));
             }
-        }
-
-        Ok(())
-    }
-
-    /// Allocate many addresses.
-    fn alloc_many<const N: usize>(&mut self) -> [AssemblyAddress; N] {
-        std::array::from_fn(|_| self.alloc())
-    }
-
-    /// Free many addresses.
-    fn free_many<const N: usize>(
-        &mut self,
-        span: Span,
-        addresses: [AssemblyAddress; N],
-    ) -> Result<()> {
-        for address in addresses {
-            self.free(span, address)?;
         }
 
         Ok(())
@@ -2308,7 +2388,7 @@ fn asm<'hir>(
             ExprKind::Block { statements, tail } => {
                 asm_block(cx, statements, tail, output)?;
             }
-            ExprKind::Let { pat, expr } => asm_let(cx, *pat, expr)?,
+            ExprKind::Let { pat, expr } => asm_let(cx, pat, expr)?,
             ExprKind::Store { value } => {
                 asm_store(cx, value, output)?;
             }
@@ -2337,25 +2417,25 @@ fn asm<'hir>(
                 asm_meta(cx, meta, needs, named, output)?;
             }
             ExprKind::Struct { kind, exprs } => {
-                asm_struct(cx, kind, exprs, output)?;
+                asm_struct(cx, this, kind, exprs, output)?;
             }
             ExprKind::Vec { items } => {
-                asm_vec(cx, items, output)?;
+                asm_vec(cx, this, items, output)?;
             }
             ExprKind::Range { from, limits, to } => {
                 asm_range(cx, this, from, limits, to, output)?;
             }
             ExprKind::Tuple { items } => {
-                asm_tuple(cx, items, output)?;
+                asm_tuple(cx, this, items, output)?;
             }
             ExprKind::Option { value } => {
-                asm_option(cx, value, output)?;
+                asm_option(cx, this, value, output)?;
             }
             ExprKind::TupleFieldAccess { lhs, index } => {
-                asm_tuple_field_access(cx, lhs, index, output)?;
+                asm_tuple_field_access(cx, this, lhs, index, output)?;
             }
             ExprKind::StructFieldAccess { lhs, field, .. } => {
-                asm_struct_field_access(cx, lhs, field, output)?;
+                asm_struct_field_access(cx, this, lhs, field, output)?;
             }
             ExprKind::StructFieldAccessGeneric { .. } => {
                 return Err(cx.error(CompileErrorKind::ExpectedExpr));
@@ -2375,35 +2455,35 @@ fn asm<'hir>(
                 address: function,
                 args,
             } => {
-                asm_call_address(cx, function, args, output)?;
+                asm_call_address(cx, this, function, args, output)?;
             }
             ExprKind::CallHash { hash, args } => {
-                asm_call_hash(cx, args, hash, output)?;
+                asm_call_hash(cx, this, args, hash, output)?;
             }
             ExprKind::CallInstance { lhs, hash, args } => {
                 asm_call_instance(cx, lhs, args, hash, output)?;
             }
             ExprKind::CallExpr { expr, args } => {
-                asm_call_expr(cx, expr, args, output)?;
+                asm_call_expr(cx, this, expr, args, output)?;
             }
             ExprKind::Yield { expr } => {
-                asm_yield(cx, expr, output)?;
+                asm_yield(cx, this, expr, output)?;
             }
             ExprKind::Await { expr } => {
-                asm_await(cx, expr, output)?;
+                asm_await(cx, this, expr, output)?;
             }
             ExprKind::Return { expr } => {
-                asm_return(cx, expr, output)?;
+                asm_return(cx, this, expr, output)?;
                 return Ok(ExprOutcome::Unreachable);
             }
             ExprKind::Try { expr } => {
-                asm_try(cx, expr, output)?;
+                asm_try(cx, this, expr, output)?;
             }
             ExprKind::Function { hash } => {
                 asm_function(cx, hash, output);
             }
             ExprKind::Closure { hash, captures } => {
-                asm_closure(cx, captures, hash, output)?;
+                asm_closure(cx, this, captures, hash, output)?;
             }
             ExprKind::Loop {
                 condition,
@@ -2424,7 +2504,7 @@ fn asm<'hir>(
                 asm_continue(cx, label)?;
             }
             ExprKind::StringConcat { exprs } => {
-                asm_string_concat(cx, exprs, output)?;
+                asm_string_concat(cx, this, exprs, output)?;
             }
             ExprKind::Format { spec, expr } => {
                 asm_format(cx, this, spec, expr, output)?;
@@ -2433,24 +2513,6 @@ fn asm<'hir>(
 
         Ok(ExprOutcome::Output)
     });
-
-    /// Allocate space for the specified array.
-    fn asm_array<'hir, I>(cx: &mut Ctxt<'_, 'hir>, expressions: I) -> Result<ArrayAddress>
-    where
-        I: IntoIterator<Item = Slot>,
-    {
-        let index = cx.allocator.array_index();
-        let mut count = 0;
-
-        for expr in expressions {
-            let output = cx.allocator.array_index();
-            asm(cx, expr, AssemblyAddress::Array(output))?;
-            cx.allocator.alloc_array_item();
-            count += 1;
-        }
-
-        Ok(ArrayAddress::new(index, count))
-    }
 
     #[instrument]
     fn asm_address<'hir>(
@@ -2638,7 +2700,7 @@ fn asm<'hir>(
                 }
 
                 if user.is_last() {
-                    cx.alloc_free_for(expr)?;
+                    cx.free_for(expr)?;
                 }
 
                 Ok(PatOutcome::Refutable)
@@ -2670,7 +2732,7 @@ fn asm<'hir>(
                 }
 
                 if expr_use.is_last() {
-                    cx.alloc_free_for(expr)?;
+                    cx.free_for(expr)?;
                 }
 
                 Ok(PatOutcome::Refutable)
@@ -2702,7 +2764,7 @@ fn asm<'hir>(
                 }
 
                 if expr_use.is_last() {
-                    cx.alloc_free_for(expr)?;
+                    cx.free_for(expr)?;
                 }
 
                 Ok(PatOutcome::Refutable)
@@ -2781,7 +2843,7 @@ fn asm<'hir>(
                 }
 
                 if expr_use.is_last() {
-                    cx.alloc_free_for(expr)?;
+                    cx.free_for(expr)?;
                 }
 
                 Ok(PatOutcome::Refutable)
@@ -3144,15 +3206,17 @@ fn asm<'hir>(
     #[instrument]
     fn asm_struct<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         kind: ExprStructKind,
         exprs: &[Slot],
         output: AssemblyAddress,
     ) -> Result<()> {
-        let address = asm_array(cx, exprs.iter().copied())?;
+        let address = cx.array(this, exprs.iter().copied())?;
+
         match kind {
             ExprStructKind::Anonymous { slot } => {
                 cx.push(Inst::Object {
-                    address: address.address(),
+                    address: *address,
                     slot,
                     output,
                 });
@@ -3163,7 +3227,7 @@ fn asm<'hir>(
             ExprStructKind::Struct { hash, slot } => {
                 cx.push(Inst::Struct {
                     hash,
-                    address: address.address(),
+                    address: *address,
                     slot,
                     output,
                 });
@@ -3171,31 +3235,33 @@ fn asm<'hir>(
             ExprStructKind::StructVariant { hash, slot } => {
                 cx.push(Inst::StructVariant {
                     hash,
-                    address: address.address(),
+                    address: *address,
                     slot,
                     output,
                 });
             }
         }
-        address.free(cx)?;
+
+        cx.free_iter([address])?;
         Ok(())
     }
 
     #[instrument]
     fn asm_vec<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         items: &[Slot],
         output: AssemblyAddress,
     ) -> Result<()> {
-        let address = asm_array(cx, items.iter().copied())?;
+        let address = cx.array(this, items.iter().copied())?;
 
         cx.push(Inst::Vec {
-            address: address.address(),
+            address: *address,
             count: address.count(),
             output,
         });
 
-        address.free(cx)?;
+        cx.free_iter([address])?;
         Ok(())
     }
 
@@ -3224,71 +3290,58 @@ fn asm<'hir>(
     #[instrument]
     fn asm_tuple<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         items: &[Slot],
         output: AssemblyAddress,
     ) -> Result<()> {
         match items {
             &[a] => {
-                asm(cx, a, output)?;
+                let [a] = cx.addresses(this, [a], [output])?;
 
-                cx.push(Inst::Tuple1 {
-                    args: [output],
-                    output,
-                });
+                cx.push(Inst::Tuple1 { args: [*a], output });
+
+                cx.free_iter([a])?;
             }
             &[a, b] => {
-                let b_output = cx.allocator.alloc();
-
-                asm(cx, a, output)?;
-                asm(cx, b, b_output)?;
+                let [a, b] = cx.addresses(this, [a, b], [output])?;
 
                 cx.push(Inst::Tuple2 {
-                    args: [output, b_output],
+                    args: [*a, *b],
                     output,
                 });
 
-                cx.allocator.free(cx.span, b_output)?;
+                cx.free_iter([a, b])?;
             }
             &[a, b, c] => {
-                let [b_output, c_output] = cx.allocator.alloc_many();
-
-                asm(cx, a, output)?;
-                asm(cx, b, b_output)?;
-                asm(cx, c, c_output)?;
+                let [a, b, c] = cx.addresses(this, [a, b, c], [output])?;
 
                 cx.push(Inst::Tuple3 {
-                    args: [output, b_output, c_output],
+                    args: [*a, *b, *c],
                     output,
                 });
 
-                cx.allocator.free_many(cx.span, [b_output, c_output])?;
+                cx.free_iter([a, b, c])?;
             }
             &[a, b, c, d] => {
-                let [b_output, c_output, d_output] = cx.allocator.alloc_many();
-
-                asm(cx, a, output)?;
-                asm(cx, b, b_output)?;
-                asm(cx, c, c_output)?;
-                asm(cx, d, d_output)?;
+                let [a, b, c, d] = cx.addresses(this, [a, b, c, d], [output])?;
 
                 cx.push(Inst::Tuple4 {
-                    args: [output, b_output, c_output, d_output],
+                    args: [*a, *b, *c, *d],
                     output,
                 });
 
-                cx.allocator
-                    .free_many(cx.span, [b_output, c_output, d_output])?;
+                cx.free_iter([a, b, c, d])?;
             }
             args => {
-                let address = asm_array(cx, args.iter().copied())?;
+                let address = cx.array(this, args.iter().copied())?;
 
                 cx.push(Inst::Tuple {
-                    address: address.address(),
-                    count: args.len(),
+                    address: *address,
+                    count: address.count(),
                     output,
                 });
 
-                address.free(cx)?;
+                cx.free_iter([address])?;
             }
         }
 
@@ -3298,22 +3351,30 @@ fn asm<'hir>(
     #[instrument]
     fn asm_option<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         value: Option<Slot>,
         output: AssemblyAddress,
     ) -> Result<()> {
-        let variant = match value {
+        match value {
             Some(value) => {
-                asm(cx, value, output)?;
-                InstVariant::Some
-            }
-            None => InstVariant::None,
-        };
+                let [address] = cx.addresses(this, [value], [output])?;
 
-        cx.push(Inst::Variant {
-            address: output,
-            variant,
-            output,
-        });
+                cx.push(Inst::Variant {
+                    address: *address,
+                    variant: InstVariant::Some,
+                    output,
+                });
+
+                cx.free_iter([address])?;
+            }
+            None => {
+                cx.push(Inst::Variant {
+                    address: output,
+                    variant: InstVariant::None,
+                    output,
+                });
+            }
+        }
 
         Ok(())
     }
@@ -3321,38 +3382,42 @@ fn asm<'hir>(
     #[instrument]
     fn asm_tuple_field_access<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         lhs: Slot,
         index: usize,
         output: AssemblyAddress,
     ) -> Result<()> {
-        asm(cx, lhs, output)?;
+        let [address] = cx.addresses(this, [lhs], [output])?;
 
         cx.push(Inst::TupleIndexGet {
-            address: output,
+            address: *address,
             index,
             output,
         });
 
+        cx.free_iter([address])?;
         Ok(())
     }
 
     #[instrument]
     fn asm_struct_field_access<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         lhs: Slot,
         field: &str,
         output: AssemblyAddress,
     ) -> Result<()> {
-        asm(cx, lhs, output)?;
+        let [address] = cx.addresses(this, [lhs], [output])?;
 
         let slot = cx.q.unit.new_static_string(cx.span, field)?;
 
         cx.push(Inst::ObjectIndexGet {
-            address: output,
+            address: *address,
             slot,
             output,
         });
 
+        cx.free_iter([address])?;
         Ok(())
     }
 
@@ -3389,16 +3454,16 @@ fn asm<'hir>(
             );
 
             if rhs_use.is_last() {
-                cx.alloc_free_for(lhs)?;
+                cx.free_for(lhs)?;
             }
         }
 
         if lhs_use.is_last() {
-            cx.alloc_free_for(lhs)?;
+            cx.free_for(lhs)?;
         }
 
         if rhs_use.is_last() {
-            cx.alloc_free_for(rhs)?;
+            cx.free_for(rhs)?;
         }
 
         Ok(())
@@ -3457,43 +3522,43 @@ fn asm<'hir>(
     #[instrument]
     fn asm_call_address<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         function: Slot,
         args: &[Slot],
         output: AssemblyAddress,
     ) -> Result<()> {
-        let function_output = cx.allocator.alloc();
-        asm(cx, function, function_output)?;
-        let address = asm_array(cx, args.iter().copied())?;
+        let [function] = cx.addresses(this, [function], [output])?;
+        let address = cx.array(this, args.iter().copied())?;
 
         cx.push(Inst::CallFn {
-            function: function_output,
-            address: address.address(),
+            function: *function,
+            address: *address,
             count: address.count(),
             output,
         });
 
-        address.free(cx)?;
-        cx.allocator.free(cx.span, function_output)?;
+        cx.free_iter([function, address])?;
         Ok(())
     }
 
     #[instrument]
     fn asm_call_hash<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         args: &[Slot],
         hash: Hash,
         output: AssemblyAddress,
     ) -> Result<()> {
-        let array = asm_array(cx, args.iter().copied())?;
+        let array = cx.array(this, args.iter().copied())?;
 
         cx.push(Inst::Call {
             hash,
-            address: array.address(),
+            address: *array,
             count: array.count(),
             output,
         });
 
-        array.free(cx)?;
+        cx.free_iter([array])?;
         Ok(())
     }
 
@@ -3533,38 +3598,42 @@ fn asm<'hir>(
     #[instrument]
     fn asm_call_expr<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         expr: Slot,
         args: &[Slot],
         output: AssemblyAddress,
     ) -> Result<()> {
         asm(cx, expr, output)?;
-        let array = asm_array(cx, args.iter().copied())?;
+        let array = cx.array(this, args.iter().copied())?;
 
         cx.push(Inst::CallFn {
             function: output,
-            address: array.address(),
+            address: *array,
             count: array.count(),
             output,
         });
 
-        array.free(cx)?;
+        cx.free_iter([array])?;
         Ok(())
     }
 
     #[instrument]
     fn asm_yield<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         expr: Option<Slot>,
         output: AssemblyAddress,
     ) -> Result<()> {
         Ok(match expr {
             Some(expr) => {
-                asm(cx, expr, output)?;
+                let [address] = cx.addresses(this, [expr], [output])?;
 
                 cx.push(Inst::Yield {
                     address: output,
                     output,
                 });
+
+                cx.free_iter([address])?;
             }
             None => {
                 cx.push(Inst::YieldUnit { output });
@@ -3573,37 +3642,51 @@ fn asm<'hir>(
     }
 
     #[instrument]
-    fn asm_await<'hir>(cx: &mut Ctxt<'_, 'hir>, expr: Slot, output: AssemblyAddress) -> Result<()> {
-        asm(cx, expr, output)?;
+    fn asm_await<'hir>(
+        cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
+        expr: Slot,
+        output: AssemblyAddress,
+    ) -> Result<()> {
+        let [address] = cx.addresses(this, [expr], [output])?;
 
         cx.push(Inst::Await {
             address: output,
             output,
         });
 
+        cx.free_iter([address])?;
         Ok(())
     }
 
     #[instrument]
     fn asm_return<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         expr: Slot,
         output: AssemblyAddress,
     ) -> Result<()> {
-        asm(cx, expr, output)?;
-        cx.push(Inst::Return { address: output });
+        let [address] = cx.addresses(this, [expr], [output])?;
+        cx.push(Inst::Return { address: *address });
+        cx.free_iter([address])?;
         Ok(())
     }
 
     #[instrument]
-    fn asm_try<'hir>(cx: &mut Ctxt<'_, 'hir>, expr: Slot, output: AssemblyAddress) -> Result<()> {
-        asm(cx, expr, output)?;
+    fn asm_try<'hir>(
+        cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
+        expr: Slot,
+        output: AssemblyAddress,
+    ) -> Result<()> {
+        let [address] = cx.addresses(this, [expr], [output])?;
 
         cx.push(Inst::Try {
-            address: output,
+            address: *address,
             output,
         });
 
+        cx.free_iter([address])?;
         Ok(())
     }
 
@@ -3615,20 +3698,21 @@ fn asm<'hir>(
     #[instrument]
     fn asm_closure<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         captures: &[Slot],
         hash: Hash,
         output: AssemblyAddress,
     ) -> Result<()> {
-        let array = asm_array(cx, captures.iter().copied())?;
+        let array = cx.array(this, captures.iter().copied())?;
 
         cx.push(Inst::Closure {
             hash,
-            address: array.address(),
+            address: *array,
             count: array.count(),
             output,
         });
 
-        array.free(cx)?;
+        cx.free_iter([array])?;
         Ok(())
     }
 
@@ -3702,10 +3786,20 @@ fn asm<'hir>(
         loop_slot: Slot,
     ) -> Result<ExprOutcome> {
         if let Some(expr) = value {
-            let output = cx.alloc_for(expr)?;
-            let _ = cx.take_slot_use(expr, this)?;
-            let _ = cx.take_slot_use(loop_slot, this)?;
+            let expr_used = cx.take_slot_use(expr, this)?;
+            let loop_slot_used = cx.take_slot_use(loop_slot, this)?;
+
+            let output = cx.alloc_for(loop_slot)?;
             asm(cx, expr, output)?;
+
+            if loop_slot_used.is_last() {
+                dbg!("FREE LOOP");
+                cx.free_for(loop_slot)?;
+            }
+
+            if expr_used.is_last() {
+                cx.free_for(expr)?;
+            }
         }
 
         cx.push(Inst::Jump { label });
@@ -3723,10 +3817,11 @@ fn asm<'hir>(
     #[instrument]
     fn asm_string_concat<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
+        this: Slot,
         exprs: &[Slot],
         output: AssemblyAddress,
     ) -> Result<ExprOutcome> {
-        let address = cx.array(exprs.iter().copied())?;
+        let address = cx.array(this, exprs.iter().copied())?;
 
         cx.push(Inst::StringConcat {
             address: *address,
@@ -3770,7 +3865,7 @@ fn block<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Block<'hir>) -> Result<Slot> 
                 hir::Stmt::Local(hir) => {
                     let expr = expr_value(cx, hir.expr)?;
                     let pat = pat(cx, hir.pat)?;
-                    cx.insert_expr(ExprKind::Let { pat: alloc!(cx; pat), expr })?
+                    cx.insert_expr(ExprKind::Let { pat, expr })?
                 }
                 hir::Stmt::Expr(hir) => expr_value(cx, hir)?,
             };

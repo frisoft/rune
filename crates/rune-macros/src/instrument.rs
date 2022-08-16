@@ -1,6 +1,5 @@
 use proc_macro2::TokenStream;
-use quote::quote_spanned;
-use syn::spanned::Spanned;
+use quote::{quote, quote_spanned};
 
 /// An internal call to the macro.
 pub struct Expander {
@@ -59,16 +58,14 @@ impl Expander {
             _ => None,
         };
 
-        let span = f.span();
         let vis = &f.vis;
-        let stmts = &f.block.stmts;
+        let block = &f.block;
         let sig = &f.sig;
 
-        Ok(quote_spanned! {
-            span =>
+        Ok(quote! {
             #vis #sig {
                 #log
-                { #(#stmts)* }
+                #block
             }
         })
     }

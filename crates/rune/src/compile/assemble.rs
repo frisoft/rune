@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::fmt;
+use std::marker;
 use std::mem;
 use std::num::NonZeroUsize;
 use std::ops::{Deref, Neg as _};
@@ -97,6 +98,61 @@ enum CtxtState {
     },
 }
 
+#[derive(Clone)]
+struct Slotted<T, Id> {
+    storage: Vec<T>,
+    _marker: marker::PhantomData<Id>,
+}
+
+impl<T, Id> Slotted<T, Id>
+where
+    Id: Index,
+{
+    fn new() -> Self {
+        Self {
+            storage: Vec::new(),
+            _marker: marker::PhantomData,
+        }
+    }
+
+    /// Get a slotted value.
+    fn get(&self, id: Id) -> Option<&T> {
+        self.storage.get(id.index())
+    }
+
+    /// Get slotted value mutably.
+    fn get_mut(&mut self, id: Id) -> Option<&mut T> {
+        self.storage.get_mut(id.index())
+    }
+
+    /// Get the next id that will be inserted.
+    fn next_id(&self) -> Option<Id> {
+        Id::new(self.storage.len())
+    }
+
+    /// Insert the given value.
+    fn insert(&mut self, value: T) {
+        self.storage.push(value);
+    }
+}
+
+impl<T, Id> IntoIterator for Slotted<T, Id> {
+    type Item = T;
+    type IntoIter = vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.storage.into_iter()
+    }
+}
+
+trait Index: Sized {
+    /// Construct a new index.
+    fn new(value: usize) -> Option<Self>;
+
+    /// Get the usize index of an index.
+    fn index(&self) -> usize;
+}
+
 /// Handler for dealing with an assembler.
 pub(crate) struct Ctxt<'a, 'hir> {
     /// The context we are compiling for.
@@ -126,9 +182,9 @@ pub(crate) struct Ctxt<'a, 'hir> {
     /// Set of useless slots.
     useless: BTreeSet<ExprId>,
     /// All defined patterns and the expressions they are to be bound to.
-    patterns: Vec<(Pat<'hir>, ExprId)>,
+    patterns: Slotted<(Pat<'hir>, ExprId), PatId>,
     /// Keeping track of every slot.
-    expressions: Vec<Expr<'hir>>,
+    expressions: Slotted<Expr<'hir>, ExprId>,
 }
 
 impl Spanned for Ctxt<'_, '_> {
@@ -161,8 +217,8 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
             state: CtxtState::default(),
             allocator: Allocator::new(),
             useless: BTreeSet::new(),
-            patterns: Vec::new(),
-            expressions: Vec::new(),
+            patterns: Slotted::new(),
+            expressions: Slotted::new(),
         }
     }
 
@@ -258,7 +314,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 
     /// Load slot.
     fn slot(&self, slot: ExprId) -> Result<&Expr<'hir>> {
-        if let Some(expr) = self.expressions.get(slot.index()) {
+        if let Some(expr) = self.expressions.get(slot) {
             return Ok(expr);
         }
 
@@ -270,7 +326,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 
     /// Load slot mutably.
     fn slot_mut(&mut self, slot: ExprId) -> Result<&mut Expr<'hir>> {
-        if let Some(expr) = self.expressions.get_mut(slot.index()) {
+        if let Some(expr) = self.expressions.get_mut(slot) {
             return Ok(expr);
         }
 
@@ -288,7 +344,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     /// Add a slot user with custom use kind.
     fn add_slot_user_with(&mut self, slot: ExprId, user: ExprId, use_kind: UseKind) -> Result<()> {
         let span = self.span;
-        self.slot_mut(slot)?.add_user(span, user, use_kind)?;
+        self.slot_mut(slot)?.insert_use(span, user, use_kind)?;
         // We can now remove this slot from the set of useless slots.
         self.useless.remove(&slot);
         Ok(())
@@ -300,7 +356,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         let slot_mut = self.slot_mut(slot)?;
 
         let sealed = slot_mut.seal();
-        let use_kind = slot_mut.remove_user(span, user)?;
+        let use_kind = slot_mut.remove_use(span, user)?;
 
         let summary = UseSummary {
             same: slot_mut.same,
@@ -317,7 +373,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     fn remove_slot_user(&mut self, slot: ExprId, user: ExprId) -> Result<()> {
         let span = self.span;
         let storage = self.slot_mut(slot)?;
-        storage.remove_user(span, user)?;
+        storage.remove_use(span, user)?;
 
         if storage.uses.is_empty() {
             self.useless.insert(slot);
@@ -340,7 +396,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 
     /// Insert a expression.
     fn insert_expr(&mut self, kind: ExprKind<'hir>) -> Result<ExprId> {
-        let slot = match ExprId::new(self.expressions.len()) {
+        let slot = match self.expressions.next_id() {
             Some(slot) => slot,
             None => return Err(CompileError::msg(self.span, "ran out of expression slots")),
         };
@@ -358,7 +414,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         // Mark current statement inserted as potentially useless to sweep it up later.
         self.useless.insert(slot);
 
-        self.expressions.push(Expr {
+        self.expressions.insert(Expr {
             span: self.span,
             slot,
             kind,
@@ -394,7 +450,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 
     /// Insert a pattern.
     fn insert_pat(&mut self, pat: Pat<'hir>, expr: ExprId) -> Result<PatId> {
-        let id = match PatId::new(self.patterns.len()) {
+        let id = match self.patterns.next_id() {
             Some(id) => id,
             None => {
                 return Err(CompileError::msg(
@@ -404,7 +460,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
             }
         };
 
-        self.patterns.push((pat, expr));
+        self.patterns.insert((pat, expr));
         Ok(id)
     }
 
@@ -415,7 +471,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 
     /// Get a reference to a pattern by id.
     fn pat(&self, pat: PatId) -> Result<&Pat<'hir>> {
-        match self.patterns.get(pat.index()) {
+        match self.patterns.get(pat) {
             Some((pat, _)) => Ok(pat),
             None => {
                 return Err(CompileError::msg(
@@ -428,7 +484,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 
     /// Get a reference to the expression that is associated with a pattern.
     fn pat_expr(&self, pat: PatId) -> Result<ExprId> {
-        match self.patterns.get(pat.index()) {
+        match self.patterns.get(pat) {
             Some(&(_, expr)) => Ok(expr),
             None => {
                 return Err(CompileError::msg(
@@ -441,7 +497,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 
     /// Get a mutable reference to a pattern by id.
     fn pat_mut(&mut self, pat: PatId) -> Result<&mut Pat<'hir>> {
-        match self.patterns.get_mut(pat.index()) {
+        match self.patterns.get_mut(pat) {
             Some((pat, _)) => Ok(pat),
             None => {
                 return Err(CompileError::msg(
@@ -1999,16 +2055,6 @@ enum ExprUnOp {
 struct ExprId(NonZeroUsize);
 
 impl ExprId {
-    /// Construct a new slot.
-    fn new(value: usize) -> Option<Self> {
-        Some(Self(NonZeroUsize::new(value.wrapping_add(1))?))
-    }
-
-    /// Get the index that the slot corresponds to.
-    fn index(&self) -> usize {
-        self.0.get().wrapping_sub(1)
-    }
-
     /// Map the current expression into some other expression.
     fn map_expr<'hir, M>(self, cx: &mut Ctxt<'_, 'hir>, map: M) -> Result<ExprId>
     where
@@ -2019,6 +2065,18 @@ impl ExprId {
         cx.release_expr_kind(replaced, self)?;
         cx.retain_expr_kind(kind, self)?;
         Ok(self)
+    }
+}
+
+impl Index for ExprId {
+    /// Construct a new slot.
+    fn new(value: usize) -> Option<Self> {
+        Some(Self(NonZeroUsize::new(value.wrapping_add(1))?))
+    }
+
+    /// Get the index that the slot corresponds to.
+    fn index(&self) -> usize {
+        self.0.get().wrapping_sub(1)
     }
 }
 
@@ -2033,7 +2091,7 @@ impl fmt::Debug for ExprId {
 #[repr(transparent)]
 struct PatId(NonZeroUsize);
 
-impl PatId {
+impl Index for PatId {
     /// Construct a new pattern identifier.
     fn new(value: usize) -> Option<Self> {
         Some(Self(NonZeroUsize::new(value.wrapping_add(1))?))
@@ -2547,8 +2605,8 @@ impl<'hir> Expr<'hir> {
         self.address = previous;
     }
 
-    /// Add a single user.
-    fn add_user(&mut self, span: Span, user: ExprId, use_kind: UseKind) -> Result<()> {
+    /// Insert a single user of this expression.
+    fn insert_use(&mut self, span: Span, user: ExprId, use_kind: UseKind) -> Result<()> {
         let this = self.slot;
 
         tracing::trace!(?this, ?user, "adding user");
@@ -2579,8 +2637,8 @@ impl<'hir> Expr<'hir> {
         Ok(())
     }
 
-    /// Remove a single user.
-    fn remove_user(&mut self, span: Span, user: ExprId) -> Result<UseKind> {
+    /// Remove a single user of this expression.
+    fn remove_use(&mut self, span: Span, user: ExprId) -> Result<UseKind> {
         let this = self.slot;
         tracing::trace!(?this, ?user, "removing user");
 
@@ -2875,7 +2933,6 @@ fn asm_to_output<'hir>(
 ) -> Result<ExprOutcome> {
     let previous = cx.slot_pass(this, output)?;
     let result = asm(cx, this);
-    dbg!(previous);
     cx.slot_restore(this, previous)?;
     result
 }

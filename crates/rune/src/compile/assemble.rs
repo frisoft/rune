@@ -696,27 +696,9 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 
         for slot in expressions {
             let output = self.allocator.array_address();
-
-            let used = self.take_slot_use(slot, this)?;
-
-            // If only, assembled directly onto our desired output.
-            if used.is_only() {
-                asm_to_output(self, slot, output)?;
-            } else {
-                // If we're not the only user, then assemble the expression into
-                // its slot and copy it from there.
-                if used.is_pending() {
-                    asm(self, slot)?;
-                }
-
-                let address = self.expr_output(slot)?;
-                self.push(Inst::Copy { address, output });
-            }
-
-            if used.is_last() {
-                self.free_for(slot)?;
-            }
-
+            let mut output = Some(output);
+            let address = self.address(&mut output, slot, Some(this))?;
+            self.free_iter([address])?;
             self.allocator.alloc_array_item();
             count += 1;
         }
@@ -734,13 +716,86 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         let mut output = None;
 
         for (slot, out) in slots.into_iter().zip(&mut out) {
-            let address = follow_slot(self, &mut output, slot, None)?;
-            out.write(address);
+            out.write(self.address(&mut output, slot, None)?);
         }
 
         // SAFETY: we just initialized the array above.
         let out = unsafe { array_assume_init(out) };
         Ok(out)
+    }
+
+    /// Helper function to assemble and allocate a single address. If `output`
+    /// is specified, this function will ensure that the output of the
+    /// expression ends up in it and `output` is taken.
+    fn address(
+        &mut self,
+        output: &mut Option<AssemblyAddress>,
+        slot: ExprId,
+        user: Option<ExprId>,
+    ) -> Result<UsedAddress> {
+        match self.slot(slot)?.kind {
+            ExprKind::Address => {
+                let address = self.expr_output(slot)?;
+
+                let address = if let Some(output) = output.take() {
+                    self.push(Inst::Copy { address, output });
+                    output
+                } else {
+                    address
+                };
+
+                Ok(UsedAddress::new(address, slot, None, None))
+            }
+            ExprKind::Binding {
+                binding,
+                expr: followed_slot,
+                use_kind,
+            } => {
+                let name = self.scopes.name_to_string(self.span, binding.name)?;
+                tracing::trace!(
+                    ?followed_slot,
+                    ?slot,
+                    ?user,
+                    ?use_kind,
+                    ?name,
+                    "follow binding"
+                );
+                return self.address(output, followed_slot, Some(slot));
+            }
+            _ => {
+                let used = if let Some(user) = user {
+                    self.take_slot_use(slot, user)?
+                } else {
+                    let summary = self.slot_mut(slot)?.use_summary();
+                    SlotUse::new(summary, UseKind::Same)
+                };
+
+                if used.is_pending() {
+                    if used.is_only() {
+                        if let Some(address) = output.take() {
+                            let existing = self.slot_pass(slot, address)?;
+                            asm(self, slot)?;
+                            return Ok(UsedAddress::new(address, slot, None, Some(existing)));
+                        }
+                    }
+
+                    asm(self, slot)?;
+                }
+
+                if let Some(output) = output.take() {
+                    let address = self.expr_output(slot)?;
+                    self.push(Inst::Copy { address, output });
+                    return Ok(UsedAddress::new(output, slot, None, None));
+                }
+
+                Ok(UsedAddress::new(
+                    self.expr_output(slot)?,
+                    slot,
+                    Some(used),
+                    None,
+                ))
+            }
+        }
     }
 
     /// Allocate a collection of slots as addresses.
@@ -757,7 +812,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
             let mut output = Some(output);
 
             for (slot, out) in slots.into_iter().zip(&mut out) {
-                let address = follow_slot(self, &mut output, slot, Some(this))?;
+                let address = self.address(&mut output, slot, Some(this))?;
                 out.write(address);
             }
         }
@@ -791,73 +846,6 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         }
 
         Ok(())
-    }
-}
-
-/// Helper function to recursively follow bindings to addresses if we are the
-/// only user.
-fn follow_slot(
-    cx: &mut Ctxt<'_, '_>,
-    output: &mut Option<AssemblyAddress>,
-    slot: ExprId,
-    user: Option<ExprId>,
-) -> Result<UsedAddress> {
-    let kind = cx.slot(slot)?.kind;
-
-    match kind {
-        ExprKind::Address => {
-            let address = cx.expr_output(slot)?;
-            Ok(UsedAddress::new(address, slot, None, None))
-        }
-        ExprKind::Binding {
-            binding,
-            expr: followed_slot,
-            use_kind,
-        } => {
-            let name = cx.scopes.name_to_string(cx.span, binding.name)?;
-            tracing::trace!(
-                ?followed_slot,
-                ?slot,
-                ?user,
-                ?use_kind,
-                ?name,
-                "follow binding"
-            );
-            return follow_slot(cx, output, followed_slot, Some(slot));
-        }
-        _ => {
-            let used = if let Some(user) = user {
-                cx.take_slot_use(slot, user)?
-            } else {
-                let summary = cx.slot_mut(slot)?.use_summary();
-                SlotUse::new(summary, UseKind::Same)
-            };
-
-            if used.is_pending() {
-                if used.is_only() {
-                    if let Some(address) = output.take() {
-                        let existing = cx.slot_pass(slot, address)?;
-                        asm(cx, slot)?;
-                        return Ok(UsedAddress::new(address, slot, None, Some(existing)));
-                    }
-                }
-
-                asm(cx, slot)?;
-
-                if let Some(output) = output.take() {
-                    let address = cx.expr_output(slot)?;
-                    cx.push(Inst::Copy { address, output });
-                    return Ok(UsedAddress::new(output, slot, None, None));
-                }
-            }
-
-            Ok(UsedAddress::new(
-                cx.expr_output(slot)?,
-                slot,
-                Some(used),
-                None,
-            ))
-        }
     }
 }
 

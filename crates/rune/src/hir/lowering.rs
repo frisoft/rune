@@ -181,6 +181,10 @@ pub fn block<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::Block) -> Result<hir::Blo
             ast::Stmt::Expr(ast) => {
                 if ast.needs_semi() {
                     must_be_last = Some(ast.span());
+                } else {
+                    statements.extend(tail_expr.take());
+                    statements.push(BlockStatement::Expr(ast));
+                    continue;
                 }
 
                 BlockStatement::Expr(ast)

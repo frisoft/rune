@@ -75,3 +75,19 @@ fn test_assign_assign_exprs() {
     };
     assert_eq!(out, (4, (), ()));
 }
+
+/// Note: This should work because tuple bindings are evaluated from left to
+/// right, where each binding constructs a copy of the variable being
+/// referenced.
+///
+/// We need to determine when `a` should be copied.
+#[test]
+fn test_assign_bindings() {
+    let out: i64 = rune! {
+        let a = 2;
+        let (_, a, _, b) = (a += 1, a, a += 1, a);
+        a + b
+    };
+
+    assert_eq!(out, 7);
+}

@@ -12,7 +12,7 @@ use rune_macros::__instrument_hir as instrument;
 
 use crate::arena::{Arena, ArenaAllocError, ArenaWriteSliceOutOfBounds};
 use crate::ast::{self, Span, Spanned};
-use crate::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use crate::collections::{btree_map, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use crate::compile::UnitBuilder;
 use crate::compile::{
     ir, Assembly, AssemblyAddress, CaptureMeta, CompileError, CompileErrorKind, CompileVisitor,
@@ -494,7 +494,8 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
             span: self.span,
             id,
             kind,
-            uses: BTreeSet::new(),
+            uses: BTreeMap::new(),
+            current: 0,
             address: ExprOutput::Empty,
             branches: 0,
             pending: true,
@@ -824,6 +825,19 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         Ok(outputs)
     }
 
+    /// Lazily assemble the given expressions *if* they are branched or if we
+    /// are the only user and they have side effects.
+    #[tracing::instrument(skip(self))]
+    fn lazy(&mut self, user: Option<ExprUser>, expr: UsedExprId) -> Result<AssemblyAddress> {
+        let (address, used) = self.lazy_address(expr, user)?;
+
+        if used.is_last() {
+            self.free_expr(expr.id())?;
+        }
+
+        Ok(address)
+    }
+
     /// Helper function to assemble and allocate a single address. If `output`
     /// is specified, this function will ensure that the output of the
     /// expression ends up in it and `output` is taken.
@@ -840,6 +854,44 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 
         if summary.is_pending() {
             asm(self, expr.id())?;
+        }
+
+        Ok((self.output(expr.id())?, summary))
+    }
+
+    /// Helper function to assemble and allocate a single address. If `output`
+    /// is specified, this function will ensure that the output of the
+    /// expression ends up in it and `output` is taken.
+    fn lazy_address(
+        &mut self,
+        expr: UsedExprId,
+        user: Option<ExprUser>,
+    ) -> Result<(AssemblyAddress, UseSummary)> {
+        let summary = if let Some(user) = user {
+            self.take_expr_user(expr, user)?
+        } else {
+            self.expr(expr.id())?.use_summary()
+        };
+
+        if summary.is_pending() {
+            let is_branched = summary.is_branched();
+            let side_effects = has_side_effects(self, expr)?;
+            let is_only = summary.is_only();
+
+            if is_branched || side_effects || !is_only {
+                tracing::trace!(
+                    ?is_branched,
+                    ?side_effects,
+                    ?is_only,
+                    ?summary,
+                    "needs assembly"
+                );
+                asm(self, expr.id())?;
+            } else {
+                // No side effects and is not branched, so just pretend that has
+                // been assembled.
+                self.expr_mut(expr.id())?.pending = false;
+            }
         }
 
         Ok((self.output(expr.id())?, summary))
@@ -1633,17 +1685,25 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
 
         let mut it = expr.uses.iter().peekable();
 
-        while let Some(user) = it.next() {
+        while let Some((user, &count)) = it.next() {
             if mem::take(&mut first) {
                 users.push(' ');
             }
 
-            match user {
-                ExprUser::Pat(id) => {
-                    write!(users, "Pat${}", id.index()).map_err(write_err(span))?;
+            let mut it = (0..count).into_iter().peekable();
+
+            while let Some(..) = it.next() {
+                match user {
+                    ExprUser::Pat(id) => {
+                        write!(users, "Pat${}", id.index()).map_err(write_err(span))?;
+                    }
+                    ExprUser::Expr(id) => {
+                        write!(users, "${}", id.index()).map_err(write_err(span))?;
+                    }
                 }
-                ExprUser::Expr(id) => {
-                    write!(users, "${}", id.index()).map_err(write_err(span))?;
+
+                if it.peek().is_some() {
+                    write!(users, ", ").map_err(write_err(span))?;
                 }
             }
 
@@ -2510,6 +2570,11 @@ impl UseSummary {
         self.current == 0
     }
 
+    /// Test if this will be the last user after it's freed.
+    fn will_be_last(&self) -> bool {
+        self.current == 1
+    }
+
     /// If the expression is waiting to be built.
     fn is_pending(&self) -> bool {
         self.pending
@@ -2591,7 +2656,6 @@ impl fmt::Display for RemoveUseError {
 
 enum InsertUseError {
     Sealed { this: ExprId, user: ExprUser },
-    AlreadyUsed { this: ExprId, user: ExprUser },
 }
 
 impl fmt::Display for InsertUseError {
@@ -2601,12 +2665,6 @@ impl fmt::Display for InsertUseError {
                 write!(
                     f,
                     "cannot add user {user:?} to expr {this:?}: the expression is sealed"
-                )
-            }
-            InsertUseError::AlreadyUsed { this, user } => {
-                write!(
-                    f,
-                    "cannot add user {user:?} to expr {this:?}: the user already exists"
                 )
             }
         }
@@ -2622,7 +2680,9 @@ struct Expr<'hir> {
     /// The kind of the expression.
     kind: ExprKind<'hir>,
     /// The downstream users of this slot.
-    uses: BTreeSet<ExprUser>,
+    uses: BTreeMap<ExprUser, usize>,
+    /// Current number of uses.
+    current: usize,
     /// The implicit address of the slot.
     address: ExprOutput,
     /// If this expression is used in a branch context which might conditionally
@@ -2658,14 +2718,13 @@ impl<'hir> Expr<'hir> {
             return Err(InsertUseError::Sealed { this, user });
         }
 
-        if !self.uses.insert(user) {
-            return Err(InsertUseError::AlreadyUsed { this, user });
-        }
+        *self.uses.entry(user).or_default() += 1;
 
         if let UseKind::Branch = use_kind {
             self.branches = self.branches.saturating_add(1);
         }
 
+        self.current = self.current.saturating_add(1);
         Ok(())
     }
 
@@ -2674,14 +2733,26 @@ impl<'hir> Expr<'hir> {
         let this = self.id;
         tracing::trace!(?this, ?user, "removing use");
 
-        if !self.uses.remove(&user) {
-            return Err(RemoveUseError { this, user });
-        };
+        match self.uses.entry(user) {
+            btree_map::Entry::Occupied(mut e) => {
+                let n = e.get_mut();
+
+                if *n == 1 {
+                    e.remove();
+                } else {
+                    *n -= 1;
+                }
+            }
+            btree_map::Entry::Vacant(..) => {
+                return Err(RemoveUseError { this, user });
+            }
+        }
 
         if let UseKind::Branch = use_kind {
             self.branches = self.branches.saturating_sub(1);
         }
 
+        self.current = self.current.saturating_sub(1);
         Ok(())
     }
 
@@ -2705,7 +2776,7 @@ impl<'hir> Expr<'hir> {
         let sealed = self.seal();
 
         UseSummary {
-            current: self.uses.len(),
+            current: self.current,
             branch: self.branches > 0,
             total: sealed.total,
             pending: self.pending,
@@ -2715,9 +2786,9 @@ impl<'hir> Expr<'hir> {
     /// Get a current non-sealed summary.
     fn use_temporary_summary(&self) -> UseSummary {
         UseSummary {
-            current: self.uses.len(),
+            current: self.current,
             branch: self.branches > 0,
-            total: self.uses.len(),
+            total: self.current,
             pending: self.pending,
         }
     }
@@ -2734,8 +2805,9 @@ impl<'hir> Expr<'hir> {
     fn import_uses(&mut self, snapshot: ExprUseSnapshot) {
         self.branches += snapshot.branches;
 
-        for user in snapshot.uses {
-            self.uses.insert(user);
+        for (user, count) in snapshot.uses {
+            *self.uses.entry(user).or_default() += count;
+            self.current += count;
         }
     }
 }
@@ -2743,7 +2815,7 @@ impl<'hir> Expr<'hir> {
 /// A snapshot from the uses of an expression.
 #[derive(Debug, Clone)]
 struct ExprUseSnapshot {
-    uses: BTreeSet<ExprUser>,
+    uses: BTreeMap<ExprUser, usize>,
     branches: usize,
 }
 
@@ -2875,9 +2947,21 @@ impl Allocator {
 
 /// Test if the expression at the given slot has side effects.
 fn has_side_effects(cx: &mut Ctxt<'_, '_>, used_id: UsedExprId) -> Result<bool> {
-    match cx.expr(used_id.id())?.kind {
+    let expr = cx.expr(used_id.id())?;
+
+    // NB: if the expression is no longer pending it cannot have side effects,
+    // since it's already been assembled somewhere else where whatever its
+    // effects are have been taken into account.
+    if !expr.use_summary().is_pending() {
+        return Ok(false);
+    }
+
+    match expr.kind {
         ExprKind::Empty => Ok(false),
-        ExprKind::Address { .. } => Ok(true),
+        ExprKind::Address => {
+            // NB: assembling an address has no side effects. In fact, it's not a legal operation.
+            Ok(false)
+        }
         ExprKind::TupleFieldAccess { .. } => Ok(true),
         ExprKind::StructFieldAccess { .. } => Ok(true),
         ExprKind::StructFieldAccessGeneric { .. } => Ok(true),
@@ -2899,8 +2983,9 @@ fn has_side_effects(cx: &mut Ctxt<'_, '_>, used_id: UsedExprId) -> Result<bool> 
         ExprKind::Meta { .. } => Ok(true),
         ExprKind::Struct { .. } => Ok(true),
         ExprKind::Tuple { items } => {
-            for &slot in items {
+            for (index, &slot) in items.iter().enumerate() {
                 if has_side_effects(cx, slot)? {
+                    tracing::trace!(?index, ?slot, "has side effects");
                     return Ok(true);
                 }
             }
@@ -3994,15 +4079,20 @@ fn asm_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, this: PatId, label: Label) -> Result<P
 
     let outcome = cx.with_span(span, |cx| match kind {
         PatKind::Irrefutable { expr, .. } => {
-            let _ = asm_pat_expr(cx, this, expr)?;
+            // NB: assemble the actual expression to ensure that any potential
+            // side effects are taken into account.
+            let _ = cx.lazy(Some(ExprUser::Pat(this)), expr)?;
             Ok(PatOutcome::Irrefutable)
         }
         PatKind::IrrefutableSequence { expr, items, .. } => {
-            let _ = asm_pat_expr(cx, this, expr)?;
-            asm_irrefutable_sequence(cx, items, label)
+            let outcome = asm_irrefutable_sequence(cx, items, label)?;
+            // NB: assemble the actual expression to ensure that any potential
+            // side effects are taken into account.
+            let _ = cx.lazy(Some(ExprUser::Pat(this)), expr)?;
+            Ok(outcome)
         }
         PatKind::Lit { expr, lit } => {
-            let expr = asm_pat_expr(cx, this, expr)?;
+            let [expr] = cx.expressions(Some(ExprUser::Pat(this)), [expr])?;
             asm_bound_lit(cx, expr, lit, label)
         }
         PatKind::Vec {
@@ -4011,7 +4101,7 @@ fn asm_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, this: PatId, label: Label) -> Result<P
             is_open,
             items,
         } => {
-            let expr = asm_pat_expr(cx, this, expr)?;
+            let [expr] = cx.expressions(Some(ExprUser::Pat(this)), [expr])?;
             asm_bound_vec(cx, expr, address, is_open, items, label)
         }
         PatKind::AnonymousTuple {
@@ -4020,7 +4110,7 @@ fn asm_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, this: PatId, label: Label) -> Result<P
             is_open,
             items,
         } => {
-            let expr = asm_pat_expr(cx, this, expr)?;
+            let [expr] = cx.expressions(Some(ExprUser::Pat(this)), [expr])?;
             asm_anonymous_tuple(cx, expr, address, is_open, items, label)
         }
         PatKind::AnonymousObject {
@@ -4030,7 +4120,7 @@ fn asm_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, this: PatId, label: Label) -> Result<P
             is_open,
             items,
         } => {
-            let expr = asm_pat_expr(cx, this, expr)?;
+            let [expr] = cx.expressions(Some(ExprUser::Pat(this)), [expr])?;
             asm_anonymous_object(cx, expr, address, slot, is_open, items, label)
         }
         PatKind::TypedSequence {
@@ -4038,39 +4128,13 @@ fn asm_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, this: PatId, label: Label) -> Result<P
             type_match,
             items,
         } => {
-            let expr = asm_pat_expr(cx, this, expr)?;
+            let [expr] = cx.expressions(Some(ExprUser::Pat(this)), [expr])?;
             asm_typed_sequence(cx, expr, type_match, items, label)
         }
         _ => Err(cx.msg("trying to assemble pattern which hasn't been bound")),
     })?;
 
     return Ok(outcome);
-
-    /// Take a pattern address.
-    #[instrument]
-    fn asm_pat_expr(
-        cx: &mut Ctxt<'_, '_>,
-        this: PatId,
-        expr: UsedExprId,
-    ) -> Result<AssemblyAddress> {
-        // Assemble value eagerly which is used by a branched context.
-        let summary = cx.expr_mut(expr.id())?.use_summary();
-
-        if summary.is_pending() {
-            if summary.is_branched() {
-                asm(cx, expr.id())?;
-            }
-        }
-
-        let address = cx.output(expr.id())?;
-
-        if summary.is_last() {
-            cx.free_expr(expr.id())?;
-        }
-
-        cx.remove_expr_user(expr, ExprUser::Pat(this))?;
-        Ok(address)
-    }
 
     #[instrument]
     fn asm_irrefutable_sequence<'hir>(

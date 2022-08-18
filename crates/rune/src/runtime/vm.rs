@@ -3465,6 +3465,7 @@ where
     let (lhs, rhs) = vm.stack.pair(lhs_address, rhs_address)?;
 
     if let CallResult::Ok(()) = apply_builtin(&vm.unit, lhs, rhs, target, builtin)? {
+        *vm.stack.at_mut(output)? = Value::Unit;
         return Ok(());
     }
 

@@ -191,7 +191,9 @@ pub fn block<'hir>(cx: &mut Ctxt<'_, 'hir>, ast: &ast::Block) -> Result<hir::Blo
                         .uneccessary_semi_colon(cx.source_id, ast.semi_token.span());
                 }
 
-                BlockStatement::Expr(&ast.expr)
+                statements.extend(tail_expr.take());
+                statements.push(BlockStatement::Expr(&ast.expr));
+                continue;
             }
             ast::Stmt::Item(item, semi) => {
                 if let Some(semi) = semi {

@@ -104,7 +104,6 @@ pub struct Expr<'hir> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ExprKind<'hir> {
-    Empty,
     Path(&'hir Path<'hir>),
     Assign(&'hir ExprAssign<'hir>),
     Call(&'hir ExprCall<'hir>),

@@ -9,7 +9,7 @@ use std::vec;
 use num::ToPrimitive;
 use rune_macros::__instrument_hir as instrument;
 
-use crate::arena::{Arena, ArenaAllocError, ArenaWriteSliceOutOfBounds};
+use crate::arena::{AllocIter, Arena, ArenaAllocError, ArenaWriteSliceOutOfBounds};
 use crate::ast::{self, Span, Spanned};
 use crate::collections::{btree_map, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use crate::compile::UnitBuilder;
@@ -1481,6 +1481,25 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
                 }
             };
 
+            ($pad:literal, [array match_branch], $var:expr) => {{
+                let mut it = IntoIterator::into_iter($var);
+
+                let first = it.next();
+
+                if let Some(&value) = first {
+                    writeln!(o, "{}{} = [", $pad, stringify!($var)).map_err(err)?;
+                    field!("    ", block, value.body);
+
+                    for &value in it {
+                        field!("    ", block, value.body);
+                    }
+
+                    writeln!(o, "{}],", $pad).map_err(err)?;
+                } else {
+                    writeln!(o, "{}{} = [],", $pad, stringify!($var)).map_err(err)?;
+                }
+            }};
+
             ($pad:literal, $fn:ident, $var:expr) => {{
                 let name = task.$fn(cx, $var)?;
                 writeln!(o, "{}{} = {name},", $pad, stringify!($var)).map_err(err)?;
@@ -1580,6 +1599,7 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
                 Continue { lit label },
                 StringConcat { [array expr] exprs },
                 Format { lit spec, expr expr },
+                Matches { [array match_branch] branches },
             }
         }
 
@@ -1962,6 +1982,11 @@ enum ExprKind<'hir> {
         spec: &'hir FormatSpec,
         expr: UsedExprId,
     },
+    /// Match branches.
+    Matches {
+        /// Match branches.
+        branches: &'hir [MatchBranch<'hir>],
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1998,6 +2023,152 @@ enum LoopCondition {
     Condition { pat: PatId },
     /// An iterator condition.
     Iterator { iter: UsedExprId, pat: PatId },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MatchBranch<'hir> {
+    span: Span,
+    pat: PatId,
+    condition: UsedExprId,
+    body: Block<'hir>,
+}
+
+struct Matches<'hir> {
+    expr: UsedExprId,
+    branches: AllocIter<'hir, MatchBranch<'hir>>,
+}
+
+impl<'hir> Matches<'hir> {
+    /// Construct a new set of matches.
+    fn new(cx: &mut Ctxt<'_, 'hir>, len: usize, expr: UsedExprId) -> Result<Self> {
+        Ok(Self {
+            expr,
+            branches: cx.arena.alloc_iter(len).map_err(arena_error(cx.span))?,
+        })
+    }
+
+    /// Assemble matches into an expression.
+    fn assemble(self, cx: &mut Ctxt<'_, 'hir>) -> Result<UsedExprId> {
+        cx.insert_expr(ExprKind::Matches {
+            branches: self.branches.finish(),
+        })
+    }
+
+    /// Add a branch.
+    fn add_branch(
+        &mut self,
+        cx: &mut Ctxt<'_, 'hir>,
+        pat: Option<&'hir hir::Pat<'hir>>,
+        condition: Option<&'hir hir::Expr<'hir>>,
+        body: &'hir hir::Expr<'hir>,
+    ) -> Result<()> {
+        let scope = cx.scopes.push_branch(body.span(), Some(cx.scope))?;
+
+        let pat = match pat {
+            Some(hir) => cx.with_scope(scope, |cx| self::pat(cx, hir, self.expr))?,
+            None => {
+                let unbound_pat = cx.build_unbound_pat(UnboundPatKind::Ignore);
+                cx.insert_pat(PatKind::Unbound {
+                    unbound_pat,
+                    expr: self.expr,
+                })?
+            }
+        };
+
+        let condition = match condition {
+            Some(hir) => cx.with_scope(scope, |cx| self::expr_value(cx, hir))?,
+            None => cx.insert_expr(ExprKind::Store {
+                value: InstValue::Bool(true),
+            })?,
+        };
+
+        let branch = MatchBranch {
+            span: body.span,
+            pat,
+            condition,
+            body: cx.block(|cx| cx.with_scope(scope, |cx| self::expr_value(cx, body)))?,
+        };
+
+        self.branches
+            .write(branch)
+            .map_err(arena_slice_write_error(cx.span))?;
+
+        cx.scopes.pop(cx.span, scope)?;
+        Ok(())
+    }
+}
+
+struct Conditions<'hir> {
+    branches: AllocIter<'hir, MatchBranch<'hir>>,
+}
+
+impl<'hir> Conditions<'hir> {
+    /// Construct a new set of conditions.
+    fn new(cx: &mut Ctxt<'_, 'hir>, len: usize) -> Result<Self> {
+        Ok(Self {
+            branches: cx.arena.alloc_iter(len).map_err(arena_error(cx.span))?,
+        })
+    }
+
+    /// Assemble conditions into an expression.
+    fn build(self, cx: &mut Ctxt<'_, 'hir>) -> Result<UsedExprId> {
+        cx.insert_expr(ExprKind::Matches {
+            branches: self.branches.finish(),
+        })
+    }
+
+    /// Add a branch.
+    fn add_branch(
+        &mut self,
+        cx: &mut Ctxt<'_, 'hir>,
+        condition: Option<&'hir hir::Condition<'hir>>,
+        body: &'hir hir::Block<'hir>,
+    ) -> Result<()> {
+        let scope = cx.scopes.push_branch(body.span(), Some(cx.scope))?;
+
+        let (condition, pat) = match condition {
+            Some(hir::Condition::Expr(hir)) => {
+                let condition = expr_value(cx, hir)?;
+                (Some(condition), None)
+            }
+            Some(hir::Condition::ExprLet(hir)) => {
+                let expr = expr_value(cx, hir.expr)?;
+                let pat = cx.with_scope(scope, |cx| self::pat(cx, hir.pat, expr))?;
+                (None, Some(pat))
+            }
+            None => (None, None),
+        };
+
+        let pat = match pat {
+            Some(pat) => pat,
+            None => {
+                let unbound_pat = cx.build_unbound_pat(UnboundPatKind::Ignore);
+                let expr = cx.insert_expr(ExprKind::Empty)?;
+                cx.insert_pat(PatKind::Unbound { unbound_pat, expr })?
+            }
+        };
+
+        let condition = match condition {
+            Some(condition) => condition,
+            None => cx.insert_expr(ExprKind::Store {
+                value: InstValue::Bool(true),
+            })?,
+        };
+
+        let branch = MatchBranch {
+            span: body.span,
+            pat,
+            condition,
+            body: cx.block(|cx| cx.with_scope(scope, |cx| self::block(cx, body)))?,
+        };
+
+        self.branches
+            .write(branch)
+            .map_err(arena_slice_write_error(cx.span))?;
+
+        cx.scopes.pop(cx.span, scope)?;
+        Ok(())
+    }
 }
 
 /// A stored pattern.
@@ -3063,8 +3234,8 @@ fn has_side_effects(cx: &mut Ctxt<'_, '_>, used_id: UsedExprId) -> Result<bool> 
         ExprKind::Break { .. } => Ok(true),
         ExprKind::Continue { .. } => Ok(true),
         ExprKind::StringConcat { exprs, .. } => {
-            for &slot in exprs {
-                if has_side_effects(cx, slot)? {
+            for &expr in exprs {
+                if has_side_effects(cx, expr)? {
                     return Ok(true);
                 }
             }
@@ -3072,6 +3243,7 @@ fn has_side_effects(cx: &mut Ctxt<'_, '_>, used_id: UsedExprId) -> Result<bool> 
             Ok(false)
         }
         ExprKind::Format { expr, .. } => has_side_effects(cx, expr),
+        ExprKind::Matches { .. } => Ok(true),
     }
 }
 
@@ -3091,19 +3263,19 @@ fn asm_to_output<'hir>(
 /// Assemble the given address.
 #[instrument]
 fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
-    let slot_mut = cx.expr_mut(this)?;
+    let expr_mut = cx.expr_mut(this)?;
 
-    if !slot_mut.pending {
+    if !expr_mut.pending {
         return Err(CompileError::msg(
-            slot_mut.span,
+            expr_mut.span,
             format_args!("expression {this:?} is being built more than once"),
         ));
     }
 
-    slot_mut.pending = false;
+    expr_mut.pending = false;
 
-    let span = slot_mut.span;
-    let kind = slot_mut.kind;
+    let span = expr_mut.span;
+    let kind = expr_mut.kind;
 
     return cx.with_span(span, |cx| {
         match kind {
@@ -3225,6 +3397,9 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
             }
             ExprKind::Format { spec, expr } => {
                 asm_format(cx, this, spec, expr)?;
+            }
+            ExprKind::Matches { branches } => {
+                asm_matches(cx, this, branches)?;
             }
         }
 
@@ -4092,6 +4267,46 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
 
         Ok(ExprOutcome::Output)
     }
+
+    /// Compile a match expression.
+    #[instrument]
+    fn asm_matches<'hir>(
+        cx: &mut Ctxt<'_, 'hir>,
+        this: ExprId,
+        branches: &'hir [MatchBranch<'hir>],
+    ) -> Result<ExprOutcome> {
+        let output = cx.output(this)?;
+
+        let match_end = cx.new_label("match_end");
+
+        for branch in branches {
+            cx.with_span(branch.span, |cx| {
+                let end = cx.new_label("branch_end");
+                asm_pat(cx, branch.pat, end)?;
+
+                let [address] = cx.expressions(Some(ExprUser::Expr(this)), [branch.condition])?;
+
+                cx.push(Inst::JumpIfNot {
+                    address,
+                    label: end,
+                });
+
+                for &expr in branch.body.program {
+                    let _ = cx.expressions(Some(ExprUser::Expr(this)), [expr])?;
+                }
+
+                cx.expression_into(this, branch.body.expr, output)?;
+
+                cx.push(Inst::Jump { label: match_end });
+
+                cx.label(end)?;
+                Ok(())
+            })?;
+        }
+
+        cx.label(match_end)?;
+        Ok(ExprOutcome::Output)
+    }
 }
 
 /// Assemble a pattern that will panic if it doesn't match.
@@ -4412,8 +4627,8 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
             hir::ExprKind::Break(hir) => break_(cx, hir)?,
             hir::ExprKind::Continue(hir) => continue_(cx, hir)?,
             hir::ExprKind::Let(..) => todo!(),
-            hir::ExprKind::If(..) => todo!(),
-            hir::ExprKind::Match(..) => todo!(),
+            hir::ExprKind::If(hir) => if_(cx, hir)?,
+            hir::ExprKind::Match(hir) => match_(cx, hir)?,
             hir::ExprKind::MacroCall(hir) => macro_call(cx, hir)?,
         };
 
@@ -5319,6 +5534,41 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
         cx.insert_expr(kind)
     }
 
+    /// Assemble an if statement.
+    #[instrument]
+    fn if_<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::ExprIf<'hir>) -> Result<UsedExprId> {
+        let len = 1 + if hir.expr_else.is_some() { 1 } else { 0 } + hir.expr_else_ifs.len();
+        let mut conditions = Conditions::new(cx, len)?;
+
+        conditions.add_branch(cx, Some(hir.condition), hir.block)?;
+
+        for expr_else_if in hir.expr_else_ifs {
+            conditions.add_branch(cx, Some(expr_else_if.condition), expr_else_if.block)?;
+        }
+
+        if let Some(expr_else) = hir.expr_else {
+            conditions.add_branch(cx, None, expr_else.block)?;
+        }
+
+        conditions.build(cx)
+    }
+
+    /// Assemble a match.
+    #[instrument]
+    fn match_<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::ExprMatch<'hir>) -> Result<UsedExprId> {
+        let expr = expr_value(cx, hir.expr)?;
+        let mut matches = Matches::new(cx, hir.branches.len(), expr)?;
+
+        for branch in hir.branches {
+            cx.with_span(branch.span, |cx| {
+                matches.add_branch(cx, Some(branch.pat), branch.condition, branch.body)?;
+                Ok(())
+            })?;
+        }
+
+        matches.assemble(cx)
+    }
+
     /// Assemble a macro call.
     #[instrument]
     fn macro_call<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::MacroCall<'hir>) -> Result<UsedExprId> {
@@ -6014,7 +6264,7 @@ fn struct_match_for<'a>(
 /// Walk over an expression and visit each expression that it touches.
 fn walk_expr<T>(cx: &mut Ctxt<'_, '_>, kind: ExprKind<'_>, mut op: T) -> Result<()>
 where
-    T: FnMut(&mut Ctxt<'_, '_>, UsedExprId) -> Result<()>,
+    T: FnMut(&mut Ctxt<'_, '_>, UsedExprId) -> Result<()> + Copy,
 {
     match kind {
         ExprKind::Empty => {}
@@ -6052,17 +6302,8 @@ where
             op(cx, rhs)?;
         }
         ExprKind::BinaryConditional { lhs, rhs, .. } => {
-            for &expr in lhs.program {
-                op(cx, expr)?;
-            }
-
-            op(cx, lhs.expr)?;
-
-            for &expr in rhs.program {
-                op(cx, expr)?;
-            }
-
-            op(cx, rhs.expr)?;
+            walk_block(cx, lhs, op)?;
+            walk_block(cx, rhs, op)?;
         }
         ExprKind::Binary { lhs, rhs, .. } => {
             op(cx, lhs)?;
@@ -6138,11 +6379,7 @@ where
         ExprKind::Loop {
             block, condition, ..
         } => {
-            for &expr in block.program {
-                op(cx, expr)?;
-            }
-
-            op(cx, block.expr)?;
+            walk_block(cx, block, op)?;
 
             match condition {
                 LoopCondition::Forever => {}
@@ -6170,9 +6407,27 @@ where
         ExprKind::Format { expr, .. } => {
             op(cx, expr)?;
         }
+        ExprKind::Matches { branches } => {
+            for branch in branches {
+                op(cx, branch.condition)?;
+                walk_block(cx, branch.body, op)?;
+            }
+        }
     }
 
-    Ok(())
+    return Ok(());
+
+    fn walk_block<T>(cx: &mut Ctxt<'_, '_>, block: Block<'_>, mut op: T) -> Result<()>
+    where
+        T: FnMut(&mut Ctxt<'_, '_>, UsedExprId) -> Result<()>,
+    {
+        for &expr in block.program {
+            op(cx, expr)?;
+        }
+
+        op(cx, block.expr)?;
+        Ok(())
+    }
 }
 
 /// Walk over a pattern and visit each expression that it touches.

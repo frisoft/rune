@@ -672,6 +672,18 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         Ok(output)
     }
 
+    /// Construct a flattened block.
+    fn block<T>(&mut self, op: T) -> Result<Block<'hir>>
+    where
+        T: FnOnce(&mut Self) -> Result<UsedExprId>,
+    {
+        let program = mem::take(&mut self.program);
+        let expr = op(self)?;
+        let program = mem::replace(&mut self.program, program);
+        let program = iter!(self; program);
+        Ok(Block { program, expr })
+    }
+
     /// Construct a compile error associated with the current scope.
     fn error<K>(&self, kind: K) -> CompileError
     where
@@ -728,7 +740,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 
         for id in expressions {
             let output = self.allocator.array_address();
-            self.expression_into(id, ExprUser::Expr(this), output)?;
+            self.expression_into(this, id, output)?;
             self.allocator.alloc_array_item();
         }
 
@@ -749,11 +761,11 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     /// Assemble an expression into the specified output.
     fn expression_into(
         &mut self,
+        user: ExprId,
         expr: UsedExprId,
-        user: ExprUser,
         output: AssemblyAddress,
     ) -> Result<()> {
-        let summary = self.take_expr_user(expr, user)?;
+        let summary = self.take_expr_user(expr, ExprUser::Expr(user))?;
 
         // Only assemble loop output *if* the loop is still alive.
         if summary.is_pending() {
@@ -1425,6 +1437,19 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
                 writeln!(o, "{}{} = {name:?},", $pad, stringify!($var)).map_err(err)?;
             }};
 
+            ($pad:literal, block, $var:expr) => {{
+                writeln!(o, "{}{} = {{", $pad, stringify!($var)).map_err(err)?;
+
+                for &expr in $var.program {
+                    let expr = task.expr(cx, expr)?;
+                    writeln!(o, "{}  {expr};", $pad).map_err(err)?;
+                }
+
+                let expr = task.expr(cx, $var.expr)?;
+                writeln!(o, "{}  {expr}", $pad).map_err(err)?;
+                writeln!(o, "{}}};", $pad).map_err(err)?;
+            }};
+
             ($pad:literal, condition, $var:expr) => {
                 match $var {
                     LoopCondition::Forever => {
@@ -1532,7 +1557,7 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
                 String { lit string },
                 Unary { lit op, expr expr },
                 BinaryAssign { expr lhs, lit op, expr rhs },
-                BinaryConditional { expr lhs, lit op, expr rhs },
+                BinaryConditional { block lhs, lit op, block rhs },
                 Binary { expr lhs, lit op, expr rhs },
                 Index { expr target, expr index },
                 Meta { lit meta, lit needs, lit named },
@@ -1550,7 +1575,7 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
                 Try { expr expr },
                 Function { lit hash },
                 Closure { lit hash, [array expr] captures },
-                Loop { condition condition, [array expr] program, expr body, lit start, lit end },
+                Loop { condition condition, block block, lit start, lit end },
                 Break { [option expr] value, lit label, expr loop_expr },
                 Continue { lit label },
                 StringConcat { [array expr] exprs },
@@ -1815,11 +1840,11 @@ enum ExprKind<'hir> {
     /// A binary conditional operation.
     BinaryConditional {
         /// The left-hand side of a binary operation.
-        lhs: UsedExprId,
+        lhs: Block<'hir>,
         /// The operator.
         op: ast::BinOp,
         /// The right-hand side of a binary operation.
-        rhs: UsedExprId,
+        rhs: Block<'hir>,
     },
     /// A binary expression.
     Binary {
@@ -1909,10 +1934,8 @@ enum ExprKind<'hir> {
     Loop {
         /// The condition to advance the loop.
         condition: LoopCondition,
-        /// The sub-program of a loop.
-        program: &'hir [UsedExprId],
-        /// The body of the loop.
-        body: UsedExprId,
+        /// The block of the loop.
+        block: Block<'hir>,
         /// The start label to use.
         start: Label,
         /// The end label.
@@ -1939,6 +1962,12 @@ enum ExprKind<'hir> {
         spec: &'hir FormatSpec,
         expr: UsedExprId,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Block<'hir> {
+    program: &'hir [UsedExprId],
+    expr: UsedExprId,
 }
 
 impl ExprKind<'_> {
@@ -3175,12 +3204,11 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
             }
             ExprKind::Loop {
                 condition,
-                program,
-                body,
+                block,
                 start,
                 end,
             } => {
-                asm_loop(cx, this, condition, program, body, start, end)?;
+                asm_loop(cx, this, condition, block, start, end)?;
             }
             ExprKind::Break {
                 value,
@@ -3297,27 +3325,33 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
     fn asm_binary_conditional<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
         this: ExprId,
-        lhs: UsedExprId,
+        lhs: Block<'hir>,
         op: ast::BinOp,
-        rhs: UsedExprId,
+        rhs: Block<'hir>,
     ) -> Result<()> {
         let end_label = cx.new_label("conditional_end");
 
+        let output = cx.output(this)?;
+
         let lhs = cx.with_state_checkpoint(|cx| {
-            let ([lhs], _) = cx.addresses(this, [lhs])?;
+            for &expr in lhs.program {
+                let _ = cx.expressions(Some(ExprUser::Expr(this)), [expr])?;
+            }
+
+            cx.expression_into(this, lhs.expr, output)?;
             Ok(lhs)
         })?;
 
         match op {
             ast::BinOp::And(..) => {
                 cx.push(Inst::JumpIfNot {
-                    address: lhs,
+                    address: output,
                     label: end_label,
                 });
             }
             ast::BinOp::Or(..) => {
                 cx.push(Inst::JumpIf {
-                    address: lhs,
+                    address: output,
                     label: end_label,
                 });
             }
@@ -3326,8 +3360,12 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
             }
         }
 
-        let rhs = cx.with_state_checkpoint(|cx| {
-            let ([rhs], _) = cx.addresses(this, [rhs])?;
+        cx.with_state_checkpoint(|cx| {
+            for &expr in rhs.program {
+                let _ = cx.expressions(Some(ExprUser::Expr(this)), [expr])?;
+            }
+
+            cx.expression_into(this, rhs.expr, output)?;
             Ok(rhs)
         })?;
 
@@ -3511,7 +3549,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
                     let expr = const_value(cx, value)?;
                     cx.insert_expr_user(expr, ExprUser::Expr(this))?;
                     let output = cx.output(this)?;
-                    cx.expression_into(expr, ExprUser::Expr(this), output)?;
+                    cx.expression_into(this, expr, output)?;
                     ExprOutcome::Output
                 }
                 _ => {
@@ -3808,13 +3846,13 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
 
         {
             let output = cx.allocator.array_address();
-            cx.expression_into(lhs, ExprUser::Expr(this), output)?;
+            cx.expression_into(this, lhs, output)?;
             cx.allocator.alloc_array_item();
         }
 
         for &expr in args {
             let output = cx.allocator.array_address();
-            cx.expression_into(expr, ExprUser::Expr(this), output)?;
+            cx.expression_into(this, expr, output)?;
             cx.allocator.alloc_array_item();
         }
 
@@ -3926,8 +3964,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         cx: &mut Ctxt<'_, 'hir>,
         this: ExprId,
         condition: LoopCondition,
-        program: &'hir [UsedExprId],
-        body: UsedExprId,
+        block: Block<'hir>,
         start: Label,
         end: Label,
     ) -> Result<ExprOutcome> {
@@ -3965,11 +4002,11 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
             }
         };
 
-        for expr in program {
+        for expr in block.program {
             let _ = cx.expressions(Some(ExprUser::Expr(this)), [*expr])?;
         }
 
-        let outcome = asm(cx, body.id())?;
+        let outcome = asm(cx, block.expr.id())?;
 
         cx.push(Inst::Jump { label: start });
         cx.label(end)?;
@@ -3997,7 +4034,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
             // Only assemble loop output *if* the loop is still alive.
             if loop_summary.is_alive() {
                 let output = cx.output(loop_expr.id())?;
-                cx.expression_into(loop_expr, ExprUser::Expr(this), output)?;
+                cx.expression_into(this, loop_expr, output)?;
             } else {
                 cx.remove_expr_user(loop_expr, ExprUser::Expr(this))?;
                 asm(cx, expr.id())?;
@@ -4689,11 +4726,11 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
 
         if hir.op.is_conditional() {
             let lhs_scope = cx.scopes.push_branch(cx.span, Some(cx.scope))?;
-            let lhs = cx.with_scope(lhs_scope, |cx| expr_value(cx, hir.lhs))?;
+            let lhs = cx.block(|cx| cx.with_scope(lhs_scope, |cx| expr_value(cx, hir.lhs)))?;
             cx.scopes.pop(cx.span, lhs_scope)?;
 
             let rhs_scope = cx.scopes.push_branch(cx.span, Some(cx.scope))?;
-            let rhs = cx.with_scope(rhs_scope, |cx| expr_value(cx, hir.rhs))?;
+            let rhs = cx.block(|cx| cx.with_scope(rhs_scope, |cx| expr_value(cx, hir.rhs)))?;
             cx.scopes.pop(cx.span, rhs_scope)?;
 
             return cx.insert_expr(ExprKind::BinaryConditional {
@@ -5166,18 +5203,14 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
             }
         };
 
-        let program = mem::take(&mut cx.program);
-        let body = cx.with_scope(scope, |cx| block(cx, hir.body))?;
-        let program = mem::replace(&mut cx.program, program);
-        let program = iter!(cx; program);
+        let block = cx.block(|cx| cx.with_scope(scope, |cx| block(cx, hir.body)))?;
 
         cx.scopes.pop(cx.span, scope)?;
 
         loop_expr.map_expr(cx, move |_, _| {
             Ok(ExprKind::Loop {
                 condition,
-                program,
-                body,
+                block,
                 start,
                 end,
             })
@@ -6019,8 +6052,17 @@ where
             op(cx, rhs)?;
         }
         ExprKind::BinaryConditional { lhs, rhs, .. } => {
-            op(cx, lhs)?;
-            op(cx, rhs)?;
+            for &expr in lhs.program {
+                op(cx, expr)?;
+            }
+
+            op(cx, lhs.expr)?;
+
+            for &expr in rhs.program {
+                op(cx, expr)?;
+            }
+
+            op(cx, rhs.expr)?;
         }
         ExprKind::Binary { lhs, rhs, .. } => {
             op(cx, lhs)?;
@@ -6094,16 +6136,13 @@ where
             }
         }
         ExprKind::Loop {
-            program,
-            body,
-            condition,
-            ..
+            block, condition, ..
         } => {
-            for expr in program {
-                op(cx, *expr)?;
+            for &expr in block.program {
+                op(cx, expr)?;
             }
 
-            op(cx, body)?;
+            op(cx, block.expr)?;
 
             match condition {
                 LoopCondition::Forever => {}

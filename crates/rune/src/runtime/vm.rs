@@ -1,6 +1,5 @@
 use crate::runtime::future::SelectFuture;
 use crate::runtime::key::StringKey;
-use crate::runtime::stack::InterleavedPairMut;
 use crate::runtime::unit::UnitFn;
 use crate::runtime::{budget, Key};
 use crate::runtime::{
@@ -931,7 +930,7 @@ impl Vm {
     #[cfg_attr(feature = "bench", inline(never))]
     #[tracing::instrument(skip(self))]
     fn op_await(&mut self, address: Address) -> Result<Shared<Future>, VmError> {
-        let value = mem::take(self.stack.at_mut(address)?);
+        let value = self.stack.at_mut(address)?.clone();
         value.into_shared_future()
     }
 
@@ -1080,12 +1079,12 @@ impl Vm {
     /// Push the tuple that is on top of the stack.
     #[cfg_attr(feature = "bench", inline(never))]
     #[tracing::instrument(skip(self))]
-    fn op_unpack_tuple(&mut self, address: Address, mut base: Address) -> Result<(), VmError> {
+    fn op_unpack_tuple(&mut self, address: Address, mut output: Address) -> Result<(), VmError> {
         let tuple = mem::take(self.stack.at_mut(address)?).into_tuple()?;
 
         for value in tuple.take()?.into_iter() {
-            self.stack.store(base, value)?;
-            base = base.step()?;
+            self.stack.store(output, value)?;
+            output = output.step()?;
         }
 
         Ok(())
@@ -1686,14 +1685,15 @@ impl Vm {
         index: usize,
         output: Address,
     ) -> Result<(), VmError> {
-        let mut pair = self.stack.interleaved_pair(address, value)?;
+        let target = self.stack.at(address)?;
+        let value = self.stack.at(value)?;
 
-        if builtin(&mut pair, index)? {
+        if builtin(target, value, index)? {
             return Ok(());
         }
 
-        let target = pair.first_mut().clone();
-        let value = pair.second_mut().clone();
+        let target = target.clone();
+        let value = value.clone();
 
         if let CallResult::Ok(()) = self
             .context
@@ -1716,14 +1716,14 @@ impl Vm {
 
         /// Built-in implementation of getting a string index on an
         /// object-like type.
-        fn builtin(pair: &mut InterleavedPairMut<'_>, index: usize) -> Result<bool, VmError> {
-            match mem::take(pair.first_mut()) {
+        fn builtin(target: &Value, value: &Value, index: usize) -> Result<bool, VmError> {
+            match target {
                 Value::Unit => Ok(false),
                 Value::Tuple(tuple) => {
                     let mut tuple = tuple.borrow_mut()?;
 
                     if let Some(target) = tuple.get_mut(index) {
-                        *target = mem::take(pair.second_mut());
+                        *target = value.clone();
                         return Ok(true);
                     }
 
@@ -1733,7 +1733,7 @@ impl Vm {
                     let mut vec = vec.borrow_mut()?;
 
                     if let Some(target) = vec.get_mut(index) {
-                        *target = mem::take(pair.second_mut());
+                        *target = value.clone();
                         return Ok(true);
                     }
 
@@ -1748,7 +1748,7 @@ impl Vm {
                         _ => return Ok(false),
                     };
 
-                    *target = mem::take(pair.second_mut());
+                    *target = value.clone();
                     Ok(true)
                 }
                 Value::Option(option) => {
@@ -1759,14 +1759,14 @@ impl Vm {
                         _ => return Ok(false),
                     };
 
-                    *target = mem::take(pair.second_mut());
+                    *target = value.clone();
                     Ok(true)
                 }
                 Value::TupleStruct(tuple_struct) => {
                     let mut tuple_struct = tuple_struct.borrow_mut()?;
 
                     if let Some(target) = tuple_struct.get_mut(index) {
-                        *target = mem::take(pair.second_mut());
+                        *target = value.clone();
                         return Ok(true);
                     }
 
@@ -1777,7 +1777,7 @@ impl Vm {
 
                     if let VariantData::Tuple(data) = variant.data_mut() {
                         if let Some(target) = data.get_mut(index) {
-                            *target = mem::take(pair.second_mut());
+                            *target = value.clone();
                             return Ok(true);
                         }
                     }
@@ -1971,16 +1971,15 @@ impl Vm {
         limits: InstRangeLimits,
         output: Address,
     ) -> Result<(), VmError> {
-        let mut pair = self.stack.interleaved_pair(from, to)?;
-        let start = Option::<Value>::from_value(mem::take(pair.first_mut()))?;
-        let end = Option::<Value>::from_value(mem::take(pair.second_mut()))?;
+        let from = Option::<Value>::from_value(self.stack.at(from)?.clone())?;
+        let to = Option::<Value>::from_value(self.stack.at(to)?.clone())?;
 
         let limits = match limits {
             InstRangeLimits::HalfOpen => RangeLimits::HalfOpen,
             InstRangeLimits::Closed => RangeLimits::Closed,
         };
 
-        let range = Range::new(start, end, limits);
+        let range = Range::new(from, to, limits);
         self.stack.store(output, Shared::new(range))?;
         Ok(())
     }
@@ -2447,26 +2446,25 @@ impl Vm {
         variant: InstVariant,
         output: Address,
     ) -> Result<(), VmError> {
-        // TODO: address is unused for InstVariant::None.
-        let mut pair = self.stack.interleaved_pair(address, output)?;
+        let value = self.stack.at(address)?;
 
         let value = match variant {
             InstVariant::Some => {
-                let some = mem::take(pair.first_mut());
+                let some = value.clone();
                 Value::Option(Shared::new(Some(some)))
             }
             InstVariant::None => Value::Option(Shared::new(None)),
             InstVariant::Ok => {
-                let some = mem::take(pair.first_mut());
+                let some = value.clone();
                 Value::Result(Shared::new(Ok(some)))
             }
             InstVariant::Err => {
-                let some = mem::take(pair.first_mut());
+                let some = value.clone();
                 Value::Result(Shared::new(Err(some)))
             }
         };
 
-        *pair.second_mut() = value;
+        *self.stack.at_mut(output)? = value;
         Ok(())
     }
 

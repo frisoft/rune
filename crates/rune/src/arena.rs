@@ -176,7 +176,13 @@ impl Arena {
 
     #[inline]
     fn alloc_raw(&self, layout: Layout) -> Result<ptr::NonNull<u8>, ArenaAllocError> {
-        assert!(layout.size() != 0);
+        // assert!(layout.size() != 0);
+        assert!(layout.align() != 0);
+
+        if layout.size() == 0 {
+            // SAFETY: we've asserted that alignment is non-zero above.
+            return unsafe { Ok(ptr::NonNull::new_unchecked(layout.align() as *mut u8)) };
+        }
 
         loop {
             if let Some(a) = self.alloc_raw_without_grow(layout) {

@@ -3,8 +3,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::mem;
 use std::num::NonZeroUsize;
-use std::ops::Deref;
-use std::ops::Neg as _;
+use std::ops::{Deref, Neg as _};
 use std::vec;
 
 use num::ToPrimitive;
@@ -312,7 +311,8 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
 
     /// Get the output address for the expression at `expr`.
     fn output(&mut self, expr: ExprId) -> Result<AssemblyAddress> {
-        let expr_mut = self.expr_mut(expr)?;
+        let followed_id = self.follow(expr);
+        let expr_mut = self.expr_mut(followed_id)?;
 
         if let ExprOutput::Allocated(address) | ExprOutput::Passed(address) = expr_mut.address {
             tracing::trace!(?expr, ?address, "using existing address");
@@ -320,12 +320,14 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         }
 
         if matches!(expr_mut.address, ExprOutput::Freed) {
-            return Err(self.msg(format_args!("trying to use freed address on slot {expr:?}")));
+            return Err(self.msg(format_args!(
+                "trying to use freed address on slot {followed_id:?}"
+            )));
         }
 
         let address = self.allocator.alloc();
-        tracing::trace!(?expr, ?address, "allocating address");
-        self.expr_mut(expr)?.address = ExprOutput::Allocated(address);
+        tracing::trace!(?followed_id, ?address, "allocating address");
+        self.expr_mut(followed_id)?.address = ExprOutput::Allocated(address);
         Ok(address)
     }
 
@@ -421,6 +423,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     /// Follow an expression user.
     fn follow_user(&self, user: ExprUser) -> ExprUser {
         match user {
+            ExprUser::Function => ExprUser::Function,
             ExprUser::Pat(id) => ExprUser::Pat(id),
             ExprUser::Expr(id) => ExprUser::Expr(self.follow(id)),
         }
@@ -1001,6 +1004,8 @@ pub(crate) fn fn_from_item_fn<'hir>(
 
     cx.scopes.pop(span, scope)?;
 
+    cx.insert_expr_user(expr, ExprUser::Function)?;
+
     // Bind all patterns.
     bind_pats(cx)?;
     debug_stdout(cx, expr)?;
@@ -1407,7 +1412,7 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
         }
 
         let summary = expr.use_temporary_summary();
-        let uses = format_uses(expr, span)?;
+        let uses = format_uses(expr).map_err(write_err(span))?;
         let kind = expr.kind;
 
         macro_rules! field {
@@ -1675,7 +1680,7 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
         Ok(())
     }
 
-    fn format_uses(expr: &Expr<'_>, span: Span) -> Result<String> {
+    fn format_uses(expr: &Expr<'_>) -> Result<String, fmt::Error> {
         use std::fmt::Write as _;
 
         let mut users = String::new();
@@ -1694,21 +1699,24 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
 
             while let Some(..) = it.next() {
                 match user {
+                    ExprUser::Function => {
+                        write!(users, "fn")?;
+                    }
                     ExprUser::Pat(id) => {
-                        write!(users, "Pat${}", id.index()).map_err(write_err(span))?;
+                        write!(users, "Pat${}", id.index())?;
                     }
                     ExprUser::Expr(id) => {
-                        write!(users, "${}", id.index()).map_err(write_err(span))?;
+                        write!(users, "${}", id.index())?;
                     }
                 }
 
                 if it.peek().is_some() {
-                    write!(users, ", ").map_err(write_err(span))?;
+                    write!(users, ", ")?;
                 }
             }
 
             if it.peek().is_some() {
-                write!(users, ", ").map_err(write_err(span))?;
+                write!(users, ", ")?;
             }
         }
 
@@ -2570,11 +2578,6 @@ impl UseSummary {
         self.current == 0
     }
 
-    /// Test if this will be the last user after it's freed.
-    fn will_be_last(&self) -> bool {
-        self.current == 1
-    }
-
     /// If the expression is waiting to be built.
     fn is_pending(&self) -> bool {
         self.pending
@@ -2633,6 +2636,8 @@ impl ExprOutput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum ExprUser {
+    /// Implicitly used by the function.
+    Function,
     /// Pattern user.
     Pat(PatId),
     /// Expression user.

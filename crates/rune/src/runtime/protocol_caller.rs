@@ -46,12 +46,11 @@ impl ProtocolCaller for EnvProtocolCaller {
             {
                 check_args(count, expected)?;
 
-                let mut stack = Stack::with_capacity(frame);
-                stack.push(target);
+                let mut stack = Stack::with_size(frame);
+                stack.store(Address::BASE, target)?;
 
                 // Safety: We hold onto the guard until the vm has completed.
-                let _guard = unsafe { args.unsafe_into_stack(&mut stack)? };
-                stack.resize_frame(frame)?;
+                let _guard = unsafe { args.unsafe_into_stack(Address::FIRST, &mut stack)? };
 
                 let mut vm = Vm::with_stack(context.clone(), unit.clone(), stack);
                 vm.set_ip(offset);
@@ -63,11 +62,11 @@ impl ProtocolCaller for EnvProtocolCaller {
                 None => return Err(VmError::from(VmErrorKind::MissingFunction { hash })),
             };
 
-            let mut stack = Stack::with_capacity(count);
-            stack.push(target);
+            let mut stack = Stack::with_size(count);
+            stack.store(Address::BASE, target)?;
 
             // Safety: We hold onto the guard until the vm has completed.
-            let _guard = unsafe { args.unsafe_into_stack(&mut stack)? };
+            let _guard = unsafe { args.unsafe_into_stack(Address::FIRST, &mut stack)? };
 
             handler(&mut stack, Address::BASE, count, Address::BASE)?;
             Ok(mem::take(stack.at_mut(Address::BASE)?))

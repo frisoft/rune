@@ -1,9 +1,9 @@
-use crate::runtime::{Stack, ToValue, Value, VmError};
+use crate::runtime::{Address, Stack, ToValue, Value, VmError};
 
 /// Trait for converting arguments onto the stack.
 pub trait Args {
-    /// Encode arguments onto a stack.
-    fn into_stack(self, stack: &mut Stack) -> Result<(), VmError>;
+    /// Encode arguments onto a stack at the given address.
+    fn into_stack(self, at: Address, stack: &mut Stack) -> Result<Address, VmError>;
 
     /// Convert arguments into a vector.
     fn into_vec(self) -> Result<Vec<Value>, VmError>;
@@ -28,10 +28,15 @@ macro_rules! impl_into_args {
             $($ty: ToValue,)*
         {
             #[allow(unused)]
-            fn into_stack(self, stack: &mut Stack) -> Result<(), VmError> {
+            fn into_stack(self, mut at: Address, stack: &mut Stack) -> Result<Address, VmError> {
                 let ($($value,)*) = self;
-                $(stack.push($value.to_value()?);)*
-                Ok(())
+
+                $(
+                    stack.store(at, $value.to_value()?);
+                    at = at.step()?;
+                )*
+
+                Ok(at)
             }
 
             #[allow(unused)]
@@ -51,11 +56,13 @@ macro_rules! impl_into_args {
 repeat_macro!(impl_into_args);
 
 impl Args for Vec<Value> {
-    fn into_stack(self, stack: &mut Stack) -> Result<(), VmError> {
+    fn into_stack(self, mut at: Address, stack: &mut Stack) -> Result<Address, VmError> {
         for value in self {
-            stack.push(value);
+            stack.store(at, value)?;
+            at = at.step()?;
         }
-        Ok(())
+
+        Ok(at)
     }
 
     fn into_vec(self) -> Result<Vec<Value>, VmError> {

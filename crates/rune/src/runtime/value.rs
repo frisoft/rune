@@ -497,6 +497,14 @@ impl Value {
         Iterator::from_value(value)
     }
 
+    /// Try to coerce into a future.
+    pub fn as_future(&self) -> Result<&Shared<Future>, VmError> {
+        match self {
+            Value::Future(fut) => Ok(fut),
+            actual => Err(VmError::expected::<Future>(actual.type_info()?)),
+        }
+    }
+
     /// Coerce into future, or convert into a future using the
     /// [Protocol::INTO_FUTURE] protocol.
     ///
@@ -637,10 +645,28 @@ impl Value {
 
     /// Try to coerce value into a unit.
     #[inline]
+    pub fn as_unit(&self) -> Result<(), VmError> {
+        match self {
+            Value::Unit => Ok(()),
+            actual => Err(VmError::expected::<()>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into a unit.
+    #[inline]
     pub fn into_unit(self) -> Result<(), VmError> {
         match self {
             Value::Unit => Ok(()),
             actual => Err(VmError::expected::<()>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into a boolean.
+    #[inline]
+    pub fn as_bool(&self) -> Result<bool, VmError> {
+        match self {
+            Self::Bool(b) => Ok(*b),
+            actual => Err(VmError::expected::<bool>(actual.type_info()?)),
         }
     }
 
@@ -653,12 +679,12 @@ impl Value {
         }
     }
 
-    /// Try to coerce value into a boolean.
+    /// Try to coerce value into a byte.
     #[inline]
-    pub fn as_bool(&self) -> Result<bool, VmError> {
+    pub fn as_byte(&self) -> Result<u8, VmError> {
         match self {
-            Self::Bool(b) => Ok(*b),
-            actual => Err(VmError::expected::<bool>(actual.type_info()?)),
+            Self::Byte(b) => Ok(*b),
+            actual => Err(VmError::expected::<u8>(actual.type_info()?)),
         }
     }
 
@@ -673,10 +699,28 @@ impl Value {
 
     /// Try to coerce value into a character.
     #[inline]
+    pub fn as_char(&self) -> Result<char, VmError> {
+        match self {
+            Self::Char(c) => Ok(*c),
+            actual => Err(VmError::expected::<char>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into a character.
+    #[inline]
     pub fn into_char(self) -> Result<char, VmError> {
         match self {
             Self::Char(c) => Ok(c),
             actual => Err(VmError::expected::<char>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into an integer.
+    #[inline]
+    pub fn as_integer(&self) -> Result<i64, VmError> {
+        match self {
+            Self::Integer(integer) => Ok(*integer),
+            actual => Err(VmError::expected::<i64>(actual.type_info()?)),
         }
     }
 
@@ -691,10 +735,30 @@ impl Value {
 
     /// Try to coerce value into a float.
     #[inline]
+    pub fn as_float(&self) -> Result<f64, VmError> {
+        match self {
+            Self::Float(float) => Ok(*float),
+            actual => Err(VmError::expected::<f64>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into a float.
+    #[inline]
     pub fn into_float(self) -> Result<f64, VmError> {
         match self {
             Self::Float(float) => Ok(float),
             actual => Err(VmError::expected::<f64>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into a result.
+    #[inline]
+    pub fn as_result(&self) -> Result<&Shared<Result<Value, Value>>, VmError> {
+        match self {
+            Self::Result(result) => Ok(result),
+            actual => Err(VmError::expected::<Result<Value, Value>>(
+                actual.type_info()?,
+            )),
         }
     }
 
@@ -711,10 +775,28 @@ impl Value {
 
     /// Try to coerce value into a generator.
     #[inline]
+    pub fn as_generator(&self) -> Result<&Shared<Generator<Vm>>, VmError> {
+        match self {
+            Value::Generator(generator) => Ok(generator),
+            actual => Err(VmError::expected::<Generator<Vm>>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into a generator.
+    #[inline]
     pub fn into_generator(self) -> Result<Shared<Generator<Vm>>, VmError> {
         match self {
             Value::Generator(generator) => Ok(generator),
             actual => Err(VmError::expected::<Generator<Vm>>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into a stream.
+    #[inline]
+    pub fn as_stream(&self) -> Result<&Shared<Stream<Vm>>, VmError> {
+        match self {
+            Value::Stream(stream) => Ok(stream),
+            actual => Err(VmError::expected::<Stream<Vm>>(actual.type_info()?)),
         }
     }
 
@@ -727,12 +809,30 @@ impl Value {
         }
     }
 
-    /// Try to coerce value into a future.
+    /// Try to coerce value into a generator state.
+    #[inline]
+    pub fn as_generator_state(&self) -> Result<&Shared<GeneratorState>, VmError> {
+        match self {
+            Value::GeneratorState(state) => Ok(state),
+            actual => Err(VmError::expected::<GeneratorState>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into a generator state.
     #[inline]
     pub fn into_generator_state(self) -> Result<Shared<GeneratorState>, VmError> {
         match self {
             Value::GeneratorState(state) => Ok(state),
             actual => Err(VmError::expected::<GeneratorState>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into an option.
+    #[inline]
+    pub fn as_option(&self) -> Result<&Shared<Option<Value>>, VmError> {
+        match self {
+            Self::Option(option) => Ok(option),
+            actual => Err(VmError::expected::<Option<Value>>(actual.type_info()?)),
         }
     }
 
@@ -747,10 +847,28 @@ impl Value {
 
     /// Try to coerce value into a string.
     #[inline]
+    pub fn as_string(&self) -> Result<&Shared<String>, VmError> {
+        match self {
+            Self::String(string) => Ok(string),
+            actual => Err(VmError::expected::<String>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into a string.
+    #[inline]
     pub fn into_string(self) -> Result<Shared<String>, VmError> {
         match self {
             Self::String(string) => Ok(string),
             actual => Err(VmError::expected::<String>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into bytes.
+    #[inline]
+    pub fn as_bytes(&self) -> Result<&Shared<Bytes>, VmError> {
+        match self {
+            Self::Bytes(bytes) => Ok(bytes),
+            actual => Err(VmError::expected::<Bytes>(actual.type_info()?)),
         }
     }
 
@@ -765,10 +883,28 @@ impl Value {
 
     /// Try to coerce value into a vector.
     #[inline]
+    pub fn as_vec(&self) -> Result<&Shared<Vec>, VmError> {
+        match self {
+            Self::Vec(vec) => Ok(vec),
+            actual => Err(VmError::expected::<Vec>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into a vector.
+    #[inline]
     pub fn into_vec(self) -> Result<Shared<Vec>, VmError> {
         match self {
             Self::Vec(vec) => Ok(vec),
             actual => Err(VmError::expected::<Vec>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into a tuple.
+    #[inline]
+    pub fn as_tuple(&self) -> Result<&Shared<Tuple>, VmError> {
+        match self {
+            Self::Tuple(tuple) => Ok(tuple),
+            actual => Err(VmError::expected::<Tuple>(actual.type_info()?)),
         }
     }
 
@@ -783,10 +919,28 @@ impl Value {
 
     /// Try to coerce value into an object.
     #[inline]
+    pub fn as_object(&self) -> Result<&Shared<Object>, VmError> {
+        match self {
+            Self::Object(object) => Ok(object),
+            actual => Err(VmError::expected::<Object>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into an object.
+    #[inline]
     pub fn into_object(self) -> Result<Shared<Object>, VmError> {
         match self {
             Self::Object(object) => Ok(object),
             actual => Err(VmError::expected::<Object>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into a range.
+    #[inline]
+    pub fn as_range(&self) -> Result<&Shared<Range>, VmError> {
+        match self {
+            Self::Range(object) => Ok(object),
+            actual => Err(VmError::expected::<Range>(actual.type_info()?)),
         }
     }
 
@@ -801,10 +955,28 @@ impl Value {
 
     /// Try to coerce value into a function pointer.
     #[inline]
+    pub fn as_function(&self) -> Result<&Shared<Function>, VmError> {
+        match self {
+            Self::Function(function) => Ok(function),
+            actual => Err(VmError::expected::<Function>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into a function pointer.
+    #[inline]
     pub fn into_function(self) -> Result<Shared<Function>, VmError> {
         match self {
             Self::Function(function) => Ok(function),
             actual => Err(VmError::expected::<Function>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into a format spec.
+    #[inline]
+    pub fn as_format(&self) -> Result<&Box<Format>, VmError> {
+        match self {
+            Value::Format(format) => Ok(format),
+            actual => Err(VmError::expected::<Format>(actual.type_info()?)),
         }
     }
 
@@ -819,10 +991,28 @@ impl Value {
 
     /// Try to coerce value into an iterator.
     #[inline]
+    pub fn as_iterator(&self) -> Result<&Shared<Iterator>, VmError> {
+        match self {
+            Value::Iterator(format) => Ok(format),
+            actual => Err(VmError::expected::<Iterator>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into an iterator.
+    #[inline]
     pub fn into_iterator(self) -> Result<Shared<Iterator>, VmError> {
         match self {
             Value::Iterator(format) => Ok(format),
             actual => Err(VmError::expected::<Iterator>(actual.type_info()?)),
+        }
+    }
+
+    /// Try to coerce value into an opaque value.
+    #[inline]
+    pub fn as_any(&self) -> Result<&Shared<AnyObj>, VmError> {
+        match self {
+            Self::Any(any) => Ok(any),
+            actual => Err(VmError::expected_any(actual.type_info()?)),
         }
     }
 

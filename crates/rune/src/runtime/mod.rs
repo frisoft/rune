@@ -86,7 +86,7 @@ pub use self::runtime_context::RuntimeContext;
 pub(crate) use self::runtime_context::{FunctionHandler, MacroHandler};
 pub use self::select::Select;
 pub use self::shared::{Mut, RawMut, RawRef, Ref, Shared, SharedPointerGuard};
-pub use self::stack::{Stack, StackError};
+pub use self::stack::{Stack, StackError, StackSize};
 pub use self::static_string::StaticString;
 pub use self::static_type::{
     StaticType, BOOL_TYPE, BYTES_TYPE, BYTE_TYPE, CHAR_TYPE, FLOAT_TYPE, FORMAT_TYPE,

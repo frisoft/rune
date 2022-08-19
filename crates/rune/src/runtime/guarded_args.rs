@@ -1,4 +1,4 @@
-use crate::runtime::{Stack, UnsafeToValue, VmError};
+use crate::runtime::{Address, Stack, UnsafeToValue, VmError};
 
 /// Trait for converting arguments onto the stack.
 ///
@@ -16,7 +16,11 @@ pub trait GuardedArgs {
     /// This is implemented for and allows encoding references on the stack.
     /// The returned guard must be dropped before any used references are
     /// invalidated.
-    unsafe fn unsafe_into_stack(self, stack: &mut Stack) -> Result<Self::Guard, VmError>;
+    unsafe fn unsafe_into_stack(
+        self,
+        at: Address,
+        stack: &mut Stack,
+    ) -> Result<Self::Guard, VmError>;
 
     /// The number of arguments.
     fn count(&self) -> usize;
@@ -40,10 +44,15 @@ macro_rules! impl_into_args {
             type Guard = ($($ty::Guard,)*);
 
             #[allow(unused)]
-            unsafe fn unsafe_into_stack(self, stack: &mut Stack) -> Result<Self::Guard, VmError> {
+            unsafe fn unsafe_into_stack(self, mut at: Address, stack: &mut Stack) -> Result<Self::Guard, VmError> {
                 let ($($value,)*) = self;
                 $(let $value = $value.unsafe_to_value()?;)*
-                $(stack.push($value.0);)*
+
+                $(
+                    stack.store(at, $value.0);
+                    at = at.step()?;
+                )*
+
                 Ok(($($value.1,)*))
             }
 

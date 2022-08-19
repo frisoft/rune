@@ -60,13 +60,12 @@ fn test_unwrap_some() {
 fn test_unwrap() {
     assert_vm_error!(
         r#"
-        pub fn main() {
-            None.unwrap()
-       }
-    "#,
-        Panic { reason} => {
-            assert_eq!(reason.to_string(),
-                       "called `Option::unwrap()` on a `None` value")
+            pub fn main() {
+                None.unwrap()
+            }
+        "#,
+        Panic { reason } => {
+            assert_eq!(reason.to_string(), "called `Option::unwrap()` on a `None` value")
         }
     );
 }

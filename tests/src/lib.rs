@@ -289,6 +289,7 @@ macro_rules! assert_vm_error {
         let mut diagnostics = Default::default();
 
         let mut sources = $crate::sources($source);
+
         let e = match $crate::run_helper::<_, _, $ty>(&context, &mut sources, &mut diagnostics, &["main"], ()) {
             Err(e) => e,
             Ok(value) => {

@@ -474,7 +474,7 @@ where
             Inner::FnHandler(handler) => {
                 let arg_count = args.count();
                 let mut stack = Stack::with_capacity(arg_count);
-                args.into_stack(&mut stack)?;
+                args.into_stack(Address::BASE, &mut stack)?;
                 (handler.handler)(&mut stack, Address::BASE, arg_count, Address::BASE)?;
                 std::mem::take(stack.at_mut(Address::BASE)?)
             }
@@ -838,13 +838,12 @@ impl FnOffset {
         let mut vm = Vm::with_stack(
             self.context.clone(),
             self.unit.clone(),
-            Stack::with_capacity(self.frame),
+            Stack::with_size(self.frame),
         );
         vm.set_ip(self.offset);
-        args.into_stack(vm.stack_mut())?;
-        vm.stack_mut().resize_frame(self.frame)?;
+        let address = args.into_stack(Address::BASE, vm.stack_mut())?;
 
-        for (o, e) in vm.stack_mut().get_mut_top(env.len())?.iter_mut().zip(env) {
+        for (o, e) in vm.stack_mut().get_mut_from(address)?.iter_mut().zip(env) {
             *o = e.clone().to_value()?;
         }
 
@@ -872,8 +871,9 @@ impl FnOffset {
         if let Call::Immediate = self.call {
             if vm.is_same(&self.context, &self.unit) {
                 vm.push_call_frame(self.offset, address, self.frame, output)?;
+                let address = address.add(env.len())?;
 
-                for (o, e) in vm.stack_mut().get_mut_top(env.len())?.iter_mut().zip(env) {
+                for (o, e) in vm.stack_mut().get_mut_from(address)?.iter_mut().zip(env) {
                     *o = e.clone().to_value()?;
                 }
 
@@ -882,13 +882,12 @@ impl FnOffset {
         }
 
         let mut stack = vm.stack_mut().drain_at(address, args)?.collect::<Stack>();
-        stack.resize_frame(self.frame)?;
+        stack.resize(self.frame)?;
 
-        for (o, e) in stack.get_mut_top(env.len())?.iter_mut().zip(env) {
+        for (o, e) in stack.get_mut_from(Address::new(args)?)?.iter_mut().zip(env) {
             *o = e.clone().to_value()?;
         }
 
-        dbg!(self.frame);
         let mut vm = Vm::with_stack(self.context.clone(), self.unit.clone(), stack);
         vm.set_ip(self.offset);
         Ok(Some(VmCall::new(self.call, vm, output)))

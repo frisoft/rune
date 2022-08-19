@@ -6,8 +6,8 @@ use crate::runtime::{
     Address, AnyObj, Args, Awaited, BorrowMut, BorrowRef, Bytes, Call, Format, FormatSpec,
     FromValue, Function, Future, Generator, GuardedArgs, Inst, InstAssignOp, InstOp,
     InstRangeLimits, InstTarget, InstValue, InstVariant, Object, Panic, Protocol, Range,
-    RangeLimits, RuntimeContext, Select, Shared, Stack, StaticString, Stream, Struct, Tuple,
-    TypeCheck, Unit, UnitStruct, UnsafeToValue, Value, Variant, VariantData, Vec, VmError,
+    RangeLimits, RuntimeContext, Select, Shared, Stack, StackSize, StaticString, Stream, Struct,
+    Tuple, TypeCheck, Unit, UnitStruct, UnsafeToValue, Value, Variant, VariantData, Vec, VmError,
     VmErrorKind, VmExecution, VmHalt, VmIntegerRepr, VmSendExecution,
 };
 use crate::{Hash, IntoTypeHash};
@@ -54,6 +54,8 @@ pub(crate) struct CallOffset<G> {
     pub(crate) frame: usize,
     /// Output address to write to.
     pub(crate) output: Address,
+    /// Old stack bottom to restore once the call completes.
+    pub(crate) old_bottom: StackSize,
     /// Guards used in the offset call.
     pub(crate) guard: G,
 }
@@ -87,9 +89,11 @@ impl<G> CallResultOrOffset<G> {
                 args,
                 frame,
                 output,
+                old_bottom,
                 guard: _guard,
             }) => {
                 vm.call_offset_fn(offset, call, address, args, frame, output)?;
+                vm.stack_mut().return_frame(old_bottom, address, output)?;
                 Ok(CallResult::Ok(()))
             }
         }
@@ -285,7 +289,7 @@ impl Vm {
         A: Args,
     {
         self.set_entrypoint(name, args.count())?;
-        args.into_stack(&mut self.stack)?;
+        args.into_stack(Address::BASE, &mut self.stack)?;
         Ok(VmExecution::new(self))
     }
 
@@ -305,7 +309,7 @@ impl Vm {
         self.stack.clear();
 
         self.set_entrypoint(name, args.count())?;
-        args.into_stack(&mut self.stack)?;
+        args.into_stack(Address::BASE, &mut self.stack)?;
         Ok(VmSendExecution(VmExecution::new(self)))
     }
 
@@ -333,7 +337,7 @@ impl Vm {
         // Safety: We hold onto the guard until the vm has completed and
         // `VmExecution` will clear the stack before this function returns.
         // Erronously or not.
-        let guard = unsafe { args.unsafe_into_stack(&mut self.stack)? };
+        let guard = unsafe { args.unsafe_into_stack(Address::BASE, &mut self.stack)? };
 
         let value = {
             // Clearing the stack here on panics has safety implications - see
@@ -374,7 +378,7 @@ impl Vm {
         // Safety: We hold onto the guard until the vm has completed and
         // `VmExecution` will clear the stack before this function returns.
         // Erronously or not.
-        let guard = unsafe { args.unsafe_into_stack(&mut self.stack)? };
+        let guard = unsafe { args.unsafe_into_stack(Address::BASE, &mut self.stack)? };
 
         let value = {
             // Clearing the stack here on panics has safety implications - see
@@ -404,17 +408,23 @@ impl Vm {
         A: GuardedArgs,
     {
         let hash = hash.into_type_hash();
-        let output = self.stack.push_with_address(Value::Unit)?;
 
         if let CallResult::Unsupported = self
             .context
-            .call_instance_fn(&mut self.stack, &self.unit, value, hash, args, output)?
+            .call_instance_fn(
+                &mut self.stack,
+                &self.unit,
+                value,
+                hash,
+                args,
+                Address::BASE,
+            )?
             .or_call_offset_with(self)?
         {
             return Err(VmError::from(VmErrorKind::MissingFunction { hash }));
         }
 
-        Ok(mem::take(self.stack.at_mut(output)?))
+        Ok(mem::take(self.stack.at_mut(Address::BASE)?))
     }
 
     /// Update the instruction pointer to match the function matching the given
@@ -452,7 +462,7 @@ impl Vm {
 
         self.ip = offset;
         self.stack.clear();
-        self.stack.resize_frame(frame)?;
+        self.stack.resize(frame)?;
         self.call_frames.clear();
         Ok(())
     }
@@ -497,12 +507,11 @@ impl Vm {
         frame: usize,
         output: Address,
     ) -> Result<(), VmError> {
-        let (stack_bottom, stack) = self.stack.replace_stack_frame(address, frame)?;
+        let stack_bottom = self.stack.replace_stack_frame(address, frame)?;
 
         let frame = CallFrame {
             ip: self.ip,
             stack_bottom,
-            stack,
             output,
         };
 
@@ -519,13 +528,13 @@ impl Vm {
         let frame = match self.call_frames.pop() {
             Some(frame) => frame,
             None => {
-                self.stack.resize_frame(1)?;
+                self.stack.resize(1)?;
                 return Ok((true, Address::BASE));
             }
         };
 
         tracing::trace!(?frame, "popping call frame");
-        self.stack.pop_stack_frame(frame.stack_bottom, frame.stack);
+        self.stack.restore_frame(frame.stack_bottom);
         self.ip = frame.ip;
         Ok((false, frame.output))
     }
@@ -584,7 +593,7 @@ impl Vm {
         output: Address,
     ) -> Result<(), VmError> {
         let mut stack = self.stack.drain_at(address, args)?.collect::<Stack>();
-        stack.resize_frame(frame)?;
+        stack.resize(frame)?;
         let mut vm = Self::with_stack(self.context.clone(), self.unit.clone(), stack);
         vm.ip = offset;
         self.stack.store(output, Generator::new(vm))?;
@@ -601,7 +610,7 @@ impl Vm {
         output: Address,
     ) -> Result<(), VmError> {
         let mut stack = self.stack.drain_at(address, args)?.collect::<Stack>();
-        stack.resize_frame(frame)?;
+        stack.resize(frame)?;
         let mut vm = Self::with_stack(self.context.clone(), self.unit.clone(), stack);
         vm.ip = offset;
         self.stack.store(output, Stream::new(vm))?;
@@ -618,7 +627,7 @@ impl Vm {
         output: Address,
     ) -> Result<(), VmError> {
         let mut stack = self.stack.drain_at(address, args)?.collect::<Stack>();
-        stack.resize_frame(frame)?;
+        stack.resize(frame)?;
         let mut vm = Self::with_stack(self.context.clone(), self.unit.clone(), stack);
         vm.ip = offset;
         self.stack.store(output, Future::new(vm.async_complete()))?;
@@ -3214,9 +3223,7 @@ pub struct CallFrame {
     ///
     /// I.e. a function should not be able to manipulate the size of any other
     /// stack than its own.
-    stack_bottom: usize,
-    /// The size of the stack when the call was entered.
-    stack: usize,
+    stack_bottom: StackSize,
     /// Where to write the return value of the stack frame.
     output: Address,
 }
@@ -3228,7 +3235,7 @@ impl CallFrame {
     }
 
     /// Get the bottom of the stack of the current call frame.
-    pub fn stack_bottom(&self) -> usize {
+    pub fn stack_bottom(&self) -> StackSize {
         self.stack_bottom
     }
 }

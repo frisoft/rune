@@ -790,10 +790,26 @@ pub struct Address(pub(crate) u32);
 impl Address {
     /// The base address of the stack.
     pub const BASE: Self = Self(0);
+    /// The first address after the base.
+    pub const FIRST: Self = Self(1);
+
+    /// Construct a new address at the given location.
+    #[inline]
+    pub fn new(at: usize) -> Result<Self, StackError> {
+        u32::try_from(at).map_err(|_| StackError).map(Self)
+    }
 
     /// Step to the next stack address.
-    pub(crate) fn step(self) -> Result<Self, StackError> {
+    #[inline]
+    pub fn step(self) -> Result<Self, StackError> {
         Ok(Self(self.0.checked_add(1).ok_or(StackError)?))
+    }
+
+    /// Add length number of steps to the current address.
+    #[inline]
+    pub fn add(self, len: usize) -> Result<Self, StackError> {
+        let len = u32::try_from(len).map_err(|_| StackError)?;
+        Ok(Self(self.0.checked_add(len).ok_or(StackError)?))
     }
 }
 

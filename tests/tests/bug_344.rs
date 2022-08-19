@@ -29,10 +29,10 @@ fn bug_344_function() -> rune::Result<()> {
 
     let function = runtime.function(hash).expect("expect function");
 
-    let mut stack = Stack::new();
-    stack.push(GuardCheck::new());
+    let mut stack = Stack::with_size(1);
+    stack.store(Address::BASE, GuardCheck::new())?;
     function(&mut stack, Address::BASE, 1, Address::BASE)?;
-    assert_eq!(stack.pop()?.into_integer()?, 42);
+    assert_eq!(stack.at(Address::BASE)?.as_integer()?, 42);
     return Ok(());
 
     fn function(check: &GuardCheck) -> i64 {
@@ -42,7 +42,7 @@ fn bug_344_function() -> rune::Result<()> {
 }
 
 #[test]
-fn bug_344_inst_fn() -> rune::Result<()> {
+fn bug_344_inst_fn() -> rune::Result<()>  {
     let mut context = Context::new();
     let mut module = Module::new();
 
@@ -56,12 +56,12 @@ fn bug_344_inst_fn() -> rune::Result<()> {
 
     let function = runtime.function(hash).expect("expect function");
 
-    let mut stack = Stack::new();
-    stack.push(GuardCheck::new());
-    stack.push(GuardCheck::new());
+    let mut stack = Stack::with_size(2);
+    stack.store(Address::new(0)?, GuardCheck::new())?;
+    stack.store(Address::new(1)?, GuardCheck::new())?;
     function(&mut stack, Address::BASE, 2, Address::BASE)?;
 
-    assert_eq!(stack.pop()?.into_integer()?, 42);
+    assert_eq!(stack.at(Address::BASE)?.as_integer()?, 42);
     return Ok(());
 
     fn function(s: &GuardCheck, check: &GuardCheck) -> i64 {
@@ -85,11 +85,11 @@ fn bug_344_async_function() -> rune::Result<()> {
 
     let function = runtime.function(hash).expect("expect function");
 
-    let mut stack = Stack::new();
-    stack.push(GuardCheck::new());
+    let mut stack = Stack::with_size(1);
+    stack.store(Address::BASE, GuardCheck::new())?;
     function(&mut stack, Address::BASE, 1, Address::BASE)?;
 
-    let future = stack.pop()?.into_future()?;
+    let future = stack.at(Address::BASE)?.as_future()?.borrow_mut()?;
     assert_eq!(block_on(future)?.into_integer()?, 42);
     return Ok(());
 
@@ -114,12 +114,12 @@ fn bug_344_async_inst_fn() -> rune::Result<()> {
 
     let function = runtime.function(hash).expect("expect function");
 
-    let mut stack = Stack::new();
-    stack.push(GuardCheck::new());
-    stack.push(GuardCheck::new());
+    let mut stack = Stack::with_size(2);
+    stack.store(Address::new(0)?, GuardCheck::new())?;
+    stack.store(Address::new(1)?, GuardCheck::new())?;
     function(&mut stack, Address::BASE, 2, Address::BASE)?;
 
-    let future = stack.pop()?.into_future()?;
+    let future = stack.at(Address::BASE)?.as_future()?.borrow_mut()?;
     assert_eq!(block_on(future)?.into_integer()?, 42);
     return Ok(());
 

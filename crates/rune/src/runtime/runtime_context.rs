@@ -91,21 +91,22 @@ impl RuntimeContext {
         // SAFETY: We hold onto the guard for the duration of this call.
         let (value, _value_guard) = unsafe { value.unsafe_to_value()? };
 
-        let address = stack.top()?;
         let full_count = args.count() + 1;
         let hash = Hash::index_fn(protocol, value.type_hash()?, Hash::index(index));
 
-        stack.push(value);
+        let stack_bottom = stack.swap_frame(full_count)?;
 
+        stack.store(Address::BASE, value)?;
         // SAFETY: We hold onto the guard for the duration of this call.
-        let _guard = unsafe { args.unsafe_into_stack(stack)? };
+        let _guard = unsafe { args.unsafe_into_stack(Address::FIRST, stack)? };
 
-        if !self.fn_call(hash, stack, address, full_count, output)? {
+        if !self.fn_call(hash, stack, Address::BASE, full_count, output)? {
             // Restore the stack since no one has touched it.
-            stack.pop_n(full_count)?;
+            stack.restore_frame(stack_bottom);
             return Ok(CallResultOrOffset::Unsupported);
         }
 
+        stack.return_frame(stack_bottom, Address::BASE, output)?;
         Ok(CallResultOrOffset::Ok)
     }
 
@@ -127,21 +128,21 @@ impl RuntimeContext {
         // SAFETY: We hold onto the guard for the duration of this call.
         let (value, _value_guard) = unsafe { value.unsafe_to_value()? };
 
-        let address = stack.top()?;
         let full_count = args.count() + 1;
+        let old_bottom = stack.swap_frame(full_count)?;
         let hash = Hash::field_fn(protocol, value.type_hash()?, hash.into_type_hash());
 
-        stack.push(value.clone());
+        stack.store(Address::BASE, value.clone())?;
 
         // SAFETY: We hold onto the guard for the duration of this call.
-        let _guard = unsafe { args.unsafe_into_stack(stack)? };
+        let _guard = unsafe { args.unsafe_into_stack(Address::FIRST, stack)? };
 
-        if !self.fn_call(hash, stack, address, full_count, output)? {
-            // Restore the stack since no one has touched it.
-            stack.pop_n(full_count)?;
+        if !self.fn_call(hash, stack, Address::BASE, full_count, output)? {
+            stack.restore_frame(old_bottom);
             return Ok(CallResult::Unsupported);
         }
 
+        stack.return_frame(old_bottom, Address::BASE, output)?;
         Ok(CallResult::Ok(()))
     }
 
@@ -166,11 +167,12 @@ impl RuntimeContext {
         let full_count = args.count() + 1;
         let type_hash = value.type_hash()?;
 
-        let address = stack.top()?;
-        stack.push(value);
+        let old_bottom = stack.swap_frame(full_count)?;
+
+        stack.store(Address::BASE, value)?;
 
         // SAFETY: We hold onto the guard for the duration of this call.
-        let args_guard = unsafe { args.unsafe_into_stack(stack)? };
+        let args_guard = unsafe { args.unsafe_into_stack(Address::FIRST, stack)? };
 
         let hash = Hash::instance_function(type_hash, hash.into_type_hash());
 
@@ -186,20 +188,21 @@ impl RuntimeContext {
             return Ok(CallResultOrOffset::Offset(CallOffset {
                 offset,
                 call,
-                address,
+                address: Address::BASE,
                 args,
                 frame,
                 output,
+                old_bottom,
                 guard: (value_guard, args_guard),
             }));
         }
 
-        if !self.fn_call(hash, stack, address, full_count, output)? {
-            // Restore the stack since no one has touched it.
-            stack.pop_n(full_count)?;
+        if !self.fn_call(hash, stack, Address::BASE, full_count, output)? {
+            stack.restore_frame(old_bottom);
             return Ok(CallResultOrOffset::Unsupported);
         }
 
+        stack.return_frame(old_bottom, Address::BASE, output)?;
         return Ok(CallResultOrOffset::Ok);
     }
 }

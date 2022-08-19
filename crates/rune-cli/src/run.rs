@@ -227,14 +227,17 @@ pub(crate) async fn run(
                 None => stack.stack_bottom(),
             };
 
-            let values = stack
-                .get(frame.stack_bottom()..stack_top)
-                .expect("bad stack slice");
-
             writeln!(io.stdout, "  frame #{} (+{})", count, frame.stack_bottom())?;
 
-            if values.is_empty() {
-                writeln!(io.stdout, "    *empty*")?;
+            match stack.range(frame.stack_bottom(), stack_top) {
+                Some(values) => {
+                    for (n, value) in values.iter().enumerate() {
+                        writeln!(io.stdout, "  {}+{} = {:?}", frame.stack_bottom(), n, value)?;
+                    }
+                }
+                None => {
+                    writeln!(io.stdout, "  *empty*")?;
+                }
             }
 
             for (n, value) in stack.iter().enumerate() {
@@ -245,25 +248,20 @@ pub(crate) async fn run(
         // NB: print final frame
         writeln!(
             io.stdout,
-            "  frame #{} (+{})",
+            "frame #{} (+{})",
             frames.len(),
             stack.stack_bottom()
         )?;
 
-        let values = stack.get(stack.stack_bottom()..).expect("bad stack slice");
-
-        if values.is_empty() {
-            writeln!(io.stdout, "    *empty*")?;
-        }
-
-        for (n, value) in values.iter().enumerate() {
-            writeln!(
-                io.stdout,
-                "    {}+{} = {:?}",
-                stack.stack_bottom(),
-                n,
-                value
-            )?;
+        match stack.get_from(stack.stack_bottom()) {
+            Some(values) => {
+                for (n, value) in values.iter().enumerate() {
+                    writeln!(io.stdout, "  {}+{} = {:?}", stack.stack_bottom(), n, value)?;
+                }
+            }
+            None => {
+                writeln!(io.stdout, "  *empty*")?;
+            }
         }
     }
 
@@ -351,7 +349,9 @@ where
                 current_frame_len = frames.len();
             }
 
-            let values = stack.get(stack.stack_bottom()..).expect("bad stack slice");
+            let values = stack
+                .get_from(stack.stack_bottom())
+                .expect("bad stack slice");
 
             if values.is_empty() {
                 writeln!(o, "    *empty*")?;

@@ -1,16 +1,43 @@
+use std::fmt;
+use std::mem;
+use std::sync::Arc;
+
 use crate::collections::HashMap;
 use crate::macros::{MacroContext, TokenStream};
 use crate::runtime::vm::{CallOffset, CallResult, CallResultOrOffset};
 use crate::runtime::{
-    Address, ConstValue, GuardedArgs, Protocol, Stack, Unit, UnitFn, UnsafeToValue, VmError,
+    Address, ConstValue, GuardedArgs, Protocol, Stack, StackError, Unit, UnitFn, UnsafeToValue,
+    Value, VmError,
 };
 use crate::{Hash, IntoTypeHash};
-use std::fmt;
-use std::sync::Arc;
+
+/// A collection of arguments passed into a function.
+pub trait Arguments {
+    /// Get the next address that was passed in.
+    fn next(&mut self) -> Result<Address, StackError>;
+
+    /// Take the next value out of a stack.
+    fn take_next(&mut self, stack: &mut Stack) -> Result<Value, StackError> {
+        Ok(mem::take(stack.at_mut(self.next()?)?))
+    }
+
+    /// Try to take the next value if one is present.
+    fn try_take_next(&mut self, stack: &mut Stack) -> Result<Option<Value>, StackError> {
+        let address = match self.next() {
+            Ok(address) => address,
+            Err(StackError) => return Ok(None),
+        };
+
+        Ok(Some(mem::take(stack.at_mut(address)?)))
+    }
+
+    /// The number of arguments passed in.
+    fn count(&self) -> usize;
+}
 
 /// A type-reduced function handler.
 pub(crate) type FunctionHandler =
-    dyn Fn(&mut Stack, Address, usize, Address) -> Result<(), VmError> + Send + Sync;
+    dyn Fn(&mut Stack, &mut dyn Arguments, Address) -> Result<(), VmError> + Send + Sync;
 
 /// A (type erased) macro handler.
 pub(crate) type MacroHandler =
@@ -57,8 +84,7 @@ impl RuntimeContext {
         &self,
         hash: Hash,
         stack: &mut Stack,
-        address: Address,
-        args: usize,
+        arguments: &mut dyn Arguments,
         output: Address,
     ) -> Result<bool, VmError> {
         let handler = match self.function(hash) {
@@ -70,37 +96,32 @@ impl RuntimeContext {
         };
 
         tracing::trace!("calling handler");
-        handler(stack, address, args, output)?;
+        handler(stack, arguments, output)?;
         Ok(true)
     }
 
     /// Helper to call an index function.
-    pub(crate) fn call_index_fn<V, A>(
+    pub(crate) fn call_index_fn<const N: usize>(
         &self,
         stack: &mut Stack,
         protocol: Protocol,
-        value: V,
+        value: Address,
         index: usize,
-        args: A,
+        args: [Address; N],
         output: Address,
-    ) -> Result<CallResultOrOffset<()>, VmError>
-    where
-        V: UnsafeToValue,
-        A: GuardedArgs,
-    {
-        // SAFETY: We hold onto the guard for the duration of this call.
-        let (value, _value_guard) = unsafe { value.unsafe_to_value()? };
-
-        let full_count = args.count() + 1;
-        let hash = Hash::index_fn(protocol, value.type_hash()?, Hash::index(index));
+    ) -> Result<CallResultOrOffset, VmError> {
+        let full_count = N + 1;
+        let hash = stack.at(value)?.type_hash()?;
+        let hash = Hash::index_fn(protocol, hash, Hash::index(index));
 
         let stack_bottom = stack.swap_frame(full_count)?;
 
-        stack.store(Address::BASE, value)?;
-        // SAFETY: We hold onto the guard for the duration of this call.
-        let _guard = unsafe { args.unsafe_into_stack(Address::FIRST, stack)? };
-
-        if !self.fn_call(hash, stack, Address::BASE, full_count, output)? {
+        if !self.fn_call(
+            hash,
+            stack,
+            &mut ArgumentsChain::new(value, args.into_iter()),
+            output,
+        )? {
             // Restore the stack since no one has touched it.
             stack.restore_frame(stack_bottom);
             return Ok(CallResultOrOffset::Unsupported);
@@ -137,7 +158,7 @@ impl RuntimeContext {
         // SAFETY: We hold onto the guard for the duration of this call.
         let _guard = unsafe { args.unsafe_into_stack(Address::FIRST, stack)? };
 
-        if !self.fn_call(hash, stack, Address::BASE, full_count, output)? {
+        if !self.fn_call(hash, stack, &mut Address::BASE.sequence(full_count), output)? {
             stack.restore_frame(old_bottom);
             return Ok(CallResult::Unsupported);
         }
@@ -147,32 +168,23 @@ impl RuntimeContext {
     }
 
     /// Helper function to call an instance function.
-    pub(crate) fn call_instance_fn<V, H, A>(
+    pub(crate) fn call_instance_fn<H, I>(
         &self,
         stack: &mut Stack,
         unit: &Unit,
-        value: V,
+        address: Address,
         hash: H,
-        args: A,
+        arguments: I,
         output: Address,
-    ) -> Result<CallResultOrOffset<(V::Guard, A::Guard)>, VmError>
+    ) -> Result<CallResultOrOffset, VmError>
     where
-        V: UnsafeToValue,
         H: IntoTypeHash,
-        A: GuardedArgs,
+        I: IntoIterator<Item = Address>,
+        I::IntoIter: ExactSizeIterator,
     {
-        // SAFETY: We hold onto the guard for the duration of this call.
-        let (value, value_guard) = unsafe { value.unsafe_to_value()? };
-
-        let full_count = args.count() + 1;
-        let type_hash = value.type_hash()?;
-
-        let old_bottom = stack.swap_frame(full_count)?;
-
-        stack.store(Address::BASE, value)?;
-
-        // SAFETY: We hold onto the guard for the duration of this call.
-        let args_guard = unsafe { args.unsafe_into_stack(Address::FIRST, stack)? };
+        let arguments = arguments.into_iter();
+        let full_count = arguments.len() + 1;
+        let type_hash = stack.at(address)?.type_hash()?;
 
         let hash = Hash::instance_function(type_hash, hash.into_type_hash());
 
@@ -188,21 +200,22 @@ impl RuntimeContext {
             return Ok(CallResultOrOffset::Offset(CallOffset {
                 offset,
                 call,
-                address: Address::BASE,
+                address: address,
                 args,
                 frame,
                 output,
-                old_bottom,
-                guard: (value_guard, args_guard),
             }));
         }
 
-        if !self.fn_call(hash, stack, Address::BASE, full_count, output)? {
-            stack.restore_frame(old_bottom);
+        if !self.fn_call(
+            hash,
+            stack,
+            &mut ArgumentsChain::new(address, arguments),
+            output,
+        )? {
             return Ok(CallResultOrOffset::Unsupported);
         }
 
-        stack.return_frame(old_bottom, Address::BASE, output)?;
         return Ok(CallResultOrOffset::Ok);
     }
 }
@@ -215,3 +228,34 @@ impl fmt::Debug for RuntimeContext {
 
 #[cfg(test)]
 static_assertions::assert_impl_all!(RuntimeContext: Send, Sync);
+
+struct ArgumentsChain<I> {
+    first: Option<Address>,
+    rest: I,
+}
+
+impl<I> ArgumentsChain<I> {
+    fn new(first: Address, rest: I) -> Self {
+        Self {
+            first: Some(first),
+            rest,
+        }
+    }
+}
+
+impl<I> Arguments for ArgumentsChain<I>
+where
+    I: ExactSizeIterator<Item = Address>,
+{
+    fn next(&mut self) -> Result<Address, StackError> {
+        if let Some(address) = self.first.take() {
+            return Ok(address);
+        }
+
+        self.rest.next().ok_or(StackError)
+    }
+
+    fn count(&self) -> usize {
+        self.rest.len() + if self.first.is_some() { 1 } else { 0 }
+    }
+}

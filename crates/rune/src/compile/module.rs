@@ -7,9 +7,9 @@ use crate::collections::{HashMap, HashSet};
 use crate::compile::{ContextError, IntoComponent, ItemBuf, Named};
 use crate::macros::{MacroContext, TokenStream};
 use crate::runtime::{
-    Address, ConstValue, FromValue, FunctionHandler, Future, GeneratorState, MacroHandler,
-    Protocol, Stack, StaticType, ToValue, TypeCheck, TypeInfo, TypeOf, UnsafeFromValue, Value,
-    VmError, VmErrorKind,
+    Address, Arguments, ConstValue, FromValue, FunctionHandler, Future, GeneratorState,
+    MacroHandler, Protocol, Stack, StaticType, ToValue, TypeCheck, TypeInfo, TypeOf,
+    UnsafeFromValue, Value, VmError, VmErrorKind,
 };
 use crate::{Hash, InstFnInfo, InstFnKind, InstFnName};
 use std::fmt;
@@ -73,9 +73,8 @@ impl InternalEnum {
     where
         C: Function<Args>,
     {
-        let constructor: Arc<FunctionHandler> = Arc::new(move |stack, address, args, output| {
-            constructor.fn_call(stack, address, args, output)
-        });
+        let constructor: Arc<FunctionHandler> =
+            Arc::new(move |stack, arguments, output| constructor.fn_call(stack, arguments, output));
 
         self.variants.push(InternalVariant {
             name,
@@ -494,8 +493,8 @@ impl Module {
             });
         }
 
-        variant.constructor = Some(Arc::new(move |stack, address, args, output| {
-            constructor.fn_call(stack, address, args, output)
+        variant.constructor = Some(Arc::new(move |stack, arguments, output| {
+            constructor.fn_call(stack, arguments, output)
         }));
 
         Ok(())
@@ -671,8 +670,8 @@ impl Module {
         self.functions.insert(
             name,
             ModuleFn {
-                handler: Arc::new(move |stack, address, args, output| {
-                    f.fn_call(stack, address, args, output)
+                handler: Arc::new(move |stack, arguments, output| {
+                    f.fn_call(stack, arguments, output)
                 }),
                 args: Some(Func::args()),
             },
@@ -772,8 +771,8 @@ impl Module {
         self.functions.insert(
             name,
             ModuleFn {
-                handler: Arc::new(move |stack, address, args, output| {
-                    f.fn_call(stack, address, args, output)
+                handler: Arc::new(move |stack, arguments, output| {
+                    f.fn_call(stack, arguments, output)
                 }),
                 args: Some(Func::args()),
             },
@@ -786,7 +785,10 @@ impl Module {
     /// machine.
     pub fn raw_fn<F, N>(&mut self, name: N, f: F) -> Result<(), ContextError>
     where
-        F: 'static + Fn(&mut Stack, Address, usize, Address) -> Result<(), VmError> + Send + Sync,
+        F: 'static
+            + Fn(&mut Stack, &mut dyn Arguments, Address) -> Result<(), VmError>
+            + Send
+            + Sync,
         N: IntoIterator,
         N::Item: IntoComponent,
     {
@@ -799,9 +801,7 @@ impl Module {
         self.functions.insert(
             name,
             ModuleFn {
-                handler: Arc::new(move |stack, address, args, output| {
-                    f(stack, address, args, output)
-                }),
+                handler: Arc::new(move |stack, arguments, output| f(stack, arguments, output)),
                 args: None,
             },
         );
@@ -851,7 +851,7 @@ impl Module {
     {
         let name = name.info();
         let handler: Arc<FunctionHandler> =
-            Arc::new(move |stack, address, args, output| f.fn_call(stack, address, args, output));
+            Arc::new(move |stack, arguments, output| f.fn_call(stack, arguments, output));
         let ty = Func::ty();
         let args = Some(Func::args());
         self.assoc_fn(name, handler, ty, args, AssocKind::Instance)
@@ -870,7 +870,7 @@ impl Module {
     {
         let name = name.info();
         let handler: Arc<FunctionHandler> =
-            Arc::new(move |stack, address, args, output| f.fn_call(stack, address, args, output));
+            Arc::new(move |stack, arguments, output| f.fn_call(stack, arguments, output));
         let ty = Func::ty();
         let args = Some(Func::args());
         self.assoc_fn(name, handler, ty, args, AssocKind::FieldFn(protocol))
@@ -891,7 +891,7 @@ impl Module {
     {
         let name = InstFnInfo::index(protocol, index);
         let handler: Arc<FunctionHandler> =
-            Arc::new(move |stack, address, args, output| f.fn_call(stack, address, args, output));
+            Arc::new(move |stack, arguments, output| f.fn_call(stack, arguments, output));
         let ty = Func::ty();
         let args = Some(Func::args());
         self.assoc_fn(name, handler, ty, args, AssocKind::IndexFn(protocol))
@@ -931,7 +931,7 @@ impl Module {
     {
         let name = name.info();
         let handler: Arc<FunctionHandler> =
-            Arc::new(move |stack, address, args, output| f.fn_call(stack, address, args, output));
+            Arc::new(move |stack, arguments, output| f.fn_call(stack, arguments, output));
         let ty = Func::ty();
         let args = Some(Func::args());
         self.assoc_fn(name, handler, ty, args, AssocKind::Instance)
@@ -994,8 +994,7 @@ pub trait Function<Args>: 'static + Send + Sync {
     fn fn_call(
         &self,
         stack: &mut Stack,
-        address: Address,
-        args: usize,
+        arguments: &mut dyn Arguments,
         output: Address,
     ) -> Result<(), VmError>;
 }
@@ -1012,8 +1011,7 @@ pub trait AsyncFunction<Args>: 'static + Send + Sync {
     fn fn_call(
         &self,
         stack: &mut Stack,
-        address: Address,
-        args: usize,
+        arguments: &mut dyn Arguments,
         output: Address,
     ) -> Result<(), VmError>;
 }
@@ -1036,8 +1034,7 @@ pub trait InstFn<Args>: 'static + Send + Sync {
     fn fn_call(
         &self,
         stack: &mut Stack,
-        address: Address,
-        args: usize,
+        arguments: &mut dyn Arguments,
         output: Address,
     ) -> Result<(), VmError>;
 }
@@ -1060,20 +1057,19 @@ pub trait AsyncInstFn<Args>: 'static + Send + Sync {
     fn fn_call(
         &self,
         stack: &mut Stack,
-        address: Address,
-        args: usize,
+        arguments: &mut dyn Arguments,
         output: Address,
     ) -> Result<(), VmError>;
 }
 
 macro_rules! impl_register {
     () => {
-        impl_register!{@impl 0,}
+        impl_register!(@impl 0,);
     };
 
     ({$ty:ident, $var:ident, $num:expr}, $({$l_ty:ident, $l_var:ident, $l_num:expr},)*) => {
-        impl_register!{@impl $num, {$ty, $var, $num}, $({$l_ty, $l_var, $l_num},)*}
-        impl_register!{$({$l_ty, $l_var, $l_num},)*}
+        impl_register!(@impl $num, {$ty, $var, $num}, $({$l_ty, $l_var, $l_num},)*);
+        impl_register!($({$l_ty, $l_var, $l_num},)*);
     };
 
     (@impl $count:expr, $({$ty:ident, $var:ident, $num:expr},)*) => {
@@ -1089,13 +1085,9 @@ macro_rules! impl_register {
                 $count
             }
 
-            fn fn_call(&self, stack: &mut Stack, address: Address, args: usize, output: Address) -> Result<(), VmError> {
-                impl_register!{@check-args $count, args}
-
-                #[allow(unused_mut)]
-                let mut it = stack.drain_at(address, $count)?;
-                $(let $var = it.next().unwrap();)*
-                drop(it);
+            fn fn_call(&self, stack: &mut Stack, arguments: &mut dyn Arguments, output: Address) -> Result<(), VmError> {
+                impl_register!(@check-args $count, arguments.count());
+                $(let $var = stack.at(arguments.next()?)?.clone();)*
 
                 tracing::trace!("call");
 
@@ -1106,9 +1098,9 @@ macro_rules! impl_register {
                 // when we return below.
                 #[allow(unused)]
                 let ret = unsafe {
-                    impl_register!{@unsafe-vars $count, $($ty, $var, $num,)*}
+                    impl_register!(@unsafe-vars $count, $($ty, $var, $num,)*);
                     let ret = self($(<$ty>::unsafe_coerce($var.0),)*);
-                    impl_register!{@drop-stack-guards $($var),*}
+                    impl_register!(@drop-stack-guards $($var),*);
                     ret
                 };
 
@@ -1130,13 +1122,9 @@ macro_rules! impl_register {
                 $count
             }
 
-            fn fn_call(&self, stack: &mut Stack, address: Address, args: usize, output: Address) -> Result<(), VmError> {
-                impl_register!{@check-args $count, args}
-
-                #[allow(unused_mut)]
-                let mut it = stack.drain_at(address, $count)?;
-                $(let $var = it.next().unwrap();)*
-                drop(it);
+            fn fn_call(&self, stack: &mut Stack, arguments: &mut dyn Arguments, output: Address) -> Result<(), VmError> {
+                impl_register!(@check-args $count, arguments.count());
+                $(let $var = stack.at(arguments.next()?)?.clone();)*
 
                 tracing::trace!("async call");
 
@@ -1146,13 +1134,13 @@ macro_rules! impl_register {
                 // being polled.
                 #[allow(unused_unsafe)]
                 let ret = unsafe {
-                    impl_register!{@unsafe-vars $count, $($ty, $var, $num,)*}
+                    impl_register!(@unsafe-vars $count, $($ty, $var, $num,)*);
 
                     let fut = self($(<$ty>::unsafe_coerce($var.0),)*);
 
                     Future::new(async move {
                         let output = fut.await;
-                        impl_register!{@drop-stack-guards $($var),*}
+                        impl_register!(@drop-stack-guards $($var),*);
                         let value = output.to_value()?;
                         Ok(value)
                     })
@@ -1184,14 +1172,11 @@ macro_rules! impl_register {
                 }
             }
 
-            fn fn_call(&self, stack: &mut Stack, address: Address, args: usize, output: Address) -> Result<(), VmError> {
-                impl_register!{@check-args ($count + 1), args}
+            fn fn_call(&self, stack: &mut Stack, arguments: &mut dyn Arguments, output: Address) -> Result<(), VmError> {
+                impl_register!(@check-args ($count + 1), arguments.count());
 
-                #[allow(unused_mut)]
-                let mut it = stack.drain_at(address, $count + 1)?;
-                let inst = it.next().unwrap();
-                $(let $var = it.next().unwrap();)*
-                drop(it);
+                let inst = stack.at(arguments.next()?)?.clone();
+                $(let $var = stack.at(arguments.next()?)?.clone();)*
 
                 tracing::trace!(?inst, "instance call");
 
@@ -1202,9 +1187,9 @@ macro_rules! impl_register {
                 // when we return below.
                 #[allow(unused)]
                 let ret = unsafe {
-                    impl_register!{@unsafe-inst-vars inst, $count, $($ty, $var, $num,)*}
+                    impl_register!(@unsafe-inst-vars inst, $count, $($ty, $var, $num,)*);
                     let ret = self(Instance::unsafe_coerce(inst.0), $(<$ty>::unsafe_coerce($var.0),)*);
-                    impl_register!{@drop-stack-guards inst, $($var),*}
+                    impl_register!(@drop-stack-guards inst, $($var),*);
                     ret
                 };
 
@@ -1235,14 +1220,11 @@ macro_rules! impl_register {
                 }
             }
 
-            fn fn_call(&self, stack: &mut Stack, address: Address, args: usize, output: Address) -> Result<(), VmError> {
-                impl_register!{@check-args ($count + 1), args}
+            fn fn_call(&self, stack: &mut Stack, arguments: &mut dyn Arguments, output: Address) -> Result<(), VmError> {
+                impl_register!(@check-args ($count + 1), arguments.count());
 
-                #[allow(unused_mut)]
-                let mut it = stack.drain_at(address, $count + 1)?;
-                let inst = it.next().unwrap();
-                $(let $var = it.next().unwrap();)*
-                drop(it);
+                let inst = stack.at(arguments.next()?)?.clone();
+                $(let $var = stack.at(arguments.next()?)?.clone();)*
 
                 tracing::trace!(?inst, "async instance call");
 
@@ -1252,13 +1234,13 @@ macro_rules! impl_register {
                 // being polled.
                 #[allow(unused)]
                 let ret = unsafe {
-                    impl_register!{@unsafe-inst-vars inst, $count, $($ty, $var, $num,)*}
+                    impl_register!(@unsafe-inst-vars inst, $count, $($ty, $var, $num,)*);
 
                     let fut = self(Instance::unsafe_coerce(inst.0), $(<$ty>::unsafe_coerce($var.0),)*);
 
                     Future::new(async move {
                         let output = fut.await;
-                        impl_register!{@drop-stack-guards inst, $($var),*}
+                        impl_register!(@drop-stack-guards inst, $($var),*);
                         let value = output.to_value()?;
                         Ok(value)
                     })

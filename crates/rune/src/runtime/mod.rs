@@ -82,7 +82,7 @@ pub use self::protocol::Protocol;
 pub(crate) use self::protocol_caller::{EnvProtocolCaller, ProtocolCaller};
 pub use self::range::{Range, RangeLimits};
 pub use self::raw_str::RawStr;
-pub use self::runtime_context::RuntimeContext;
+pub use self::runtime_context::{Arguments, RuntimeContext};
 pub(crate) use self::runtime_context::{FunctionHandler, MacroHandler};
 pub use self::select::Select;
 pub use self::shared::{Mut, RawMut, RawRef, Ref, Shared, SharedPointerGuard};

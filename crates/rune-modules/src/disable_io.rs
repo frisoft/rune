@@ -10,7 +10,7 @@
 //! # Ok(()) }
 //! ```
 
-use rune::runtime::{Address, Stack};
+use rune::runtime::{Address, Arguments, Stack};
 use rune::{ContextError, Module};
 
 /// Provide a bunch of `std::io` functions which will cause any output to be ignored.
@@ -23,9 +23,8 @@ pub fn module() -> Result<Module, ContextError> {
 
     module.raw_fn(
         &["dbg"],
-        move |stack: &mut Stack, address: Address, args: usize, output: Address| {
-            // NB: still need to maintain the stack.
-            drop(stack.drain_at(address, args)?);
+        move |stack: &mut Stack, arguments: &mut dyn Arguments, output: Address| {
+            while let Some(_) = arguments.try_take_next(stack)? {}
             stack.store(output, ())?;
             Ok(())
         },

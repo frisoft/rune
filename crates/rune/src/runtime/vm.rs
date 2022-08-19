@@ -3,11 +3,11 @@ use crate::runtime::key::StringKey;
 use crate::runtime::unit::UnitFn;
 use crate::runtime::{budget, Key};
 use crate::runtime::{
-    Address, AnyObj, Args, Awaited, BorrowMut, BorrowRef, Bytes, Call, Format, FormatSpec,
-    FromValue, Function, Future, Generator, GuardedArgs, Inst, InstAssignOp, InstOp,
-    InstRangeLimits, InstTarget, InstValue, InstVariant, Object, Panic, Protocol, Range,
-    RangeLimits, RuntimeContext, Select, Shared, Stack, StackSize, StaticString, Stream, Struct,
-    Tuple, TypeCheck, Unit, UnitStruct, UnsafeToValue, Value, Variant, VariantData, Vec, VmError,
+    Address, Args, Awaited, BorrowMut, BorrowRef, Bytes, Call, Format, FormatSpec, FromValue,
+    Function, Future, Generator, GuardedArgs, Inst, InstAssignOp, InstOp, InstRangeLimits,
+    InstTarget, InstValue, InstVariant, Object, Panic, Protocol, Range, RangeLimits,
+    RuntimeContext, Select, Shared, Stack, StackSize, StaticString, Stream, Struct, Tuple,
+    TypeCheck, Unit, UnitStruct, UnsafeToValue, Value, Variant, VariantData, Vec, VmError,
     VmErrorKind, VmExecution, VmHalt, VmIntegerRepr, VmSendExecution,
 };
 use crate::{Hash, IntoTypeHash};
@@ -41,7 +41,7 @@ impl<T> CallResult<BorrowRef<'_, T>> {
 }
 
 #[derive(Debug)]
-pub(crate) struct CallOffset<G> {
+pub(crate) struct CallOffset {
     /// Offset of the registered function.
     pub(crate) offset: usize,
     /// The way the function is called.
@@ -54,27 +54,23 @@ pub(crate) struct CallOffset<G> {
     pub(crate) frame: usize,
     /// Output address to write to.
     pub(crate) output: Address,
-    /// Old stack bottom to restore once the call completes.
-    pub(crate) old_bottom: StackSize,
-    /// Guards used in the offset call.
-    pub(crate) guard: G,
 }
 
 /// The result from a dynamic call. Indicates if the attempted operation is
 /// supported.
 #[derive(Debug)]
 #[must_use]
-pub(crate) enum CallResultOrOffset<G> {
+pub(crate) enum CallResultOrOffset {
     /// Call successful. Return value is on the stack.
     Ok,
     /// Call failed because function was missing so the method is unsupported.
     /// Contains target value.
     Unsupported,
     /// Offset to call.
-    Offset(CallOffset<G>),
+    Offset(CallOffset),
 }
 
-impl<G> CallResultOrOffset<G> {
+impl CallResultOrOffset {
     /// Apply the call result to the virtual machine if it resulted in an offset
     /// call.
     #[inline]
@@ -89,11 +85,9 @@ impl<G> CallResultOrOffset<G> {
                 args,
                 frame,
                 output,
-                old_bottom,
-                guard: _guard,
             }) => {
                 vm.call_offset_fn(offset, call, address, args, frame, output)?;
-                vm.stack_mut().return_frame(old_bottom, address, output)?;
+                todo!("this is all sorts of wrong, we need to ensure that the desired calling convention is being followed");
                 Ok(CallResult::Ok(()))
             }
         }
@@ -409,14 +403,20 @@ impl Vm {
     {
         let hash = hash.into_type_hash();
 
+        // SAFETY: We hold onto the guard for the duration of the call.
+        let (value, _value_guard) = unsafe { value.unsafe_to_value()? };
+
+        let bottom = self.stack.swap_frame(1 + args.count())?;
+        self.stack.store(Address::BASE, value)?;
+
         if let CallResult::Unsupported = self
             .context
             .call_instance_fn(
                 &mut self.stack,
                 &self.unit,
-                value,
+                Address::BASE,
                 hash,
-                args,
+                Address::FIRST.sequence(args.count()),
                 Address::BASE,
             )?
             .or_call_offset_with(self)?
@@ -424,7 +424,9 @@ impl Vm {
             return Err(VmError::from(VmErrorKind::MissingFunction { hash }));
         }
 
-        Ok(mem::take(self.stack.at_mut(Address::BASE)?))
+        let value = mem::take(self.stack.at_mut(Address::BASE)?);
+        self.stack.restore_frame(bottom);
+        Ok(value)
     }
 
     /// Update the instruction pointer to match the function matching the given
@@ -723,12 +725,16 @@ impl Vm {
             _ => {}
         }
 
-        let lhs = lhs.clone();
-        let rhs = rhs.clone();
-
         if let CallResult::Ok(()) = self
             .context
-            .call_instance_fn(&mut self.stack, &self.unit, lhs, protocol, (rhs,), output)?
+            .call_instance_fn(
+                &mut self.stack,
+                &self.unit,
+                lhs_address,
+                protocol,
+                [rhs_address],
+                output,
+            )?
             .or_call_offset_with(self)?
         {
             return Ok(());
@@ -753,25 +759,22 @@ impl Vm {
         let lhs = self.stack.at(lhs_address)?;
         let rhs = self.stack.at(rhs_address)?;
 
-        let (lhs, rhs) = match (lhs, rhs) {
+        match (lhs, rhs) {
             (Value::Integer(lhs), Value::Integer(rhs)) => {
                 self.stack.store(output, integer_op(*lhs, *rhs))?;
                 return Ok(());
             }
-            (lhs, rhs) => (lhs, rhs),
-        };
-
-        let lhs = lhs.clone();
-        let rhs = rhs.clone();
+            _ => {}
+        }
 
         if let CallResult::Ok(()) = self
             .context
             .call_instance_fn(
                 &mut self.stack,
                 &self.unit,
-                lhs.clone(),
+                lhs_address,
                 protocol,
-                (rhs.clone(),),
+                [rhs_address],
                 output,
             )?
             .or_call_offset_with(self)?
@@ -799,7 +802,7 @@ impl Vm {
         let lhs = self.stack.at(lhs_address)?;
         let rhs = self.stack.at(rhs_address)?;
 
-        let (lhs, rhs) = match (lhs, rhs) {
+        match (lhs, rhs) {
             (Value::Integer(lhs), Value::Integer(rhs)) => {
                 self.stack.store(output, integer_op(*lhs, *rhs))?;
                 return Ok(());
@@ -808,20 +811,17 @@ impl Vm {
                 self.stack.store(output, bool_op(*lhs, *rhs))?;
                 return Ok(());
             }
-            (lhs, rhs) => (lhs, rhs),
-        };
-
-        let lhs = lhs.clone();
-        let rhs = rhs.clone();
+            _ => {}
+        }
 
         if let CallResult::Ok(()) = self
             .context
             .call_instance_fn(
                 &mut self.stack,
                 &self.unit,
-                lhs.clone(),
+                lhs_address,
                 protocol,
-                (rhs.clone(),),
+                [rhs_address],
                 output,
             )?
             .or_call_offset_with(self)?
@@ -883,17 +883,14 @@ impl Vm {
             _ => {}
         }
 
-        let lhs = lhs.clone();
-        let rhs = lhs.clone();
-
         if let CallResult::Ok(()) = self
             .context
             .call_instance_fn(
                 &mut self.stack,
                 &self.unit,
-                lhs.clone(),
+                lhs_address,
                 protocol,
-                (rhs.clone(),),
+                [rhs_address],
                 output,
             )?
             .or_call_offset_with(self)?
@@ -1433,25 +1430,21 @@ impl Vm {
     ) -> Result<(), VmError> {
         {
             let target = self.stack.at(address)?;
-            let index = self.stack.at(index)?;
-            let value = self.stack.at(value)?;
+            let index_value = self.stack.at(index)?;
+            let value_value = self.stack.at(value)?;
 
-            if let CallResult::Ok(()) = builtin(target, index, value)? {
+            if let CallResult::Ok(()) = builtin(target, index_value, value_value)? {
                 return Ok(());
             }
-
-            let target = target.clone();
-            let index = index.clone();
-            let value = value.clone();
 
             if let CallResult::Ok(()) = self
                 .context
                 .call_instance_fn(
                     &mut self.stack,
                     &self.unit,
-                    target,
+                    address,
                     Protocol::INDEX_SET,
-                    (index, value),
+                    [index, value],
                     output,
                 )?
                 .or_call_offset_with(self)?
@@ -1580,17 +1573,14 @@ impl Vm {
             return Ok(());
         }
 
-        let target = self.stack.at(address)?.clone();
-        let index = self.stack.at(index_address)?.clone();
-
         if let CallResult::Ok(()) = self
             .context
             .call_instance_fn(
                 &mut self.stack,
                 &self.unit,
-                target,
+                address,
                 Protocol::INDEX_GET,
-                (index,),
+                [index_address],
                 output,
             )?
             .or_call_offset_with(self)?
@@ -1653,18 +1643,9 @@ impl Vm {
             }
         }
 
-        let value = self.stack.at(address)?.clone();
-
         if let CallResult::Ok(()) = self
             .context
-            .call_index_fn(
-                &mut self.stack,
-                Protocol::GET,
-                value.clone(),
-                index,
-                (),
-                output,
-            )?
+            .call_index_fn(&mut self.stack, Protocol::GET, address, index, [], output)?
             .or_call_offset_with(self)?
         {
             return Ok(());
@@ -1685,24 +1666,21 @@ impl Vm {
         index: usize,
         output: Address,
     ) -> Result<(), VmError> {
-        let target = self.stack.at(address)?;
-        let value = self.stack.at(value)?;
+        let target_value = self.stack.at(address)?;
+        let value_value = self.stack.at(value)?;
 
-        if builtin(target, value, index)? {
+        if builtin(target_value, value_value, index)? {
             return Ok(());
         }
-
-        let target = target.clone();
-        let value = value.clone();
 
         if let CallResult::Ok(()) = self
             .context
             .call_index_fn(
                 &mut self.stack,
                 Protocol::SET,
-                target,
+                address,
                 index,
-                (value,),
+                [value],
                 output,
             )?
             .or_call_offset_with(self)?
@@ -2289,16 +2267,14 @@ impl Vm {
                 if any.borrow_ref()?.type_hash() != enum_hash {
                     self.modify_ip(offset);
                 }
-
+            }
+            _ => {
                 if matches!(
-                    self.call_is_variant(&any, index, output)?,
+                    self.call_is_variant(address, index, output)?,
                     CallResult::Unsupported | CallResult::Ok(false)
                 ) {
                     self.modify_ip(offset);
                 }
-            }
-            _ => {
-                self.modify_ip(offset);
             }
         }
 
@@ -2651,10 +2627,12 @@ impl Vm {
                 }
             },
             None => {
-                if !self
-                    .context
-                    .fn_call(hash, &mut self.stack, address, count, output)?
-                {
+                if !self.context.fn_call(
+                    hash,
+                    &mut self.stack,
+                    &mut address.sequence(count),
+                    output,
+                )? {
                     return Err(VmError::from(VmErrorKind::MissingFunction { hash }));
                 }
             }
@@ -2691,7 +2669,7 @@ impl Vm {
 
         if !self
             .context
-            .fn_call(hash, &mut self.stack, address, count, output)?
+            .fn_call(hash, &mut self.stack, &mut address.sequence(count), output)?
         {
             return Err(VmError::from(VmErrorKind::MissingInstanceFunction {
                 instance: self.stack.at(Address::BASE)?.type_info()?,
@@ -2743,12 +2721,10 @@ impl Vm {
 
         let value = match iterator {
             Value::Iterator(iterator) => iterator.borrow_mut()?.next()?,
-            Value::Any(any) => {
-                let any = any.clone();
-
-                if let CallResult::Unsupported = self.call_next(&any, output)? {
+            _ => {
+                if let CallResult::Unsupported = self.call_next(address, output)? {
                     return Err(VmError::from(VmErrorKind::UnsupportedIterNextOperand {
-                        actual: any.borrow_ref()?.type_info(),
+                        actual: self.stack.at(address)?.type_info()?,
                     }));
                 }
 
@@ -2759,11 +2735,6 @@ impl Vm {
                     Some(some) => Some(some.clone()),
                     None => None,
                 }
-            }
-            other => {
-                return Err(VmError::from(VmErrorKind::UnsupportedIterNextOperand {
-                    actual: other.type_info()?,
-                }))
             }
         };
 
@@ -3463,12 +3434,16 @@ where
         return Ok(());
     }
 
-    let lhs = lhs.clone();
-    let rhs = rhs.clone();
-
     if let CallResult::Ok(()) = vm
         .context
-        .call_instance_fn(&mut vm.stack, &vm.unit, lhs, protocol, (rhs,), output)?
+        .call_instance_fn(
+            &mut vm.stack,
+            &vm.unit,
+            lhs_address,
+            protocol,
+            [rhs_address],
+            output,
+        )?
         .or_call_offset_with(vm)?
     {
         return Ok(());
@@ -3569,20 +3544,18 @@ impl Vm {
     /// by `index`.
     fn call_is_variant(
         &mut self,
-        any: &Shared<AnyObj>,
+        address: Address,
         index: usize,
         output: Address,
     ) -> Result<CallResult<bool>, VmError> {
-        let value = Value::Any(any.clone());
-
         if let CallResult::Unsupported = self
             .context
-            .call_instance_fn(
+            .call_index_fn(
                 &mut self.stack,
-                &self.unit,
-                value,
                 Protocol::IS_VARIANT,
-                (index,),
+                address,
+                index,
+                [],
                 output,
             )?
             .or_call_offset_with(self)?
@@ -3594,21 +3567,15 @@ impl Vm {
     }
 
     /// Call [Protocol::NEXT] on the given value.
-    fn call_next(
-        &mut self,
-        any: &Shared<AnyObj>,
-        output: Address,
-    ) -> Result<CallResult<()>, VmError> {
-        let value = Value::Any(any.clone());
-
+    fn call_next(&mut self, address: Address, output: Address) -> Result<CallResult<()>, VmError> {
         if let CallResult::Unsupported = self
             .context
             .call_instance_fn(
                 &mut self.stack,
                 &self.unit,
-                value,
+                address,
                 Protocol::NEXT,
-                (),
+                [],
                 output,
             )?
             .or_call_offset_with(self)?

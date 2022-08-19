@@ -50,8 +50,8 @@ impl Function {
     {
         Self(FunctionImpl {
             inner: Inner::FnHandler(FnHandler {
-                handler: Arc::new(move |stack, address, args, output| {
-                    f.fn_call(stack, address, args, output)
+                handler: Arc::new(move |stack, arguments, output| {
+                    f.fn_call(stack, arguments, output)
                 }),
                 hash: Hash::EMPTY,
             }),
@@ -94,8 +94,8 @@ impl Function {
     {
         Self(FunctionImpl {
             inner: Inner::FnHandler(FnHandler {
-                handler: Arc::new(move |stack, address, args, output| {
-                    f.fn_call(stack, address, args, output)
+                handler: Arc::new(move |stack, arguments, output| {
+                    f.fn_call(stack, arguments, output)
                 }),
                 hash: Hash::EMPTY,
             }),
@@ -475,7 +475,11 @@ where
                 let arg_count = args.count();
                 let mut stack = Stack::with_capacity(arg_count);
                 args.into_stack(Address::BASE, &mut stack)?;
-                (handler.handler)(&mut stack, Address::BASE, arg_count, Address::BASE)?;
+                (handler.handler)(
+                    &mut stack,
+                    &mut Address::BASE.sequence(arg_count),
+                    Address::BASE,
+                )?;
                 std::mem::take(stack.at_mut(Address::BASE)?)
             }
             Inner::FnOffset(fn_offset) => fn_offset.call::<_, Value>(args, &[])?,
@@ -547,7 +551,7 @@ where
     ) -> Result<Option<VmHalt>, VmError> {
         let reason = match &self.inner {
             Inner::FnHandler(handler) => {
-                (handler.handler)(vm.stack_mut(), address, args, output)?;
+                (handler.handler)(vm.stack_mut(), &mut address.sequence(args), output)?;
                 None
             }
             Inner::FnOffset(fn_offset) => {

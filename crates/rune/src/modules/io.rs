@@ -1,6 +1,6 @@
 //! The `std::io` module.
 
-use crate::runtime::{Address, Panic, Protocol, Stack, VmError};
+use crate::runtime::{Address, Arguments, Panic, Protocol, Stack, VmError};
 use crate::{ContextError, Module};
 use std::fmt::{self, Write as _};
 use std::io::{self, Write as _};
@@ -27,14 +27,13 @@ fn format_io_error(error: &std::io::Error, buf: &mut String) -> fmt::Result {
 
 fn dbg_impl(
     stack: &mut Stack,
-    address: Address,
-    args: usize,
+    arguments: &mut dyn Arguments,
     output: Address,
 ) -> Result<(), VmError> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
 
-    for value in stack.drain_at(address, args)? {
+    while let Some(value) = arguments.try_take_next(stack)? {
         writeln!(stdout, "{:?}", value).map_err(VmError::panic)?;
     }
 

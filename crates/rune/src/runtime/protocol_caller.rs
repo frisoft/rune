@@ -68,7 +68,7 @@ impl ProtocolCaller for EnvProtocolCaller {
             // Safety: We hold onto the guard until the vm has completed.
             let _guard = unsafe { args.unsafe_into_stack(Address::FIRST, &mut stack)? };
 
-            handler(&mut stack, Address::BASE, count, Address::BASE)?;
+            handler(&mut stack, &mut &[Address::BASE][..], Address::BASE)?;
             Ok(mem::take(stack.at_mut(Address::BASE)?))
         });
 

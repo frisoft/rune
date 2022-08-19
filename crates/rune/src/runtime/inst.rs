@@ -2,12 +2,13 @@
 #![allow(unused)]
 
 use std::fmt;
+use std::mem;
 
 use rune_macros::Instruction;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::stack::StackError;
-use crate::runtime::{FormatSpec, Value};
+use crate::runtime::{Arguments, FormatSpec, Value};
 use crate::Hash;
 
 /// Pre-canned panic reasons.
@@ -811,11 +812,62 @@ impl Address {
         let len = u32::try_from(len).map_err(|_| StackError)?;
         Ok(Self(self.0.checked_add(len).ok_or(StackError)?))
     }
+
+    /// Construct an address sequence starting at the current address.
+    pub(crate) fn sequence(self, count: usize) -> AddressSequence {
+        AddressSequence { at: self, count }
+    }
+}
+
+/// A sequence of addresses.
+pub(crate) struct AddressSequence {
+    at: Address,
+    count: usize,
+}
+
+impl Arguments for AddressSequence {
+    fn next(&mut self) -> Result<Address, StackError> {
+        self.count = self.count.checked_sub(1).ok_or(StackError)?;
+        let next = self.at.step()?;
+        Ok(mem::replace(&mut self.at, next))
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+}
+
+impl Iterator for AddressSequence {
+    type Item = Address;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.count = self.count.checked_sub(1)?;
+        let next = self.at.step().ok()?;
+        Some(mem::replace(&mut self.at, next))
+    }
+}
+
+impl ExactSizeIterator for AddressSequence {
+    fn len(&self) -> usize {
+        self.count
+    }
 }
 
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+impl Arguments for &[Address] {
+    fn next(&mut self) -> Result<Address, StackError> {
+        let (first, rest) = self.split_first().ok_or(StackError)?;
+        *self = rest;
+        Ok(*first)
+    }
+
+    fn count(&self) -> usize {
+        self.len()
     }
 }
 

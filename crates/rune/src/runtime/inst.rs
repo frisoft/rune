@@ -425,16 +425,6 @@ pub enum Inst {
         #[rune(address)]
         output: Address,
     },
-    /// Take the tuple that is on top of the stack and unpack its content onto the
-    /// stack starting at `output`.
-    UnpackTuple {
-        /// Address of the tuple to unpack.
-        #[rune(address)]
-        address: Address,
-        /// The output address to push the tuple onto.
-        #[rune(address)]
-        output: Address,
-    },
     /// Construct a push an object onto the stack. The number of elements
     /// in the object are determined the slot of the object keys `slot` and are
     /// popped from the stack.
@@ -766,7 +756,10 @@ pub enum Inst {
         #[rune(address)]
         output: Address,
     },
-    /// Advance an iterator at the given position.
+    /// Advance an iterator at the given position. If the iterator does not
+    /// advance `output` will be set to `()` and the jump indicated by `offset`
+    /// will be performed. If the iterator can be advanced its output is stored
+    /// in `output`.
     IterNext {
         /// The address of the value being advanced.
         #[rune(address)]
@@ -800,7 +793,7 @@ impl Address {
 
     /// Step to the next stack address.
     pub(crate) fn step(self) -> Result<Self, StackError> {
-        Ok(Self(self.0.checked_add(1).ok_or(StackError::new())?))
+        Ok(Self(self.0.checked_add(1).ok_or(StackError)?))
     }
 }
 

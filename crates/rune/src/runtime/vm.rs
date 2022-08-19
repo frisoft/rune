@@ -1057,6 +1057,11 @@ impl Vm {
     #[cfg_attr(feature = "bench", inline(never))]
     #[tracing::instrument(skip(self))]
     fn op_tuple(&mut self, address: Address, count: usize, output: Address) -> Result<(), VmError> {
+        if count == 0 {
+            self.stack.store(output, Value::Unit)?;
+            return Ok(());
+        }
+
         let tuple = self.stack.drain_at(address, count)?.collect::<Box<[_]>>();
         self.stack.store(output, Tuple::from(tuple))?;
         Ok(())
@@ -1073,20 +1078,6 @@ impl Vm {
         }
 
         self.stack.store(output, Tuple::from(tuple))?;
-        Ok(())
-    }
-
-    /// Push the tuple that is on top of the stack.
-    #[cfg_attr(feature = "bench", inline(never))]
-    #[tracing::instrument(skip(self))]
-    fn op_unpack_tuple(&mut self, address: Address, mut output: Address) -> Result<(), VmError> {
-        let tuple = mem::take(self.stack.at_mut(address)?).into_tuple()?;
-
-        for value in tuple.take()?.into_iter() {
-            self.stack.store(output, value)?;
-            output = output.step()?;
-        }
-
         Ok(())
     }
 
@@ -2772,6 +2763,7 @@ impl Vm {
                 *self.stack.at_mut(output)? = value;
             }
             None => {
+                *self.stack.at_mut(output)? = Value::Unit;
                 self.modify_ip(offset);
             }
         }
@@ -3019,9 +3011,6 @@ impl Vm {
                 }
                 Inst::Tuple4 { args, output } => {
                     self.op_tuple_n(&args[..], output)?;
-                }
-                Inst::UnpackTuple { address, output } => {
-                    self.op_unpack_tuple(address, output)?;
                 }
                 Inst::Object {
                     address,

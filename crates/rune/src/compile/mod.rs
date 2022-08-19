@@ -220,6 +220,7 @@ impl CompileBuildEntry<'_> {
                     };
 
                     let mut cx = self::assemble::Ctxt::new(
+                        item_meta.item,
                         self.context,
                         self.q.borrow(),
                         &mut asm,
@@ -268,6 +269,7 @@ impl CompileBuildEntry<'_> {
                     };
 
                     let mut cx = self::assemble::Ctxt::new(
+                        item_meta.item,
                         self.context,
                         self.q.borrow(),
                         &mut asm,
@@ -324,6 +326,7 @@ impl CompileBuildEntry<'_> {
                     };
 
                     let mut cx = self::assemble::Ctxt::new(
+                        item_meta.item,
                         self.context,
                         self.q.borrow(),
                         &mut asm,
@@ -374,6 +377,7 @@ impl CompileBuildEntry<'_> {
                     };
 
                     let mut cx = self::assemble::Ctxt::new(
+                        item_meta.item,
                         self.context,
                         self.q.borrow(),
                         &mut asm,

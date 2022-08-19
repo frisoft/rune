@@ -26,7 +26,7 @@ pub struct Options {
     /// Compile for and enable test features
     pub cfg_test: bool,
     /// Use the second version of the compiler in parallel.
-    pub v2: bool,
+    pub show_ssa: bool,
 }
 
 impl Options {
@@ -58,8 +58,8 @@ impl Options {
             Some("test") => {
                 self.cfg_test = it.next() != Some("false");
             }
-            Some("v2") => {
-                self.v2 = it.next() != Some("false");
+            Some("show-ssa") => {
+                self.show_ssa = it.next() != Some("false");
             }
             _ => {
                 return Err(ParseOptionError {
@@ -113,7 +113,7 @@ impl Default for Options {
             macros: true,
             bytecode: false,
             cfg_test: false,
-            v2: false,
+            show_ssa: false,
         }
     }
 }

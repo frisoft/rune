@@ -51,7 +51,8 @@ macro_rules! iter {
         let mut writer = match $cx.arena.alloc_iter(ExactSizeIterator::len(&it)) {
             Ok(writer) => writer,
             Err(e) => {
-                return Err($cx.error(
+                return Err(CompileError::new(
+                    $cx.span,
                     crate::compile::CompileErrorKind::ArenaAllocError {
                         requested: e.requested,
                     },
@@ -61,7 +62,8 @@ macro_rules! iter {
 
         while let Some($pat) = it.next() {
             if let Err(e) = writer.write($closure) {
-                return Err($cx.error(
+                return Err(CompileError::new(
+                    $cx.span,
                     crate::compile::CompileErrorKind::ArenaWriteSliceOutOfBounds { index: e.index },
                 ));
             }
@@ -223,6 +225,8 @@ trait Index: Sized {
 
 /// Handler for dealing with an assembler.
 pub(crate) struct Ctxt<'a, 'hir> {
+    /// The item that the context corresponds to.
+    item: ItemId,
     /// The context we are compiling for.
     context: &'a Context,
     /// Query system to compile required items.
@@ -265,6 +269,7 @@ impl Spanned for Ctxt<'_, '_> {
 
 impl<'a, 'hir> Ctxt<'a, 'hir> {
     pub(crate) fn new(
+        item: ItemId,
         context: &'a Context,
         q: Query<'a>,
         asm: &'a mut Assembly,
@@ -275,6 +280,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         let span = asm.location.span;
 
         Self {
+            item,
             context,
             q,
             asm,
@@ -378,6 +384,12 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         self.scopes.declare(self.span, self.scope, name, id)
     }
 
+    /// Declare a variable inside of a scope.
+    fn declare_in(&mut self, scope: ScopeId, name: Name, id: ExprId) -> Result<Option<ExprId>> {
+        let id = self.expressions.follow(id).unwrap_or(id);
+        self.scopes.declare(self.span, scope, name, id)
+    }
+
     /// Add a slot user with custom use kind.
     fn insert_expr_user(&mut self, expr: UsedExprId, user: ExprUser) -> Result<()> {
         let followed_id = self.follow(expr.id());
@@ -456,6 +468,13 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         let summary = expr_mut.use_summary();
         tracing::trace!(?expr, ?user, ?summary, "took slot user");
         Ok(summary)
+    }
+
+    /// Release an expression.
+    fn release_expr(&mut self, expr: UsedExprId) -> Result<()> {
+        let kind = self.expr(expr.id())?.kind;
+        self.release_expr_kind(kind, ExprUser::Expr(expr.id))?;
+        Ok(())
     }
 
     /// Retain all expressions referenced by the given expression.
@@ -677,9 +696,9 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     where
         T: FnOnce(&mut Self) -> Result<UsedExprId>,
     {
-        let program = mem::take(&mut self.program);
+        let start = self.program.len();
         let expr = op(self)?;
-        let program = mem::replace(&mut self.program, program);
+        let program = self.program.drain(start..);
         let program = iter!(self; program);
         Ok(Block { program, expr })
     }
@@ -958,20 +977,57 @@ pub unsafe fn array_assume_init<T, const N: usize>(array: [mem::MaybeUninit<T>; 
 #[instrument]
 pub(crate) fn closure_from_block<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    _: &hir::Block<'hir>,
-    _: &[CaptureMeta],
+    hir: &hir::Block<'hir>,
+    captures: &[CaptureMeta],
 ) -> Result<()> {
-    todo!()
+    let scope = cx.scopes.push(cx.span, None)?;
+
+    let expr = cx.with_scope(scope, |cx| {
+        build_captures(cx, captures)?;
+        let expr = block(cx, hir)?;
+        Ok(expr)
+    })?;
+
+    cx.scopes.pop(cx.span, scope)?;
+    // Assemble a function through the current context.
+    asm_function(cx, &[], expr)?;
+    Ok(())
 }
 
 /// Assemble the body of a closure function.
 #[instrument]
 pub(crate) fn closure_from_expr_closure<'hir>(
     cx: &mut Ctxt<'_, 'hir>,
-    _: &hir::ExprClosure<'hir>,
-    _: &[CaptureMeta],
+    hir: &hir::ExprClosure<'hir>,
+    captures: &[CaptureMeta],
 ) -> Result<()> {
-    todo!()
+    let scope = cx.scopes.push(cx.span, None)?;
+    let mut arguments = Vec::new();
+
+    let expr = cx.with_scope(scope, |cx| {
+        for arg in hir.args {
+            match arg {
+                hir::FnArg::SelfValue(span) => {
+                    return Err(CompileError::new(span, CompileErrorKind::UnsupportedSelf))
+                }
+                hir::FnArg::Pat(hir) => {
+                    let address = cx.allocator.alloc();
+                    let expr = cx.insert_expr_with_address(ExprKind::Empty, address)?;
+                    arguments.push(pat(cx, hir, expr)?);
+                }
+            }
+        }
+
+        build_captures(cx, captures)?;
+        let expr = expr_value(cx, hir.body)?;
+        Ok(expr)
+    })?;
+
+    cx.scopes.pop(cx.span, scope)?;
+
+    // Assemble a function through the current context.
+    asm_function(cx, &arguments, expr)?;
+    Ok(())
 }
 
 /// Assemble a function from an [hir::ItemFn<'_>].
@@ -1016,13 +1072,34 @@ pub(crate) fn fn_from_item_fn<'hir>(
 
     cx.scopes.pop(span, scope)?;
 
+    // Assemble a function through the current context.
+    asm_function(cx, &arguments, expr)?;
+    Ok(())
+}
+
+/// Add captures in scope.
+fn build_captures(cx: &mut Ctxt<'_, '_>, captures: &[CaptureMeta]) -> Result<()> {
+    for capture in captures {
+        let address = cx.allocator.alloc();
+        let name = cx.scopes.name(capture.ident.as_ref());
+        let expr = cx.insert_expr_with_address(ExprKind::Empty, address)?;
+        cx.declare(name, expr.id())?;
+    }
+
+    Ok(())
+}
+
+/// Assemble a function.
+fn asm_function(cx: &mut Ctxt<'_, '_>, arguments: &[PatId], expr: UsedExprId) -> Result<()> {
     cx.insert_expr_user(expr, ExprUser::Function)?;
 
-    // Bind all patterns.
     bind_pats(cx)?;
-    debug_stdout(cx, expr)?;
 
-    for pat in arguments {
+    if cx.options.show_ssa {
+        debug_stdout(cx, expr)?;
+    }
+
+    for &pat in arguments {
         asm_pat_or_panic(cx, pat, "argument_panic")?;
     }
 
@@ -1031,10 +1108,10 @@ pub(crate) fn fn_from_item_fn<'hir>(
     }
 
     if cx.expr(expr.id())?.kind.is_empty() {
-        let _ = cx.expressions(None, [expr])?;
+        let _ = cx.expressions(Some(ExprUser::Function), [expr])?;
         cx.push(Inst::ReturnUnit);
     } else {
-        let [address] = cx.expressions(None, [expr])?;
+        let [address] = cx.expressions(Some(ExprUser::Function), [expr])?;
         cx.push(Inst::Return { address });
     }
 
@@ -1335,6 +1412,8 @@ fn bind_pats(cx: &mut Ctxt<'_, '_>) -> Result<()> {
 
 /// Debug a slot to stdout.
 fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
+    use std::io::Write as _;
+
     let out = std::io::stdout();
     let mut out = out.lock();
 
@@ -1349,6 +1428,9 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
         visited: iter.clone().collect(),
         queue: VecDeque::from_iter(iter.map(Job::Expr)),
     };
+
+    writeln!(out, "# ssa for {item}:", item = cx.q.pool.item(cx.item))
+        .map_err(write_err(cx.span))?;
 
     while let Some(job) = task.queue.pop_front() {
         match job {
@@ -1412,9 +1494,7 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
     where
         O: std::io::Write,
     {
-        let from = task.expr_id(cx, id)?;
-        let expr = cx.expr(id)?;
-        let span = expr.span;
+        let span = cx.expr(id)?.span;
         let err = write_err(span);
 
         if let Some(to) = cx.expressions.follow(id) {
@@ -1423,9 +1503,10 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
             return Ok(());
         }
 
+        let from = task.expr_id(cx, id)?;
+        let expr = cx.expr(id)?;
         let summary = expr.use_temporary_summary();
         let uses = format_uses(expr).map_err(write_err(span))?;
-        let kind = expr.kind;
 
         macro_rules! field {
             ($pad:literal, lit, $var:expr) => {
@@ -1561,15 +1642,9 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
         }
 
         matches! {
-            kind, {
+            expr.kind, {
                 Empty,
                 Address,
-                TupleFieldAccess { expr lhs, lit index },
-                StructFieldAccess { expr lhs, lit field, lit hash },
-                StructFieldAccessGeneric { expr lhs, lit hash, lit generics },
-                Assign { expr lhs, expr rhs },
-                AssignStructField { expr lhs, lit field, expr rhs },
-                AssignTupleField { expr lhs, lit index, expr rhs },
                 Let { pat_id pat },
                 Store { lit value },
                 Bytes { lit bytes },
@@ -1585,6 +1660,12 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
                 Vec { [array expr] items },
                 Range { expr from, lit limits, expr to },
                 Option { [option expr] value },
+                TupleFieldAccess { expr lhs, lit index },
+                StructFieldAccess { expr lhs, lit field, lit hash },
+                StructFieldAccessGeneric { expr lhs, lit hash, lit generics },
+                Assign { expr lhs, expr rhs },
+                AssignStructField { expr lhs, lit field, expr rhs },
+                AssignTupleField { expr lhs, lit index, expr rhs },
                 CallHash { lit hash, [array expr] args },
                 CallInstance { expr lhs, lit hash, [array expr] args },
                 CallExpr { expr expr, [array expr] args },
@@ -1727,22 +1808,19 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
 
     fn format_uses(expr: &Expr<'_>) -> Result<String, fmt::Error> {
         use std::fmt::Write as _;
+        let mut empty = true;
 
         let mut users = String::new();
         users.push('{');
 
-        let mut first = true;
+        for (user, &count) in &expr.uses {
+            for _ in 0..count {
+                if mem::take(&mut empty) {
+                    users.push(' ');
+                } else {
+                    users.push_str(", ");
+                }
 
-        let mut it = expr.uses.iter().peekable();
-
-        while let Some((user, &count)) = it.next() {
-            if mem::take(&mut first) {
-                users.push(' ');
-            }
-
-            let mut it = (0..count).into_iter().peekable();
-
-            while let Some(..) = it.next() {
                 match user {
                     ExprUser::Function => {
                         write!(users, "fn")?;
@@ -1754,18 +1832,10 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
                         write!(users, "${}", id.index())?;
                     }
                 }
-
-                if it.peek().is_some() {
-                    write!(users, ", ")?;
-                }
-            }
-
-            if it.peek().is_some() {
-                write!(users, ", ")?;
             }
         }
 
-        if !first {
+        if !empty {
             users.push(' ');
         }
 
@@ -1804,38 +1874,6 @@ enum ExprKind<'hir> {
     Empty,
     /// An expression who's inherent address refers to a static address.
     Address,
-    /// An assignment to a binding.
-    Assign {
-        /// Address to assign to.
-        lhs: UsedExprId,
-        /// The expression to assign.
-        rhs: UsedExprId,
-    },
-    /// A tuple field access.
-    TupleFieldAccess { lhs: UsedExprId, index: usize },
-    /// A struct field access where the index is the slot used.
-    StructFieldAccess {
-        lhs: UsedExprId,
-        field: &'hir str,
-        hash: Hash,
-    },
-    StructFieldAccessGeneric {
-        lhs: UsedExprId,
-        hash: Hash,
-        generics: Option<(Span, &'hir [hir::Expr<'hir>])>,
-    },
-    /// An assignment to a struct field.
-    AssignStructField {
-        lhs: UsedExprId,
-        field: &'hir str,
-        rhs: UsedExprId,
-    },
-    /// An assignment to a tuple field.
-    AssignTupleField {
-        lhs: UsedExprId,
-        index: usize,
-        rhs: UsedExprId,
-    },
     Let {
         /// The assembled pattern.
         pat: PatId,
@@ -1908,6 +1946,38 @@ enum ExprKind<'hir> {
     Option {
         /// The value to allocate.
         value: Option<UsedExprId>,
+    },
+    /// A tuple field access.
+    TupleFieldAccess { lhs: UsedExprId, index: usize },
+    /// A struct field access where the index is the slot used.
+    StructFieldAccess {
+        lhs: UsedExprId,
+        field: &'hir str,
+        hash: Hash,
+    },
+    StructFieldAccessGeneric {
+        lhs: UsedExprId,
+        hash: Hash,
+        generics: Option<(Span, &'hir [hir::Expr<'hir>])>,
+    },
+    /// An assignment to a binding.
+    Assign {
+        /// Address to assign to.
+        lhs: UsedExprId,
+        /// The expression to assign.
+        rhs: UsedExprId,
+    },
+    /// An assignment to a struct field.
+    AssignStructField {
+        lhs: UsedExprId,
+        field: &'hir str,
+        rhs: UsedExprId,
+    },
+    /// An assignment to a tuple field.
+    AssignTupleField {
+        lhs: UsedExprId,
+        index: usize,
+        rhs: UsedExprId,
     },
     /// Call the given hash.
     CallHash {
@@ -2000,8 +2070,8 @@ impl ExprKind<'_> {
     fn is_empty(&self) -> bool {
         match self {
             ExprKind::Empty => true,
-            ExprKind::Assign { .. } => true,
             ExprKind::Loop { .. } => true,
+            ExprKind::Assign { .. } => true,
             ExprKind::AssignStructField { .. } => true,
             ExprKind::AssignTupleField { .. } => true,
             ExprKind::Let { .. } => true,
@@ -2009,6 +2079,10 @@ impl ExprKind<'_> {
             ExprKind::Continue { .. } => true,
             ExprKind::Return { .. } => true,
             ExprKind::Tuple { items: [], .. } => true,
+            ExprKind::Store {
+                value: InstValue::Unit,
+                ..
+            } => true,
             _ => false,
         }
     }
@@ -2183,20 +2257,6 @@ impl<'hir> Pat<'hir> {
     /// Construct a new stored pattern.
     const fn new(span: Span, id: PatId, kind: PatKind<'hir>) -> Self {
         Self { span, id, kind }
-    }
-
-    /// Get an expression.
-    fn expr(&self) -> UsedExprId {
-        match self.kind {
-            PatKind::Unbound { expr, .. } => expr,
-            PatKind::Irrefutable { expr } => expr,
-            PatKind::IrrefutableSequence { expr, .. } => expr,
-            PatKind::Lit { expr, .. } => expr,
-            PatKind::Vec { expr, .. } => expr,
-            PatKind::AnonymousTuple { expr, .. } => expr,
-            PatKind::AnonymousObject { expr, .. } => expr,
-            PatKind::TypedSequence { expr, .. } => expr,
-        }
     }
 }
 
@@ -3167,12 +3227,6 @@ fn has_side_effects(cx: &mut Ctxt<'_, '_>, used_id: UsedExprId) -> Result<bool> 
             // NB: assembling an address has no side effects. In fact, it's not a legal operation.
             Ok(false)
         }
-        ExprKind::TupleFieldAccess { .. } => Ok(true),
-        ExprKind::StructFieldAccess { .. } => Ok(true),
-        ExprKind::StructFieldAccessGeneric { .. } => Ok(true),
-        ExprKind::Assign { rhs, .. } => has_side_effects(cx, rhs),
-        ExprKind::AssignStructField { .. } => Ok(true),
-        ExprKind::AssignTupleField { .. } => Ok(true),
         ExprKind::Let { .. } => Ok(true),
         ExprKind::Store { .. } => Ok(false),
         ExprKind::Bytes { .. } => Ok(false),
@@ -3221,6 +3275,12 @@ fn has_side_effects(cx: &mut Ctxt<'_, '_>, used_id: UsedExprId) -> Result<bool> 
             Some(slot) => has_side_effects(cx, slot),
             None => Ok(false),
         },
+        ExprKind::TupleFieldAccess { .. } => Ok(true),
+        ExprKind::StructFieldAccess { .. } => Ok(true),
+        ExprKind::StructFieldAccessGeneric { .. } => Ok(true),
+        ExprKind::Assign { rhs, .. } => has_side_effects(cx, rhs),
+        ExprKind::AssignStructField { .. } => Ok(true),
+        ExprKind::AssignTupleField { .. } => Ok(true),
         ExprKind::CallHash { .. } => Ok(true),
         ExprKind::CallInstance { .. } => Ok(true),
         ExprKind::CallExpr { .. } => Ok(true),
@@ -3508,7 +3568,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
 
         let output = cx.output(this)?;
 
-        let lhs = cx.with_state_checkpoint(|cx| {
+        cx.with_state_checkpoint(|cx| {
             for &expr in lhs.program {
                 let _ = cx.expressions(Some(ExprUser::Expr(this)), [expr])?;
             }
@@ -3937,14 +3997,18 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         Ok(())
     }
 
+    /// Assemble an assignment expression.
     #[instrument]
     fn asm_assign<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
-        _this: ExprId,
-        _lhs: UsedExprId,
-        _rhs: UsedExprId,
+        this: ExprId,
+        lhs: UsedExprId,
+        rhs: UsedExprId,
     ) -> Result<()> {
-        todo!()
+        let [output] = cx.delayed(Some(ExprUser::Expr(this)), [lhs])?;
+        cx.expression_into(this, rhs, *output)?;
+        output.free(cx)?;
+        Ok(())
     }
 
     #[instrument]
@@ -4143,18 +4207,19 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         start: Label,
         end: Label,
     ) -> Result<ExprOutcome> {
-        let cleanup = match condition {
+        let (cleanup, end_unit) = match condition {
             LoopCondition::Forever => {
                 cx.label(start)?;
-                None
+                (None, None)
             }
             LoopCondition::Condition { pat } => {
+                let end_unit = cx.new_label("loop_condition_end");
+
                 cx.label(start)?;
-                asm_pat(cx, pat, end)?;
-                None
+                asm_pat(cx, pat, end_unit)?;
+                (None, Some(end_unit))
             }
             LoopCondition::Iterator { iter, pat } => {
-                let value = cx.output(cx.pat(pat)?.expr().id())?;
                 let [iter] = cx.delayed(Some(ExprUser::Expr(this)), [iter])?;
 
                 cx.push(Inst::CallInstance {
@@ -4166,6 +4231,8 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
 
                 cx.label(start)?;
 
+                let value = cx.output(this)?;
+
                 cx.push(Inst::IterNext {
                     address: *iter,
                     label: end,
@@ -4173,7 +4240,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
                 });
 
                 asm_pat(cx, pat, end)?;
-                Some((iter, value))
+                (Some(iter), None)
             }
         };
 
@@ -4184,11 +4251,20 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         let outcome = asm(cx, block.expr.id())?;
 
         cx.push(Inst::Jump { label: start });
+
+        if let Some(end_unit) = end_unit {
+            let output = cx.output(this)?;
+            cx.label(end_unit)?;
+            cx.push(Inst::Store {
+                value: InstValue::Unit,
+                output,
+            });
+        }
+
         cx.label(end)?;
 
-        if let Some((iter, value)) = cleanup {
+        if let Some(iter) = cleanup {
             iter.free(cx)?;
-            // value.free(cx)?;
         }
 
         Ok(outcome)
@@ -4207,17 +4283,15 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
             let loop_summary = cx.expr_mut(loop_expr.id())?.use_summary();
 
             // Only assemble loop output *if* the loop is still alive.
-            if loop_summary.is_alive() {
-                let output = cx.output(loop_expr.id())?;
-                cx.expression_into(this, loop_expr, output)?;
-            } else {
-                cx.remove_expr_user(loop_expr, ExprUser::Expr(this))?;
-                asm(cx, expr.id())?;
+            if !loop_summary.is_alive() {
+                return Err(cx.msg("loop is not alive"));
             }
-        } else {
-            cx.remove_expr_user(loop_expr, ExprUser::Expr(this))?;
+
+            let output = cx.output(loop_expr.id())?;
+            cx.expression_into(this, expr, output)?;
         }
 
+        cx.remove_expr_user(loop_expr, ExprUser::Expr(this))?;
         cx.push(Inst::Jump { label });
         Ok(ExprOutcome::Empty)
     }
@@ -4626,7 +4700,7 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
             hir::ExprKind::Loop(hir) => loop_(cx, hir)?,
             hir::ExprKind::Break(hir) => break_(cx, hir)?,
             hir::ExprKind::Continue(hir) => continue_(cx, hir)?,
-            hir::ExprKind::Let(..) => todo!(),
+            hir::ExprKind::Let(hir) => let_(cx, hir)?,
             hir::ExprKind::If(hir) => if_(cx, hir)?,
             hir::ExprKind::Match(hir) => match_(cx, hir)?,
             hir::ExprKind::MacroCall(hir) => macro_call(cx, hir)?,
@@ -4708,7 +4782,19 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
             ExprKind::TupleFieldAccess { lhs, index } => {
                 ExprKind::AssignTupleField { lhs, index, rhs }
             }
-            _ => ExprKind::Assign { lhs, rhs },
+            _ => match (lhs.kind, rhs.kind) {
+                (
+                    UsedExprIdKind::Binding { binding, .. },
+                    UsedExprIdKind::Binding {
+                        use_kind: UseKind::Same,
+                        ..
+                    },
+                ) => {
+                    cx.declare_in(binding.scope, binding.name, rhs.id)?;
+                    ExprKind::Empty
+                }
+                _ => ExprKind::Assign { lhs, rhs },
+            },
         };
 
         cx.insert_expr(kind)
@@ -4717,9 +4803,9 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
     /// Assemble a call expression.
     #[instrument]
     fn call<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::ExprCall<'hir>) -> Result<UsedExprId> {
-        let this = expr_value(cx, hir.expr)?;
+        let expr = expr_value(cx, hir.expr)?;
 
-        let this = this.map_expr(cx, |cx, kind| match kind {
+        match cx.expr(expr.id())?.kind {
             ExprKind::Meta { meta, named, .. } => {
                 match &meta.kind {
                     PrivMetaKind::Struct {
@@ -4772,15 +4858,11 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
                     PrivMetaKind::Function { .. } => (),
                     PrivMetaKind::ConstFn { id, .. } => {
                         named.assert_not_generic()?;
-
                         let from = cx.q.item_for((cx.span, hir.id))?;
                         let const_fn = cx.q.const_fn_for((cx.span, *id))?;
                         let value = cx.call_const_fn(meta, &from, &const_fn, hir.args)?;
-                        let value = const_value(cx, &value)?;
-                        // NB: It is valid to coerce an expr_const into a kind
-                        // because it belongs to the constant scope which requires
-                        // no cleanup.
-                        return Ok(cx.expr(value.id())?.kind);
+                        cx.release_expr(expr)?;
+                        return const_value(cx, &value);
                     }
                     _ => {
                         return Err(cx.error(CompileErrorKind::ExpectedMeta {
@@ -4799,16 +4881,15 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
                     hash
                 };
 
-                Ok(ExprKind::CallHash {
-                    hash,
-                    args: iter!(cx; hir.args, |hir| expr_value(cx, hir)?),
-                })
+                let args = iter!(cx; hir.args, |hir| expr_value(cx, hir)?);
+                cx.release_expr(expr)?;
+                cx.insert_expr(ExprKind::CallHash { hash, args })
             }
-            ExprKind::StructFieldAccess { lhs, hash, .. } => Ok(ExprKind::CallInstance {
-                lhs,
-                hash,
-                args: iter!(cx; hir.args, |hir| expr_value(cx, hir)?),
-            }),
+            ExprKind::StructFieldAccess { lhs, hash, .. } => {
+                let args = iter!(cx; hir.args, |hir| expr_value(cx, hir)?);
+                cx.release_expr(expr)?;
+                cx.insert_expr(ExprKind::CallInstance { lhs, hash, args })
+            }
             ExprKind::StructFieldAccessGeneric {
                 lhs,
                 hash,
@@ -4822,19 +4903,15 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
                     hash
                 };
 
-                Ok(ExprKind::CallInstance {
-                    lhs,
-                    hash,
-                    args: iter!(cx; hir.args, |hir| expr_value(cx, hir)?),
-                })
+                let args = iter!(cx; hir.args, |hir| expr_value(cx, hir)?);
+                cx.release_expr(expr)?;
+                cx.insert_expr(ExprKind::CallInstance { lhs, hash, args })
             }
-            kind => Ok(ExprKind::CallExpr {
-                expr: cx.insert_expr(kind)?,
-                args: iter!(cx; hir.args, |hir| expr_value(cx, hir)?),
-            }),
-        })?;
-
-        Ok(this)
+            _ => {
+                let args = iter!(cx; hir.args, |hir| expr_value(cx, hir)?);
+                cx.insert_expr(ExprKind::CallExpr { expr, args })
+            }
+        }
     }
 
     /// Decode a field access expression.
@@ -5532,6 +5609,14 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
         };
 
         cx.insert_expr(kind)
+    }
+
+    /// Assemble a let expression.
+    #[instrument]
+    fn let_<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::ExprLet<'hir>) -> Result<UsedExprId> {
+        let expr = expr_value(cx, hir.expr)?;
+        let pat = pat(cx, hir.pat, expr)?;
+        cx.insert_expr(ExprKind::Let { pat })
     }
 
     /// Assemble an if statement.
@@ -6269,27 +6354,6 @@ where
     match kind {
         ExprKind::Empty => {}
         ExprKind::Address => {}
-        ExprKind::Assign { lhs, rhs } => {
-            op(cx, lhs)?;
-            op(cx, rhs)?;
-        }
-        ExprKind::TupleFieldAccess { lhs, .. } => {
-            op(cx, lhs)?;
-        }
-        ExprKind::StructFieldAccess { lhs, .. } => {
-            op(cx, lhs)?;
-        }
-        ExprKind::StructFieldAccessGeneric { lhs, .. } => {
-            op(cx, lhs)?;
-        }
-        ExprKind::AssignStructField { lhs, rhs, .. } => {
-            op(cx, lhs)?;
-            op(cx, rhs)?;
-        }
-        ExprKind::AssignTupleField { lhs, rhs, .. } => {
-            op(cx, lhs)?;
-            op(cx, rhs)?;
-        }
         ExprKind::Let { .. } => {}
         ExprKind::Store { .. } => {}
         ExprKind::Bytes { .. } => {}
@@ -6336,6 +6400,27 @@ where
             if let Some(slot) = value {
                 op(cx, slot)?;
             }
+        }
+        ExprKind::TupleFieldAccess { lhs, .. } => {
+            op(cx, lhs)?;
+        }
+        ExprKind::StructFieldAccess { lhs, .. } => {
+            op(cx, lhs)?;
+        }
+        ExprKind::StructFieldAccessGeneric { lhs, .. } => {
+            op(cx, lhs)?;
+        }
+        ExprKind::Assign { lhs, rhs } => {
+            op(cx, lhs)?;
+            op(cx, rhs)?;
+        }
+        ExprKind::AssignStructField { lhs, rhs, .. } => {
+            op(cx, lhs)?;
+            op(cx, rhs)?;
+        }
+        ExprKind::AssignTupleField { lhs, rhs, .. } => {
+            op(cx, lhs)?;
+            op(cx, rhs)?;
         }
         ExprKind::CallHash { args, .. } => {
             for &slot in args {

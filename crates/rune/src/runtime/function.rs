@@ -1,10 +1,10 @@
+use crate::hash::Hash;
 use crate::runtime::{
     Address, Args, Call, ConstValue, FromValue, FunctionHandler, RawRef, Ref, Rtti, RuntimeContext,
-    Shared, Stack, Tuple, Unit, UnsafeFromValue, Value, VariantRtti, Vm, VmCall, VmError,
+    Shared, Stack, ToValue, Unit, UnsafeFromValue, Value, VariantRtti, Vm, VmCall, VmError,
     VmErrorKind, VmHalt,
 };
 use crate::shared::AssertSend;
-use crate::Hash;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -454,16 +454,14 @@ impl SyncFunction {
 #[derive(Clone)]
 struct FunctionImpl<V>
 where
-    V: Clone,
-    Tuple: From<Box<[V]>>,
+    V: ToValue + fmt::Debug + Clone,
 {
     inner: Inner<V>,
 }
 
 impl<V> FunctionImpl<V>
 where
-    V: fmt::Debug + Clone,
-    Tuple: From<Box<[V]>>,
+    V: ToValue + fmt::Debug + Clone,
 {
     fn call<A, T>(&self, args: A) -> Result<T, VmError>
     where
@@ -480,10 +478,10 @@ where
                 (handler.handler)(&mut stack, Address::BASE, arg_count, Address::BASE)?;
                 std::mem::take(stack.at_mut(Address::BASE)?)
             }
-            Inner::FnOffset(fn_offset) => fn_offset.call(args, ())?,
-            Inner::FnClosureOffset(closure) => closure
-                .fn_offset
-                .call(args, (Tuple::from(closure.environment.clone()),))?,
+            Inner::FnOffset(fn_offset) => fn_offset.call::<_, Value>(args, &[])?,
+            Inner::FnClosureOffset(closure) => {
+                closure.fn_offset.call(args, closure.environment.as_ref())?
+            }
             Inner::FnUnitStruct(empty) => {
                 check_args(args.count(), 0)?;
                 Value::unit_struct(empty.rtti.clone())
@@ -553,7 +551,9 @@ where
                 None
             }
             Inner::FnOffset(fn_offset) => {
-                if let Some(vm_call) = fn_offset.call_with_vm(vm, address, args, (), output)? {
+                if let Some(vm_call) =
+                    fn_offset.call_with_vm::<Value>(vm, address, args, &[], output)?
+                {
                     return Ok(Some(VmHalt::VmCall(vm_call)));
                 }
 
@@ -564,7 +564,7 @@ where
                     vm,
                     address,
                     args,
-                    (Tuple::from(closure.environment.clone()),),
+                    closure.environment.as_ref(),
                     output,
                 )? {
                     return Ok(Some(VmHalt::VmCall(vm_call)));
@@ -829,10 +829,10 @@ struct FnOffset {
 
 impl FnOffset {
     /// Perform a call into the specified offset and return the produced value.
-    fn call<A, E>(&self, args: A, extra: E) -> Result<Value, VmError>
+    fn call<A, V>(&self, args: A, env: &[V]) -> Result<Value, VmError>
     where
         A: Args,
-        E: Args,
+        V: Clone + ToValue,
     {
         check_args(args.count(), self.args)?;
         let mut vm = Vm::with_stack(
@@ -842,8 +842,12 @@ impl FnOffset {
         );
         vm.set_ip(self.offset);
         args.into_stack(vm.stack_mut())?;
-        extra.into_stack(vm.stack_mut())?;
         vm.stack_mut().resize_frame(self.frame)?;
+
+        for (o, e) in vm.stack_mut().get_mut_top(env.len())?.iter_mut().zip(env) {
+            *o = e.clone().to_value()?;
+        }
+
         self.call.call_with_vm(vm)
     }
 
@@ -851,16 +855,16 @@ impl FnOffset {
     ///
     /// This will cause a halt in case the vm being called into isn't the same
     /// as the context and unit of the function.
-    fn call_with_vm<E>(
+    fn call_with_vm<V>(
         &self,
         vm: &mut Vm,
         address: Address,
         args: usize,
-        extra: E,
+        env: &[V],
         output: Address,
     ) -> Result<Option<VmCall>, VmError>
     where
-        E: Args,
+        V: Clone + ToValue,
     {
         check_args(args, self.args)?;
 
@@ -868,14 +872,23 @@ impl FnOffset {
         if let Call::Immediate = self.call {
             if vm.is_same(&self.context, &self.unit) {
                 vm.push_call_frame(self.offset, address, self.frame, output)?;
-                extra.into_stack(vm.stack_mut())?;
+
+                for (o, e) in vm.stack_mut().get_mut_top(env.len())?.iter_mut().zip(env) {
+                    *o = e.clone().to_value()?;
+                }
+
                 return Ok(None);
             }
         }
 
         let mut stack = vm.stack_mut().drain_at(address, args)?.collect::<Stack>();
-        extra.into_stack(&mut stack)?;
         stack.resize_frame(self.frame)?;
+
+        for (o, e) in stack.get_mut_top(env.len())?.iter_mut().zip(env) {
+            *o = e.clone().to_value()?;
+        }
+
+        dbg!(self.frame);
         let mut vm = Vm::with_stack(self.context.clone(), self.unit.clone(), stack);
         vm.set_ip(self.offset);
         Ok(Some(VmCall::new(self.call, vm, output)))

@@ -65,8 +65,8 @@ fn bug_344_inst_fn() -> rune::Result<()> {
     return Ok(());
 
     fn function(s: &GuardCheck, check: &GuardCheck) -> i64 {
-        s.ensure_not_dropped("async self argument");
-        check.ensure_not_dropped("async instance argument");
+        s.ensure_not_dropped("self argument");
+        check.ensure_not_dropped("instance argument");
         42
     }
 }

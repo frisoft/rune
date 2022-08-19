@@ -9,14 +9,8 @@ use crate::runtime::{Address, Value};
 /// An error raised when interacting with the stack.
 #[derive(Debug, Error)]
 #[error("tried to access out-of-bounds stack entry")]
-pub struct StackError(());
-
-impl StackError {
-    /// Construct a new stack error.
-    pub(crate) const fn new() -> Self {
-        Self(())
-    }
-}
+#[non_exhaustive]
+pub struct StackError;
 
 const _: () = assert!(
     std::mem::size_of::<u32>() <= std::mem::size_of::<usize>(),
@@ -150,6 +144,12 @@ impl Stack {
         self.stack.get(index)
     }
 
+    /// Get the stack mutably from the top.
+    pub(crate) fn get_mut_top(&mut self, len: usize) -> Result<&mut [Value], StackError> {
+        let start = self.stack.len().checked_sub(len).ok_or(StackError)?;
+        self.stack.get_mut(start..).ok_or(StackError)
+    }
+
     /// Push a value onto the stack.
     ///
     /// ```
@@ -180,8 +180,8 @@ impl Stack {
             .stack
             .len()
             .checked_sub(self.stack_bottom)
-            .ok_or(StackError(()))?;
-        let address = Address(address.try_into().map_err(|_| StackError(()))?);
+            .ok_or(StackError)?;
+        let address = Address(address.try_into().map_err(|_| StackError)?);
         self.stack.push(Value::from(value));
         Ok(address)
     }
@@ -201,10 +201,10 @@ impl Stack {
     /// ```
     pub fn pop(&mut self) -> Result<Value, StackError> {
         if self.stack.len() == self.stack_bottom {
-            return Err(StackError(()));
+            return Err(StackError);
         }
 
-        self.stack.pop().ok_or(StackError(()))
+        self.stack.pop().ok_or(StackError)
     }
 
     /// Extend the current stack with an iterator.
@@ -241,7 +241,7 @@ impl Stack {
     /// Get the last position on the stack.
     #[inline]
     pub fn last(&self) -> Result<&Value, StackError> {
-        self.stack.last().ok_or(StackError(()))
+        self.stack.last().ok_or(StackError)
     }
 
     /// Iterate over the stack.
@@ -253,7 +253,7 @@ impl Stack {
     pub(crate) fn top(&self) -> Result<Address, StackError> {
         u32::try_from(self.stack.len())
             .map(Address)
-            .map_err(|_| StackError(()))
+            .map_err(|_| StackError)
     }
 
     /// Get the offset that corresponds to the bottom of the stack right now.
@@ -315,7 +315,7 @@ impl Stack {
     ) -> Result<impl DoubleEndedIterator<Item = Value> + '_, StackError> {
         match self.stack.len().checked_sub(count) {
             Some(start) if start >= self.stack_bottom => Ok(self.stack.drain(start..)),
-            _ => Err(StackError(())),
+            _ => Err(StackError),
         }
     }
 
@@ -346,7 +346,7 @@ impl Stack {
         Address(address): Address,
         count: usize,
     ) -> Result<impl DoubleEndedIterator<Item = Value> + '_, StackError> {
-        return imp(self, address, count).ok_or(StackError(()));
+        return imp(self, address, count).ok_or(StackError);
 
         #[inline]
         fn imp(
@@ -370,7 +370,7 @@ impl Stack {
     where
         T: IntoIterator<Item = Value>,
     {
-        return imp(self, address, values).ok_or(StackError(()));
+        return imp(self, address, values).ok_or(StackError);
 
         #[inline]
         fn imp<T>(this: &mut Stack, address: u32, values: T) -> Option<()>
@@ -400,7 +400,7 @@ impl Stack {
         self.stack_bottom
             .checked_add(address as usize)
             .and_then(|n| self.stack.get(n))
-            .ok_or(StackError(()))
+            .ok_or(StackError)
     }
 
     /// Take the value at the given address.
@@ -413,7 +413,7 @@ impl Stack {
         self.stack_bottom
             .checked_add(address as usize)
             .and_then(|n| self.stack.get_mut(n))
-            .ok_or(StackError(()))
+            .ok_or(StackError)
     }
 
     /// Access a pair of addresses mutably.
@@ -425,21 +425,21 @@ impl Stack {
         Address(second): Address,
     ) -> Result<(&mut Value, &mut Value), StackError> {
         if first == second {
-            return Err(StackError(()));
+            return Err(StackError);
         }
 
         let first = self
             .stack_bottom
             .checked_add(first as usize)
-            .ok_or(StackError(()))?;
+            .ok_or(StackError)?;
 
         let second = self
             .stack_bottom
             .checked_add(second as usize)
-            .ok_or(StackError(()))?;
+            .ok_or(StackError)?;
 
         if first.max(second) >= self.stack.len() {
-            return Err(StackError(()));
+            return Err(StackError);
         }
 
         // SAFETY: Addresses are checked to be in bound above.
@@ -459,25 +459,22 @@ impl Stack {
         let second = second as usize;
 
         if first == second {
-            let first = self.stack_bottom.checked_add(first).ok_or(StackError(()))?;
+            let first = self.stack_bottom.checked_add(first).ok_or(StackError)?;
 
             return match self.stack.get_mut(first) {
                 Some(first) => Ok(InterleavedPairMut {
                     first,
                     second: None,
                 }),
-                None => Err(StackError(())),
+                None => Err(StackError),
             };
         }
 
-        let first = self.stack_bottom.checked_add(first).ok_or(StackError(()))?;
-        let second = self
-            .stack_bottom
-            .checked_add(second)
-            .ok_or(StackError(()))?;
+        let first = self.stack_bottom.checked_add(first).ok_or(StackError)?;
+        let second = self.stack_bottom.checked_add(second).ok_or(StackError)?;
 
         if first.max(second) >= self.stack.len() {
-            return Err(StackError(()));
+            return Err(StackError);
         }
 
         // SAFETY: the addresses are bounds checked just above.
@@ -498,7 +495,7 @@ impl Stack {
         frame: usize,
     ) -> Result<(usize, usize), StackError> {
         let (stack_bottom, new_stack) =
-            calculate(self.stack_bottom, bottom, frame).ok_or(StackError(()))?;
+            calculate(self.stack_bottom, bottom, frame).ok_or(StackError)?;
         let stack = self.stack.len();
         self.stack.resize(new_stack, Value::Unit);
         return Ok((mem::replace(&mut self.stack_bottom, stack_bottom), stack));
@@ -516,7 +513,7 @@ impl Stack {
 
     /// Grow the stack so that it matches the given length.
     pub(crate) fn resize_frame(&mut self, frame: usize) -> Result<(), StackError> {
-        let frame = self.stack_bottom.checked_add(frame).ok_or(StackError(()))?;
+        let frame = self.stack_bottom.checked_add(frame).ok_or(StackError)?;
         self.stack.resize(frame, Value::Unit);
         Ok(())
     }

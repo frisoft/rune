@@ -534,7 +534,9 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         address: AssemblyAddress,
     ) -> Result<UsedExprId> {
         let used_id = self.insert_expr(kind)?;
-        self.expr_mut(used_id.id())?.address = ExprOutput::Allocated(address);
+        let expr_mut = self.expr_mut(used_id.id())?;
+        expr_mut.address = ExprOutput::Allocated(address);
+        expr_mut.pending = false;
         Ok(used_id)
     }
 
@@ -1055,11 +1057,11 @@ pub(crate) fn fn_from_item_fn<'hir>(
                     }
 
                     let name = cx.scopes.name(SELF);
-                    let expr = cx.insert_expr_with_address(ExprKind::Empty, address)?;
+                    let expr = cx.insert_expr_with_address(ExprKind::Address, address)?;
                     cx.declare(name, expr.id())?;
                 }
                 hir::FnArg::Pat(hir) => {
-                    let expr = cx.insert_expr_with_address(ExprKind::Empty, address)?;
+                    let expr = cx.insert_expr_with_address(ExprKind::Address, address)?;
                     arguments.push(pat(cx, hir, expr)?);
                 }
             }
@@ -1082,7 +1084,7 @@ fn build_captures(cx: &mut Ctxt<'_, '_>, captures: &[CaptureMeta]) -> Result<()>
     for capture in captures {
         let address = cx.allocator.alloc();
         let name = cx.scopes.name(capture.ident.as_ref());
-        let expr = cx.insert_expr_with_address(ExprKind::Empty, address)?;
+        let expr = cx.insert_expr_with_address(ExprKind::Address, address)?;
         cx.declare(name, expr.id())?;
     }
 

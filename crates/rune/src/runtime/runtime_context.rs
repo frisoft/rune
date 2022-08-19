@@ -1,3 +1,4 @@
+use std::array;
 use std::fmt;
 use std::mem;
 use std::sync::Arc;
@@ -33,6 +34,14 @@ pub trait Arguments {
 
     /// The number of arguments passed in.
     fn count(&self) -> usize;
+}
+
+impl fmt::Debug for dyn Arguments {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Arguments")
+            .field("count", &self.count())
+            .finish()
+    }
 }
 
 /// A type-reduced function handler.
@@ -109,7 +118,7 @@ impl RuntimeContext {
         index: usize,
         args: [Address; N],
         output: Address,
-    ) -> Result<CallResultOrOffset, VmError> {
+    ) -> Result<CallResultOrOffset<array::IntoIter<Address, 0>>, VmError> {
         let full_count = N + 1;
         let hash = stack.at(value)?.type_hash()?;
         let hash = Hash::index_fn(protocol, hash, Hash::index(index));
@@ -176,7 +185,7 @@ impl RuntimeContext {
         hash: H,
         arguments: I,
         output: Address,
-    ) -> Result<CallResultOrOffset, VmError>
+    ) -> Result<CallResultOrOffset<impl ExactSizeIterator<Item = Address>>, VmError>
     where
         H: IntoTypeHash,
         I: IntoIterator<Item = Address>,
@@ -187,6 +196,8 @@ impl RuntimeContext {
         let type_hash = stack.at(address)?.type_hash()?;
 
         let hash = Hash::instance_function(type_hash, hash.into_type_hash());
+
+        let mut arguments = ArgumentsChain::new(address, arguments);
 
         if let Some(UnitFn::Offset {
             offset,
@@ -200,19 +211,13 @@ impl RuntimeContext {
             return Ok(CallResultOrOffset::Offset(CallOffset {
                 offset,
                 call,
-                address: address,
-                args,
+                arguments,
                 frame,
                 output,
             }));
         }
 
-        if !self.fn_call(
-            hash,
-            stack,
-            &mut ArgumentsChain::new(address, arguments),
-            output,
-        )? {
+        if !self.fn_call(hash, stack, &mut arguments, output)? {
             return Ok(CallResultOrOffset::Unsupported);
         }
 
@@ -248,14 +253,34 @@ where
     I: ExactSizeIterator<Item = Address>,
 {
     fn next(&mut self) -> Result<Address, StackError> {
-        if let Some(address) = self.first.take() {
-            return Ok(address);
-        }
-
-        self.rest.next().ok_or(StackError)
+        <Self as Iterator>::next(self).ok_or(StackError)
     }
 
     fn count(&self) -> usize {
         self.rest.len() + if self.first.is_some() { 1 } else { 0 }
+    }
+}
+
+impl<I> Iterator for ArgumentsChain<I>
+where
+    I: Iterator<Item = Address>,
+{
+    type Item = Address;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(address) = self.first.take() {
+            return Some(address);
+        }
+
+        self.rest.next()
+    }
+}
+
+impl<I> ExactSizeIterator for ArgumentsChain<I>
+where
+    I: ExactSizeIterator<Item = Address>,
+{
+    fn len(&self) -> usize {
+        self.count()
     }
 }

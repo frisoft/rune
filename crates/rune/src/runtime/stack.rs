@@ -422,8 +422,19 @@ impl Stack {
     }
 
     /// Access the value at the given frame offset mutably.
-    pub(crate) fn at_mut(&mut self, Address(address): Address) -> Result<&mut Value, StackError> {
-        self.stack_bottom
+    #[inline]
+    pub(crate) fn at_mut(&mut self, address: Address) -> Result<&mut Value, StackError> {
+        let bottom = self.stack_bottom;
+        self.at_mut_with(StackSize(bottom), address)
+    }
+
+    /// Access the value at the given frame offset mutably using a custom stack bottom.
+    pub(crate) fn at_mut_with(
+        &mut self,
+        StackSize(bottom): StackSize,
+        Address(address): Address,
+    ) -> Result<&mut Value, StackError> {
+        bottom
             .checked_add(address as usize)
             .and_then(|n| self.stack.get_mut(n))
             .ok_or(StackError)
@@ -532,6 +543,11 @@ impl Stack {
         let frame = self.stack_bottom.checked_add(frame).ok_or(StackError)?;
         self.stack.resize(frame, Value::Unit);
         Ok(())
+    }
+
+    /// Internal resize with an exact stack size.
+    pub(crate) fn global_resize(&mut self, len: usize) {
+        self.stack.resize(len, Value::Unit);
     }
 }
 

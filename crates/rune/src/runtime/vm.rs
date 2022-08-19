@@ -41,15 +41,13 @@ impl<T> CallResult<BorrowRef<'_, T>> {
 }
 
 #[derive(Debug)]
-pub(crate) struct CallOffset {
+pub(crate) struct CallOffset<I> {
     /// Offset of the registered function.
     pub(crate) offset: usize,
     /// The way the function is called.
     pub(crate) call: Call,
-    /// Stack address to allocate arguments from.
-    pub(crate) address: Address,
-    /// The number of arguments the function takes.
-    pub(crate) args: usize,
+    /// Arguments to pass into the unit function.
+    pub(crate) arguments: I,
     /// Slots to allocate for the function call.
     pub(crate) frame: usize,
     /// Output address to write to.
@@ -60,17 +58,20 @@ pub(crate) struct CallOffset {
 /// supported.
 #[derive(Debug)]
 #[must_use]
-pub(crate) enum CallResultOrOffset {
+pub(crate) enum CallResultOrOffset<I> {
     /// Call successful. Return value is on the stack.
     Ok,
     /// Call failed because function was missing so the method is unsupported.
     /// Contains target value.
     Unsupported,
     /// Offset to call.
-    Offset(CallOffset),
+    Offset(CallOffset<I>),
 }
 
-impl CallResultOrOffset {
+impl<I> CallResultOrOffset<I>
+where
+    I: ExactSizeIterator<Item = Address>,
+{
     /// Apply the call result to the virtual machine if it resulted in an offset
     /// call.
     #[inline]
@@ -81,13 +82,25 @@ impl CallResultOrOffset {
             CallResultOrOffset::Offset(CallOffset {
                 offset,
                 call,
-                address,
-                args,
+                arguments,
                 frame,
                 output,
             }) => {
-                vm.call_offset_fn(offset, call, address, args, frame, output)?;
-                todo!("this is all sorts of wrong, we need to ensure that the desired calling convention is being followed");
+                // re-organize the stack so that it follow the dynamic calling convention.
+                let mut arguments = arguments.into_iter();
+                let count = arguments.len();
+                let bottom = vm.stack_mut().swap_frame(count)?;
+
+                let mut to = Address::BASE;
+
+                while let Some(address) = arguments.next() {
+                    let value = mem::take(vm.stack_mut().at_mut_with(bottom, address)?);
+                    vm.stack_mut().store(to, value)?;
+                    to = to.step()?;
+                }
+
+                vm.call_offset_fn(offset, call, Address::BASE, count, frame, Address::BASE)?;
+                vm.stack_mut().return_frame(bottom, Address::BASE, output)?;
                 Ok(CallResult::Ok(()))
             }
         }
@@ -509,11 +522,13 @@ impl Vm {
         frame: usize,
         output: Address,
     ) -> Result<(), VmError> {
+        let stack_len = self.stack.len();
         let stack_bottom = self.stack.replace_stack_frame(address, frame)?;
 
         let frame = CallFrame {
             ip: self.ip,
             stack_bottom,
+            stack_len,
             output,
         };
 
@@ -537,6 +552,7 @@ impl Vm {
 
         tracing::trace!(?frame, "popping call frame");
         self.stack.restore_frame(frame.stack_bottom);
+        self.stack.global_resize(frame.stack_len);
         self.ip = frame.ip;
         Ok((false, frame.output))
     }
@@ -3195,6 +3211,8 @@ pub struct CallFrame {
     /// I.e. a function should not be able to manipulate the size of any other
     /// stack than its own.
     stack_bottom: StackSize,
+    /// The size of the frame.
+    stack_len: usize,
     /// Where to write the return value of the stack frame.
     output: Address,
 }

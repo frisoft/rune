@@ -2106,12 +2106,13 @@ impl Vm {
 
         for _ in 0..count {
             buf.clear();
-            let value = self.stack.at(address)?;
+            let value = mem::take(self.stack.at_mut(address)?);
 
             if let Err(fmt::Error) = value.string_display_with(&mut out, &mut buf, &mut *self)? {
                 return Err(VmError::from(VmErrorKind::FormatError));
             }
 
+            *self.stack.at_mut(address)? = value;
             address = address.step()?;
         }
 

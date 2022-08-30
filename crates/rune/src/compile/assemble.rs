@@ -316,28 +316,40 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     }
 
     /// Get the output address for the expression at `expr`.
+    #[tracing::instrument(skip(self))]
     fn output(&mut self, expr: ExprId) -> Result<AssemblyAddress> {
-        let followed_id = self.follow(expr);
-        let expr_mut = self.expr_mut(followed_id)?;
+        let followed_expr = self.follow(expr);
+        let expr_mut = self.expr_mut(followed_expr)?;
 
         if let ExprOutput::Allocated(address) | ExprOutput::Passed(address) = expr_mut.address {
-            tracing::trace!(?expr, ?address, "using existing address");
+            tracing::trace!(?expr, ?followed_expr, ?address, "using existing address");
             return Ok(address);
         }
 
         if matches!(expr_mut.address, ExprOutput::Freed) {
             return Err(self.msg(format_args!(
-                "trying to use freed address on slot {followed_id:?}"
+                "trying to use freed address on slot {followed_expr:?}"
             )));
         }
 
         let address = self.allocator.alloc();
-        tracing::trace!(?followed_id, ?address, "allocating address");
-        self.expr_mut(followed_id)?.address = ExprOutput::Allocated(address);
+        tracing::trace!(?followed_expr, ?address, "allocating address");
+        self.expr_mut(followed_expr)?.address = ExprOutput::Allocated(address);
         Ok(address)
     }
 
+    /// Free the delayed address.
+    #[tracing::instrument(skip_all)]
+    fn free(&mut self, delayed: DelayedAddress) -> Result<()> {
+        if delayed.summary.is_last() {
+            self.free_expr(delayed.expr.id)?;
+        }
+
+        Ok(())
+    }
+
     /// Free the implicit address associated with the given slot.
+    #[tracing::instrument(skip_all)]
     fn free_expr(&mut self, slot: ExprId) -> Result<()> {
         let storage = self.expr_mut(slot)?;
 
@@ -391,37 +403,37 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     }
 
     /// Add a slot user with custom use kind.
-    fn insert_expr_user(&mut self, expr: UsedExprId, user: ExprUser) -> Result<()> {
-        let followed_id = self.follow(expr.id());
+    fn insert_expr_user(&mut self, expr: UsedExprId, user: Use) -> Result<()> {
+        let followed_expr = self.follow(expr.id);
         let followed_user = self.follow_user(user);
 
         self.expressions
-            .get_mut(followed_id)
-            .ok_or_else(missing_expr(self.span, followed_id))?
+            .get_mut(followed_expr)
+            .ok_or_else(missing_expr(self.span, followed_expr))?
             .insert_use(followed_user, expr.use_kind())
             .map_err(error_msg(self.span))?;
 
         // We can now remove this slot from the set of useless slots.
-        self.useless.remove(&followed_id);
+        self.useless.remove(&followed_expr);
         Ok(())
     }
 
     /// Remove a slot user.
-    fn remove_expr_user(&mut self, expr: UsedExprId, user: ExprUser) -> Result<()> {
-        let followed_id = self.follow(expr.id());
+    fn remove_expr_user(&mut self, expr: UsedExprId, user: Use) -> Result<()> {
+        let followed_expr = self.follow(expr.id);
         let followed_user = self.follow_user(user);
 
         let expr_mut = self
             .expressions
-            .get_mut(followed_id)
-            .ok_or_else(missing_expr(self.span, followed_id))?;
+            .get_mut(followed_expr)
+            .ok_or_else(missing_expr(self.span, followed_expr))?;
 
         expr_mut
             .remove_use(followed_user, expr.use_kind())
             .map_err(error_msg(self.span))?;
 
         if expr_mut.uses.is_empty() {
-            self.useless.insert(followed_id);
+            self.useless.insert(followed_expr);
         }
 
         Ok(())
@@ -433,31 +445,26 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     }
 
     /// Follow an expression user.
-    fn follow_user(&self, user: ExprUser) -> ExprUser {
+    fn follow_user(&self, user: Use) -> Use {
         match user {
-            ExprUser::Function => ExprUser::Function,
-            ExprUser::Pat(id) => ExprUser::Pat(id),
-            ExprUser::Expr(id) => ExprUser::Expr(self.follow(id)),
+            Use::Function => Use::Function,
+            Use::Pat(id) => Use::Pat(id),
+            Use::Expr(id) => Use::Expr(self.follow(id)),
         }
     }
 
     /// Take a single slot user.
-    fn take_expr_user(&mut self, expr: UsedExprId, user: ExprUser) -> Result<UseSummary> {
-        let followed_id = self.follow(expr.id());
+    #[tracing::instrument(skip_all)]
+    fn take_expr_user(&mut self, expr: UsedExprId, user: Use) -> Result<UseSummary> {
+        let followed_expr = self.follow(expr.id);
         let followed_user = self.follow_user(user);
 
-        tracing::trace!(
-            ?expr,
-            ?user,
-            ?followed_id,
-            ?followed_user,
-            "taking expr user"
-        );
+        tracing::trace!(?followed_expr, ?followed_user, "taking expr user");
 
         let expr_mut = self
             .expressions
-            .get_mut(followed_id)
-            .ok_or_else(missing_expr(self.span, followed_id))?;
+            .get_mut(followed_expr)
+            .ok_or_else(missing_expr(self.span, followed_expr))?;
 
         expr_mut.seal();
 
@@ -466,34 +473,35 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
             .map_err(error_msg(self.span))?;
 
         let summary = expr_mut.use_summary();
-        tracing::trace!(?expr, ?user, ?summary, "took slot user");
+        tracing::trace!(?expr.id, use_kind = ?expr.use_kind(), ?user, ?summary, "took slot user");
         Ok(summary)
     }
 
     /// Release an expression.
+    #[tracing::instrument(skip(self))]
     fn release_expr(&mut self, expr: UsedExprId) -> Result<()> {
-        let kind = self.expr(expr.id())?.kind;
-        self.release_expr_kind(kind, ExprUser::Expr(expr.id))?;
+        let kind = self.expr(expr.id)?.kind;
+        self.release_expr_kind(kind, Use::Expr(expr.id))?;
         Ok(())
     }
 
     /// Retain all expressions referenced by the given expression.
-    fn retain_expr_kind(&mut self, kind: ExprKind<'hir>, user: ExprUser) -> Result<()> {
+    fn retain_expr_kind(&mut self, kind: ExprKind<'hir>, user: Use) -> Result<()> {
         walk_expr(self, kind, |cx, used_id| cx.insert_expr_user(used_id, user))
     }
 
     /// Release all expressions referenced by the given expression.
-    fn release_expr_kind(&mut self, kind: ExprKind<'hir>, user: ExprUser) -> Result<()> {
+    fn release_expr_kind(&mut self, kind: ExprKind<'hir>, user: Use) -> Result<()> {
         walk_expr(self, kind, |cx, used_id| cx.remove_expr_user(used_id, user))
     }
 
     /// Retain all expressions associated with a pattern.
-    fn retain_pat_kind(&mut self, kind: PatKind<'hir>, user: ExprUser) -> Result<()> {
+    fn retain_pat_kind(&mut self, kind: PatKind<'hir>, user: Use) -> Result<()> {
         walk_pat(self, kind, |cx, used_id| cx.insert_expr_user(used_id, user))
     }
 
     /// Release all expressions referenced associated with a pattern.
-    fn release_pat_kind(&mut self, kind: PatKind<'hir>, user: ExprUser) -> Result<()> {
+    fn release_pat_kind(&mut self, kind: PatKind<'hir>, user: Use) -> Result<()> {
         walk_pat(self, kind, |cx, used_id| cx.remove_expr_user(used_id, user))
     }
 
@@ -508,7 +516,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     /// Insert a expression.
     fn insert_expr(&mut self, kind: ExprKind<'hir>) -> Result<UsedExprId> {
         let id = self.next_expr_id()?;
-        self.retain_expr_kind(kind, ExprUser::Expr(id))?;
+        self.retain_expr_kind(kind, Use::Expr(id))?;
         // Mark current statement inserted as potentially useless to sweep it up later.
         self.useless.insert(id);
 
@@ -534,7 +542,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         address: AssemblyAddress,
     ) -> Result<UsedExprId> {
         let used_id = self.insert_expr(kind)?;
-        let expr_mut = self.expr_mut(used_id.id())?;
+        let expr_mut = self.expr_mut(used_id.id)?;
         expr_mut.address = ExprOutput::Allocated(address);
         expr_mut.pending = false;
         Ok(used_id)
@@ -552,7 +560,7 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
             }
         };
 
-        self.retain_pat_kind(kind, ExprUser::Pat(id))?;
+        self.retain_pat_kind(kind, Use::Pat(id))?;
         self.patterns.insert(Pat::new(self.span, id, kind));
         Ok(id)
     }
@@ -768,17 +776,6 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         Ok(address)
     }
 
-    /// Get all addresses associated with a normal expression that has multiple inputs and a single output.
-    fn addresses<const N: usize>(
-        &mut self,
-        this: ExprId,
-        expressions: [UsedExprId; N],
-    ) -> Result<([AssemblyAddress; N], AssemblyAddress)> {
-        let outputs = self.expressions(Some(ExprUser::Expr(this)), expressions)?;
-        let output = self.output(this)?;
-        Ok((outputs, output))
-    }
-
     /// Assemble an expression into the specified output.
     fn expression_into(
         &mut self,
@@ -786,22 +783,22 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
         expr: UsedExprId,
         output: AssemblyAddress,
     ) -> Result<()> {
-        let summary = self.take_expr_user(expr, ExprUser::Expr(user))?;
+        let summary = self.take_expr_user(expr, Use::Expr(user))?;
 
         // Only assemble loop output *if* the loop is still alive.
         if summary.is_pending() {
             if summary.is_only() {
-                asm_to_output(self, expr.id(), output)?;
+                asm_to_output(self, expr.id, output)?;
                 return Ok(());
             }
 
-            asm(self, expr.id())?;
+            asm(self, expr.id)?;
         }
 
-        let address = self.output(expr.id())?;
+        let address = self.output(expr.id)?;
 
         if summary.is_last() {
-            self.free_expr(expr.id())?;
+            self.free_expr(expr.id)?;
         }
 
         if address != output {
@@ -817,15 +814,14 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     /// Allocate a collection of slots as addresses.
     fn expressions<const N: usize>(
         &mut self,
-        user: Option<ExprUser>,
-        expressions: [UsedExprId; N],
+        expressions: [(UsedExprId, Use); N],
     ) -> Result<[AssemblyAddress; N]> {
-        let delayed = self.delayed(user, expressions)?;
+        let delayed = self.delayed(expressions)?;
         let mut outputs = [mem::MaybeUninit::uninit(); N];
 
         for (o, address) in outputs.iter_mut().zip(delayed) {
             let out = *address;
-            address.free(self)?;
+            self.free(address)?;
             o.write(out);
         }
 
@@ -838,37 +834,27 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     /// which allows for delaying deallocation.
     fn delayed<const N: usize>(
         &mut self,
-        user: Option<ExprUser>,
-        expressions: [UsedExprId; N],
+        expressions: [(UsedExprId, Use); N],
     ) -> Result<[DelayedAddress; N]> {
-        let mut inputs = [mem::MaybeUninit::uninit(); N];
-
-        for (expr, input) in expressions.into_iter().zip(&mut inputs) {
-            let (address, used) = self.address(expr, user)?;
-            input.write((address, used, expr));
-        }
-
-        // SAFETY: we just initialized the array above.
-        let inputs = unsafe { array_assume_init(inputs) };
         let mut outputs = [mem::MaybeUninit::uninit(); N];
 
-        for (o, (address, used, expr)) in outputs.iter_mut().zip(inputs) {
-            o.write(DelayedAddress::new(address, expr, used));
+        for ((expr, user), o) in expressions.into_iter().zip(&mut outputs) {
+            let address = self.assemble(expr, Some(user))?;
+            o.write(address);
         }
 
         // SAFETY: we just initialized the array above.
-        let outputs = unsafe { array_assume_init(outputs) };
-        Ok(outputs)
+        Ok(unsafe { array_assume_init(outputs) })
     }
 
     /// Lazily assemble the given expressions *if* they are branched or if we
     /// are the only user and they have side effects.
     #[tracing::instrument(skip(self))]
-    fn lazy(&mut self, user: Option<ExprUser>, expr: UsedExprId) -> Result<AssemblyAddress> {
+    fn lazy(&mut self, user: Use, expr: UsedExprId) -> Result<AssemblyAddress> {
         let (address, used) = self.lazy_address(expr, user)?;
 
         if used.is_last() {
-            self.free_expr(expr.id())?;
+            self.free_expr(expr.id)?;
         }
 
         Ok(address)
@@ -877,22 +863,19 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     /// Helper function to assemble and allocate a single address. If `output`
     /// is specified, this function will ensure that the output of the
     /// expression ends up in it and `output` is taken.
-    fn address(
-        &mut self,
-        expr: UsedExprId,
-        user: Option<ExprUser>,
-    ) -> Result<(AssemblyAddress, UseSummary)> {
+    fn assemble(&mut self, expr: UsedExprId, user: Option<Use>) -> Result<DelayedAddress> {
         let summary = if let Some(user) = user {
             self.take_expr_user(expr, user)?
         } else {
-            self.expr(expr.id())?.use_summary()
+            self.expr(expr.id)?.use_summary()
         };
 
         if summary.is_pending() {
-            asm(self, expr.id())?;
+            asm(self, expr.id)?;
         }
 
-        Ok((self.output(expr.id())?, summary))
+        let address = self.output(expr.id)?;
+        Ok(DelayedAddress::new(address, expr, summary))
     }
 
     /// Helper function to assemble and allocate a single address. If `output`
@@ -901,13 +884,9 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
     fn lazy_address(
         &mut self,
         expr: UsedExprId,
-        user: Option<ExprUser>,
+        user: Use,
     ) -> Result<(AssemblyAddress, UseSummary)> {
-        let summary = if let Some(user) = user {
-            self.take_expr_user(expr, user)?
-        } else {
-            self.expr(expr.id())?.use_summary()
-        };
+        let summary = self.take_expr_user(expr, user)?;
 
         if summary.is_pending() {
             let is_branched = summary.is_branched();
@@ -922,15 +901,15 @@ impl<'a, 'hir> Ctxt<'a, 'hir> {
                     ?summary,
                     "needs assembly"
                 );
-                asm(self, expr.id())?;
+                asm(self, expr.id)?;
             } else {
                 // No side effects and is not branched, so just pretend that has
                 // been assembled.
-                self.expr_mut(expr.id())?.pending = false;
+                self.expr_mut(expr.id)?.pending = false;
             }
         }
 
-        Ok((self.output(expr.id())?, summary))
+        Ok((self.output(expr.id)?, summary))
     }
 }
 
@@ -949,15 +928,6 @@ impl DelayedAddress {
             expr,
             summary,
         }
-    }
-
-    /// Free the delayed address.
-    fn free(self, cx: &mut Ctxt<'_, '_>) -> Result<()> {
-        if self.summary.is_last() {
-            cx.free_expr(self.expr.id())?;
-        }
-
-        Ok(())
     }
 }
 
@@ -1058,7 +1028,7 @@ pub(crate) fn fn_from_item_fn<'hir>(
 
                     let name = cx.scopes.name(SELF);
                     let expr = cx.insert_expr_with_address(ExprKind::Address, address)?;
-                    cx.declare(name, expr.id())?;
+                    cx.declare(name, expr.id)?;
                 }
                 hir::FnArg::Pat(hir) => {
                     let expr = cx.insert_expr_with_address(ExprKind::Address, address)?;
@@ -1085,7 +1055,7 @@ fn build_captures(cx: &mut Ctxt<'_, '_>, captures: &[CaptureMeta]) -> Result<()>
         let address = cx.allocator.alloc();
         let name = cx.scopes.name(capture.ident.as_ref());
         let expr = cx.insert_expr_with_address(ExprKind::Address, address)?;
-        cx.declare(name, expr.id())?;
+        cx.declare(name, expr.id)?;
     }
 
     Ok(())
@@ -1093,7 +1063,7 @@ fn build_captures(cx: &mut Ctxt<'_, '_>, captures: &[CaptureMeta]) -> Result<()>
 
 /// Assemble a function.
 fn asm_function(cx: &mut Ctxt<'_, '_>, arguments: &[PatId], expr: UsedExprId) -> Result<()> {
-    cx.insert_expr_user(expr, ExprUser::Function)?;
+    cx.insert_expr_user(expr, Use::Function)?;
 
     bind_pats(cx)?;
 
@@ -1106,14 +1076,15 @@ fn asm_function(cx: &mut Ctxt<'_, '_>, arguments: &[PatId], expr: UsedExprId) ->
     }
 
     for expr in cx.program.clone() {
-        let [_] = cx.expressions(None, [expr])?;
+        let address = cx.assemble(expr, None)?;
+        cx.free(address)?;
     }
 
-    if cx.expr(expr.id())?.kind.is_empty() {
-        let _ = cx.expressions(Some(ExprUser::Function), [expr])?;
+    if cx.expr(expr.id)?.kind.is_empty() {
+        let _ = cx.expressions([(expr, Use::Function)])?;
         cx.push(Inst::ReturnUnit);
     } else {
-        let [address] = cx.expressions(Some(ExprUser::Function), [expr])?;
+        let [address] = cx.expressions([(expr, Use::Function)])?;
         cx.push(Inst::Return { address });
     }
 
@@ -1132,8 +1103,8 @@ fn bind_pats(cx: &mut Ctxt<'_, '_>) -> Result<()> {
             PatKind::Unbound { unbound_pat, expr } => {
                 let kind = bind_pat(cx, unbound_pat, expr)?;
                 let replaced = mem::replace(&mut cx.pat_mut(pat.id)?.kind, kind);
-                cx.release_pat_kind(replaced, ExprUser::Pat(pat.id))?;
-                cx.retain_pat_kind(kind, ExprUser::Pat(pat.id))?;
+                cx.release_pat_kind(replaced, Use::Pat(pat.id))?;
+                cx.retain_pat_kind(kind, Use::Pat(pat.id))?;
             }
             _ => {}
         }
@@ -1154,9 +1125,9 @@ fn bind_pats(cx: &mut Ctxt<'_, '_>) -> Result<()> {
             UnboundPatKind::Ghost { ghost_expr } => {
                 // Here we make the ghost expression reference the bound
                 // expression so it can be used.
-                let snapshot = cx.expr_mut(ghost_expr.id())?.take_uses();
-                cx.expr_mut(expr.id())?.import_uses(snapshot);
-                cx.expressions.move_value(ghost_expr.id(), expr.id());
+                let snapshot = cx.expr_mut(ghost_expr.id)?.take_uses();
+                cx.expr_mut(expr.id)?.import_uses(snapshot);
+                cx.expressions.move_value(ghost_expr.id, expr.id);
                 Ok(PatKind::Irrefutable { expr })
             }
             UnboundPatKind::Meta { meta } => {
@@ -1189,7 +1160,7 @@ fn bind_pats(cx: &mut Ctxt<'_, '_>) -> Result<()> {
         expr: UsedExprId,
     ) -> Result<PatKind<'hir>> {
         // Match irrefutable patterns.
-        match (cx.expr(lit.id())?.kind, cx.expr(expr.id())?.kind) {
+        match (cx.expr(lit.id)?.kind, cx.expr(expr.id)?.kind) {
             (ExprKind::Store { value: a }, ExprKind::Store { value: b }) if a == b => {
                 return Ok(PatKind::Irrefutable { expr });
             }
@@ -1214,7 +1185,7 @@ fn bind_pats(cx: &mut Ctxt<'_, '_>) -> Result<()> {
         expr: UsedExprId,
     ) -> Result<PatKind<'hir>> {
         // Try a simpler form of pattern matching through syntactical reassignment.
-        match cx.expr(expr.id())?.kind {
+        match cx.expr(expr.id)?.kind {
             ExprKind::Vec { items: expr_items }
                 if expr_items.len() == items.len()
                     || expr_items.len() >= items.len() && is_open =>
@@ -1277,7 +1248,7 @@ fn bind_pats(cx: &mut Ctxt<'_, '_>) -> Result<()> {
             PatTupleKind::Anonymous => {
                 // Try a simpler form of pattern matching through syntactical
                 // reassignment.
-                match cx.expr(expr.id())?.kind {
+                match cx.expr(expr.id)?.kind {
                     ExprKind::Tuple { items: tuple_items }
                         if tuple_items.len() == items.len()
                             || is_open && tuple_items.len() >= items.len() =>
@@ -1347,7 +1318,7 @@ fn bind_pats(cx: &mut Ctxt<'_, '_>) -> Result<()> {
             PatObjectKind::Anonymous { slot, is_open } => {
                 // Try a simpler form of pattern matching through syntactical
                 // reassignment.
-                match cx.expr(expr.id())?.kind {
+                match cx.expr(expr.id)?.kind {
                     ExprKind::Struct {
                         kind: ExprStructKind::Anonymous { slot: expr_slot },
                         exprs,
@@ -1419,12 +1390,7 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
     let out = std::io::stdout();
     let mut out = out.lock();
 
-    let iter = cx
-        .program
-        .iter()
-        .copied()
-        .chain([expr])
-        .map(|expr| expr.id());
+    let iter = cx.program.iter().copied().chain([expr]).map(|expr| expr.id);
 
     let mut task = Task {
         visited: iter.clone().collect(),
@@ -1458,26 +1424,26 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
                 self.queue.push_back(Job::Expr(id));
             }
 
-            Ok(format!("${}", id.index()))
+            Ok(format!("{:?}", id))
         }
 
         fn expr(&mut self, cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<String> {
-            if self.visited.insert(expr.id()) {
-                self.queue.push_back(Job::Expr(expr.id()));
+            if self.visited.insert(expr.id) {
+                self.queue.push_back(Job::Expr(expr.id));
             }
 
             match expr.kind {
-                UsedExprIdKind::Default => Ok(format!("${}", expr.id().index())),
+                UsedExprIdKind::Default => Ok(format!("{:?}", expr.id)),
                 UsedExprIdKind::Binding { binding, use_kind } => {
                     let name = cx.scopes.name_to_string(cx.span, binding.name)?;
-                    Ok(format!("${} {{{name:?}, {use_kind:?}}}", expr.id().index()))
+                    Ok(format!("{:?} {{{name:?}, {use_kind:?}}}", expr.id))
                 }
             }
         }
 
         fn pat_id(&mut self, _: &mut Ctxt<'_, '_>, pat: PatId) -> Result<String> {
             self.queue.push_back(Job::Pat(pat));
-            Ok(format!("Pat${}", pat.index()))
+            Ok(format!("{:?}", pat))
         }
     }
 
@@ -1501,7 +1467,7 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
 
         if let Some(to) = cx.expressions.follow(id) {
             let to = task.expr_id(cx, to)?;
-            writeln!(o, "${} => {to};", id.index()).map_err(err)?;
+            writeln!(o, "{id:?} => {to};").map_err(err)?;
             return Ok(());
         }
 
@@ -1699,7 +1665,6 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
     where
         O: std::io::Write,
     {
-        let id = pat.index();
         let pat = cx.pat(pat)?;
         let span = pat.span;
         let kind = pat.kind;
@@ -1739,11 +1704,11 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
 
         macro_rules! variant {
             ($name:ident) => {{
-                writeln!(o, "Pat${id} = {name};", name = stringify!($name)).map_err(err)?;
+                writeln!(o, "{pat:?} = {name};", name = stringify!($name)).map_err(err)?;
             }};
 
             ($name:ident { $($what:tt $field:ident),* }) => {{
-                writeln!(o, "Pat${id} = {name} {{", name = stringify!($name)).map_err(err)?;
+                writeln!(o, "{pat:?} = {name} {{", name = stringify!($name)).map_err(err)?;
                 $(field!("  ", $what, $field);)*
                 writeln!(o, "}};").map_err(err)?;
             }};
@@ -1815,7 +1780,7 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
         let mut users = String::new();
         users.push('{');
 
-        for (user, &count) in &expr.uses {
+        for (u, &count) in &expr.uses {
             for _ in 0..count {
                 if mem::take(&mut empty) {
                     users.push(' ');
@@ -1823,17 +1788,7 @@ fn debug_stdout(cx: &mut Ctxt<'_, '_>, expr: UsedExprId) -> Result<()> {
                     users.push_str(", ");
                 }
 
-                match user {
-                    ExprUser::Function => {
-                        write!(users, "fn")?;
-                    }
-                    ExprUser::Pat(id) => {
-                        write!(users, "Pat${}", id.index())?;
-                    }
-                    ExprUser::Expr(id) => {
-                        write!(users, "${}", id.index())?;
-                    }
-                }
+                write!(users, "{u:?}")?;
             }
         }
 
@@ -2432,7 +2387,7 @@ impl Index for ExprId {
 
 impl fmt::Debug for ExprId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("ExprId").field(&self.index()).finish()
+        write!(f, "${}", self.index())
     }
 }
 
@@ -2455,7 +2410,7 @@ impl Index for PatId {
 
 impl fmt::Debug for PatId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("PatId").field(&self.index()).finish()
+        write!(f, "Pat${}", self.index())
     }
 }
 
@@ -2896,8 +2851,8 @@ impl ExprOutput {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum ExprUser {
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Use {
     /// Implicitly used by the function.
     Function,
     /// Pattern user.
@@ -2906,9 +2861,19 @@ enum ExprUser {
     Expr(ExprId),
 }
 
+impl fmt::Debug for Use {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Function => write!(f, "fn"),
+            Self::Pat(id) => id.fmt(f),
+            Self::Expr(id) => id.fmt(f),
+        }
+    }
+}
+
 struct RemoveUseError {
     this: ExprId,
-    user: ExprUser,
+    user: Use,
 }
 
 impl fmt::Display for RemoveUseError {
@@ -2922,7 +2887,7 @@ impl fmt::Display for RemoveUseError {
 }
 
 enum InsertUseError {
-    Sealed { this: ExprId, user: ExprUser },
+    Sealed { this: ExprId, user: Use },
 }
 
 impl fmt::Display for InsertUseError {
@@ -2947,7 +2912,7 @@ struct Expr<'hir> {
     /// The kind of the expression.
     kind: ExprKind<'hir>,
     /// The downstream users of this slot.
-    uses: BTreeMap<ExprUser, usize>,
+    uses: BTreeMap<Use, usize>,
     /// Current number of uses.
     current: usize,
     /// The implicit address of the slot.
@@ -2977,12 +2942,15 @@ impl<'hir> Expr<'hir> {
     }
 
     /// Insert a single user of this expression.
-    fn insert_use(&mut self, user: ExprUser, use_kind: UseKind) -> Result<(), InsertUseError> {
-        let this = self.id;
-        tracing::trace!(?this, ?user, ?use_kind, "inserting use");
+    #[tracing::instrument(skip(self))]
+    fn insert_use(&mut self, user: Use, use_kind: UseKind) -> Result<(), InsertUseError> {
+        tracing::trace!(?self.id, ?self.uses, ?self.branches, ?self.current, "inserting use");
 
         if self.sealed.get().is_some() {
-            return Err(InsertUseError::Sealed { this, user });
+            return Err(InsertUseError::Sealed {
+                this: self.id,
+                user,
+            });
         }
 
         *self.uses.entry(user).or_default() += 1;
@@ -2996,9 +2964,9 @@ impl<'hir> Expr<'hir> {
     }
 
     /// Remove a single user of this expression.
-    fn remove_use(&mut self, user: ExprUser, use_kind: UseKind) -> Result<(), RemoveUseError> {
-        let this = self.id;
-        tracing::trace!(?this, ?user, "removing use");
+    #[tracing::instrument(skip(self))]
+    fn remove_use(&mut self, user: Use, use_kind: UseKind) -> Result<(), RemoveUseError> {
+        tracing::trace!(?self.id, ?self.uses, ?self.branches, ?self.current, "removing use");
 
         match self.uses.entry(user) {
             btree_map::Entry::Occupied(mut e) => {
@@ -3011,7 +2979,10 @@ impl<'hir> Expr<'hir> {
                 }
             }
             btree_map::Entry::Vacant(..) => {
-                return Err(RemoveUseError { this, user });
+                return Err(RemoveUseError {
+                    this: self.id,
+                    user,
+                });
             }
         }
 
@@ -3082,7 +3053,7 @@ impl<'hir> Expr<'hir> {
 /// A snapshot from the uses of an expression.
 #[derive(Debug, Clone)]
 struct ExprUseSnapshot {
-    uses: BTreeMap<ExprUser, usize>,
+    uses: BTreeMap<Use, usize>,
     branches: usize,
 }
 
@@ -3214,7 +3185,7 @@ impl Allocator {
 
 /// Test if the expression at the given slot has side effects.
 fn has_side_effects(cx: &mut Ctxt<'_, '_>, used_id: UsedExprId) -> Result<bool> {
-    let expr = cx.expr(used_id.id())?;
+    let expr = cx.expr(used_id.id)?;
 
     // NB: if the expression is no longer pending it cannot have side effects,
     // since it's already been assembled somewhere else where whatever its
@@ -3470,7 +3441,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
 
     #[instrument]
     fn asm_store<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId, value: InstValue) -> Result<()> {
-        let ([], output) = cx.addresses(this, [])?;
+        let output = cx.output(this)?;
         cx.push(Inst::Store { value, output });
         Ok(())
     }
@@ -3478,7 +3449,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
     #[instrument]
     fn asm_bytes<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId, bytes: &[u8]) -> Result<()> {
         let slot = cx.q.unit.new_static_bytes(cx.span, bytes)?;
-        let ([], output) = cx.addresses(this, [])?;
+        let output = cx.output(this)?;
         cx.push(Inst::Bytes { slot, output });
         Ok(())
     }
@@ -3486,7 +3457,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
     #[instrument]
     fn asm_string<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId, string: &str) -> Result<()> {
         let slot = cx.q.unit.new_static_string(cx.span, string)?;
-        let ([], output) = cx.addresses(this, [])?;
+        let output = cx.output(this)?;
         cx.push(Inst::String { slot, output });
         Ok(())
     }
@@ -3498,7 +3469,8 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         op: ExprUnOp,
         expr: UsedExprId,
     ) -> Result<()> {
-        let ([address], output) = cx.addresses(this, [expr])?;
+        let [address] = cx.expressions([(expr, Use::Expr(this))])?;
+        let output = cx.output(this)?;
 
         match op {
             ExprUnOp::Neg => {
@@ -3516,11 +3488,28 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
     fn asm_binary_assign<'hir>(
         cx: &mut Ctxt<'_, 'hir>,
         this: ExprId,
-        lhs: UsedExprId,
+        cur: UsedExprId,
         op: ast::BinOp,
         rhs: UsedExprId,
     ) -> Result<()> {
-        let ([lhs, rhs], output) = cx.addresses(this, [lhs, rhs])?;
+        let (lhs, rhs, target) = match cx.expr(cur.id)?.kind {
+            ExprKind::StructFieldAccess { lhs, field, .. } => {
+                let n = cx.q.unit.new_static_string(cx.span, field)?;
+                let [lhs, rhs] =
+                    cx.expressions([(lhs, Use::Expr(cur.id)), (rhs, Use::Expr(this))])?;
+                (lhs, rhs, InstTarget::ObjectField(n))
+            }
+            ExprKind::TupleFieldAccess { lhs, index, .. } => {
+                let [lhs, rhs] =
+                    cx.expressions([(lhs, Use::Expr(cur.id)), (rhs, Use::Expr(this))])?;
+                (lhs, rhs, InstTarget::TupleField(index))
+            }
+            _ => {
+                let [lhs, rhs] =
+                    cx.expressions([(cur, Use::Expr(this)), (rhs, Use::Expr(this))])?;
+                (lhs, rhs, InstTarget::Offset)
+            }
+        };
 
         let op = match op {
             ast::BinOp::AddAssign(..) => InstAssignOp::Add,
@@ -3538,10 +3527,12 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
             }
         };
 
+        let output = cx.output(this)?;
+
         cx.push(Inst::Assign {
             lhs,
             rhs,
-            target: InstTarget::Offset,
+            target,
             op,
             // NB: while an assign operation doesn't output anything, this
             // might result in a call to an external function which expects
@@ -3572,7 +3563,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
 
         cx.with_state_checkpoint(|cx| {
             for &expr in lhs.program {
-                let _ = cx.expressions(Some(ExprUser::Expr(this)), [expr])?;
+                let _ = cx.expressions([(expr, Use::Expr(this))])?;
             }
 
             cx.expression_into(this, lhs.expr, output)?;
@@ -3599,7 +3590,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
 
         cx.with_state_checkpoint(|cx| {
             for &expr in rhs.program {
-                let _ = cx.expressions(Some(ExprUser::Expr(this)), [expr])?;
+                let _ = cx.expressions([(expr, Use::Expr(this))])?;
             }
 
             cx.expression_into(this, rhs.expr, output)?;
@@ -3645,7 +3636,8 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
             }
         };
 
-        let ([a, b], output) = cx.addresses(this, [lhs, rhs])?;
+        let [a, b] = cx.expressions([(lhs, Use::Expr(this)), (rhs, Use::Expr(this))])?;
+        let output = cx.output(this)?;
         cx.push(Inst::Op { op, a, b, output });
         Ok(())
     }
@@ -3657,7 +3649,9 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         target: UsedExprId,
         index: UsedExprId,
     ) -> Result<()> {
-        let ([address, index], output) = cx.addresses(this, [target, index])?;
+        let [address, index] =
+            cx.expressions([(target, Use::Expr(this)), (index, Use::Expr(this))])?;
+        let output = cx.output(this)?;
 
         cx.push(Inst::IndexGet {
             address,
@@ -3691,7 +3685,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
                 } => {
                     named.assert_not_generic()?;
 
-                    let ([], output) = cx.addresses(this, [])?;
+                    let output = cx.output(this)?;
 
                     cx.push_with_comment(
                         Inst::Call {
@@ -3715,7 +3709,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
                 } if tuple.args == 0 => {
                     named.assert_not_generic()?;
 
-                    let ([], output) = cx.addresses(this, [])?;
+                    let output = cx.output(this)?;
 
                     cx.push_with_comment(
                         Inst::Call {
@@ -3735,7 +3729,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
                 } => {
                     named.assert_not_generic()?;
 
-                    let ([], output) = cx.addresses(this, [])?;
+                    let output = cx.output(this)?;
 
                     cx.push_with_comment(
                         Inst::LoadFn {
@@ -3753,7 +3747,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
                 } => {
                     named.assert_not_generic()?;
 
-                    let ([], output) = cx.addresses(this, [])?;
+                    let output = cx.output(this)?;
 
                     cx.push_with_comment(
                         Inst::LoadFn {
@@ -3774,7 +3768,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
                         *type_hash
                     };
 
-                    let ([], output) = cx.addresses(this, [])?;
+                    let output = cx.output(this)?;
 
                     cx.push_with_comment(Inst::LoadFn { hash, output }, meta.info(cx.q.pool));
                     ExprOutcome::Output
@@ -3784,7 +3778,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
                 } => {
                     named.assert_not_generic()?;
                     let expr = const_value(cx, value)?;
-                    cx.insert_expr_user(expr, ExprUser::Expr(this))?;
+                    cx.insert_expr_user(expr, Use::Expr(this))?;
                     let output = cx.output(this)?;
                     cx.expression_into(this, expr, output)?;
                     ExprOutcome::Output
@@ -3809,7 +3803,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
                 }
             };
 
-            let ([], output) = cx.addresses(this, [])?;
+            let output = cx.output(this)?;
 
             cx.push(Inst::Store {
                 value: InstValue::Type(type_hash),
@@ -3829,7 +3823,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         kind: ExprStructKind,
         exprs: &[UsedExprId],
     ) -> Result<()> {
-        let ([], output) = cx.addresses(this, [])?;
+        let output = cx.output(this)?;
         let address = cx.array(this, exprs.iter().copied())?;
 
         match kind {
@@ -3866,7 +3860,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
 
     #[instrument]
     fn asm_vec<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId, items: &[UsedExprId]) -> Result<()> {
-        let ([], output) = cx.addresses(this, [])?;
+        let output = cx.output(this)?;
         let address = cx.array(this, items.iter().copied())?;
 
         cx.push(Inst::Vec {
@@ -3886,7 +3880,8 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         limits: InstRangeLimits,
         to: UsedExprId,
     ) -> Result<()> {
-        let ([from, to], output) = cx.addresses(this, [from, to])?;
+        let [from, to] = cx.expressions([(from, Use::Expr(this)), (to, Use::Expr(this))])?;
+        let output = cx.output(this)?;
 
         cx.push(Inst::Range {
             from,
@@ -3902,23 +3897,36 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
     fn asm_tuple<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId, items: &[UsedExprId]) -> Result<()> {
         match items {
             &[a] => {
-                let (args, output) = cx.addresses(this, [a])?;
+                let args = cx.expressions([(a, Use::Expr(this))])?;
+                let output = cx.output(this)?;
                 cx.push(Inst::Tuple1 { args, output });
             }
             &[a, b] => {
-                let (args, output) = cx.addresses(this, [a, b])?;
+                let args = cx.expressions([(a, Use::Expr(this)), (b, Use::Expr(this))])?;
+                let output = cx.output(this)?;
                 cx.push(Inst::Tuple2 { args, output });
             }
             &[a, b, c] => {
-                let (args, output) = cx.addresses(this, [a, b, c])?;
+                let args = cx.expressions([
+                    (a, Use::Expr(this)),
+                    (b, Use::Expr(this)),
+                    (c, Use::Expr(this)),
+                ])?;
+                let output = cx.output(this)?;
                 cx.push(Inst::Tuple3 { args: args, output });
             }
             &[a, b, c, d] => {
-                let (args, output) = cx.addresses(this, [a, b, c, d])?;
+                let args = cx.expressions([
+                    (a, Use::Expr(this)),
+                    (b, Use::Expr(this)),
+                    (c, Use::Expr(this)),
+                    (d, Use::Expr(this)),
+                ])?;
+                let output = cx.output(this)?;
                 cx.push(Inst::Tuple4 { args, output });
             }
             args => {
-                let ([], output) = cx.addresses(this, [])?;
+                let output = cx.output(this)?;
                 let address = cx.array(this, args.iter().copied())?;
 
                 cx.push(Inst::Tuple {
@@ -3940,7 +3948,8 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
     ) -> Result<()> {
         match value {
             Some(value) => {
-                let ([address], output) = cx.addresses(this, [value])?;
+                let [address] = cx.expressions([(value, Use::Expr(this))])?;
+                let output = cx.output(this)?;
 
                 cx.push(Inst::Variant {
                     address,
@@ -3949,7 +3958,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
                 });
             }
             None => {
-                let ([], output) = cx.addresses(this, [])?;
+                let output = cx.output(this)?;
 
                 cx.push(Inst::Variant {
                     address: output,
@@ -3969,7 +3978,8 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         lhs: UsedExprId,
         index: usize,
     ) -> Result<()> {
-        let ([address], output) = cx.addresses(this, [lhs])?;
+        let [address] = cx.expressions([(lhs, Use::Expr(this))])?;
+        let output = cx.output(this)?;
 
         cx.push(Inst::TupleIndexGet {
             address,
@@ -3987,7 +3997,8 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         lhs: UsedExprId,
         field: &str,
     ) -> Result<()> {
-        let ([address], output) = cx.addresses(this, [lhs])?;
+        let [address] = cx.expressions([(lhs, Use::Expr(this))])?;
+        let output = cx.output(this)?;
         let slot = cx.q.unit.new_static_string(cx.span, field)?;
 
         cx.push(Inst::ObjectIndexGet {
@@ -4007,9 +4018,9 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         lhs: UsedExprId,
         rhs: UsedExprId,
     ) -> Result<()> {
-        let [output] = cx.delayed(Some(ExprUser::Expr(this)), [lhs])?;
+        let [output] = cx.delayed([(lhs, Use::Expr(this))])?;
         cx.expression_into(this, rhs, *output)?;
-        output.free(cx)?;
+        cx.free(output)?;
         Ok(())
     }
 
@@ -4021,7 +4032,8 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         field: &str,
         rhs: UsedExprId,
     ) -> Result<()> {
-        let ([address, value], output) = cx.addresses(this, [lhs, rhs])?;
+        let [address, value] = cx.expressions([(lhs, Use::Expr(this)), (rhs, Use::Expr(this))])?;
+        let output = cx.output(this)?;
         let slot = cx.q.unit.new_static_string(cx.span, field)?;
 
         cx.push(Inst::ObjectIndexSet {
@@ -4042,7 +4054,8 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         index: usize,
         rhs: UsedExprId,
     ) -> Result<()> {
-        let ([address, value], output) = cx.addresses(this, [lhs, rhs])?;
+        let [address, value] = cx.expressions([(lhs, Use::Expr(this)), (rhs, Use::Expr(this))])?;
+        let output = cx.output(this)?;
 
         cx.push(Inst::TupleIndexSet {
             address,
@@ -4061,7 +4074,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         args: &[UsedExprId],
         hash: Hash,
     ) -> Result<()> {
-        let ([], output) = cx.addresses(this, [])?;
+        let output = cx.output(this)?;
         let address = cx.array(this, args.iter().copied())?;
 
         cx.push(Inst::Call {
@@ -4082,7 +4095,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         args: &[UsedExprId],
         hash: Hash,
     ) -> Result<()> {
-        let ([], output) = cx.addresses(this, [])?;
+        let output = cx.output(this)?;
         let address = cx.allocator.array_address();
 
         {
@@ -4115,12 +4128,13 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         expr: UsedExprId,
         args: &[UsedExprId],
     ) -> Result<()> {
-        let ([function], output) = cx.addresses(this, [expr])?;
-        let array = cx.array(this, args.iter().copied())?;
+        let [function] = cx.expressions([(expr, Use::Expr(this))])?;
+        let output = cx.output(this)?;
+        let address = cx.array(this, args.iter().copied())?;
 
         cx.push(Inst::CallFn {
             function,
-            address: array,
+            address,
             count: args.len(),
             output,
         });
@@ -4136,12 +4150,12 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
     ) -> Result<()> {
         Ok(match expr {
             Some(expr) => {
-                let ([address], output) = cx.addresses(this, [expr])?;
-
+                let [address] = cx.expressions([(expr, Use::Expr(this))])?;
+                let output = cx.output(this)?;
                 cx.push(Inst::Yield { address, output });
             }
             None => {
-                let ([], output) = cx.addresses(this, [])?;
+                let output = cx.output(this)?;
                 cx.push(Inst::YieldUnit { output });
             }
         })
@@ -4149,32 +4163,30 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
 
     #[instrument]
     fn asm_await<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId, expr: UsedExprId) -> Result<()> {
-        let ([address], output) = cx.addresses(this, [expr])?;
-
+        let [address] = cx.expressions([(expr, Use::Expr(this))])?;
+        let output = cx.output(this)?;
         cx.push(Inst::Await { address, output });
-
         Ok(())
     }
 
     #[instrument]
     fn asm_return<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId, expr: UsedExprId) -> Result<()> {
-        let ([address], _) = cx.addresses(this, [expr])?;
+        let [address] = cx.expressions([(expr, Use::Expr(this))])?;
         cx.push(Inst::Return { address });
         Ok(())
     }
 
     #[instrument]
     fn asm_try<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId, expr: UsedExprId) -> Result<()> {
-        let ([address], output) = cx.addresses(this, [expr])?;
-
+        let [address] = cx.expressions([(expr, Use::Expr(this))])?;
+        let output = cx.output(this)?;
         cx.push(Inst::Try { address, output });
-
         Ok(())
     }
 
     #[instrument]
     fn asm_function<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId, hash: Hash) -> Result<()> {
-        let ([], output) = cx.addresses(this, [])?;
+        let output = cx.output(this)?;
         cx.push(Inst::LoadFn { hash, output });
         Ok(())
     }
@@ -4186,7 +4198,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         captures: &[UsedExprId],
         hash: Hash,
     ) -> Result<()> {
-        let ([], output) = cx.addresses(this, [])?;
+        let output = cx.output(this)?;
         let address = cx.array(this, captures.iter().copied())?;
 
         cx.push(Inst::Closure {
@@ -4222,7 +4234,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
                 (None, Some(end_unit))
             }
             LoopCondition::Iterator { iter, pat } => {
-                let [iter] = cx.delayed(Some(ExprUser::Expr(this)), [iter])?;
+                let [iter] = cx.delayed([(iter, Use::Expr(this))])?;
 
                 cx.push(Inst::CallInstance {
                     hash: *Protocol::INTO_ITER,
@@ -4247,10 +4259,10 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         };
 
         for expr in block.program {
-            let _ = cx.expressions(Some(ExprUser::Expr(this)), [*expr])?;
+            let _ = cx.expressions([(*expr, Use::Expr(this))])?;
         }
 
-        let outcome = asm(cx, block.expr.id())?;
+        let outcome = asm(cx, block.expr.id)?;
 
         cx.push(Inst::Jump { label: start });
 
@@ -4266,7 +4278,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         cx.label(end)?;
 
         if let Some(iter) = cleanup {
-            iter.free(cx)?;
+            cx.free(iter)?;
         }
 
         Ok(outcome)
@@ -4282,18 +4294,18 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         loop_expr: UsedExprId,
     ) -> Result<ExprOutcome> {
         if let Some(expr) = value {
-            let loop_summary = cx.expr_mut(loop_expr.id())?.use_summary();
+            let loop_summary = cx.expr_mut(loop_expr.id)?.use_summary();
 
             // Only assemble loop output *if* the loop is still alive.
             if !loop_summary.is_alive() {
                 return Err(cx.msg("loop is not alive"));
             }
 
-            let output = cx.output(loop_expr.id())?;
+            let output = cx.output(loop_expr.id)?;
             cx.expression_into(this, expr, output)?;
         }
 
-        cx.remove_expr_user(loop_expr, ExprUser::Expr(this))?;
+        cx.remove_expr_user(loop_expr, Use::Expr(this))?;
         cx.push(Inst::Jump { label });
         Ok(ExprOutcome::Empty)
     }
@@ -4333,7 +4345,8 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
         spec: &FormatSpec,
         expr: UsedExprId,
     ) -> Result<ExprOutcome> {
-        let ([address], output) = cx.addresses(this, [expr])?;
+        let [address] = cx.expressions([(expr, Use::Expr(this))])?;
+        let output = cx.output(this)?;
 
         cx.push(Inst::Format {
             address,
@@ -4360,7 +4373,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
                 let end = cx.new_label("branch_end");
                 asm_pat(cx, branch.pat, end)?;
 
-                let [address] = cx.expressions(Some(ExprUser::Expr(this)), [branch.condition])?;
+                let [address] = cx.expressions([(branch.condition, Use::Expr(this))])?;
 
                 cx.push(Inst::JumpIfNot {
                     address,
@@ -4368,7 +4381,7 @@ fn asm<'hir>(cx: &mut Ctxt<'_, 'hir>, this: ExprId) -> Result<ExprOutcome> {
                 });
 
                 for &expr in branch.body.program {
-                    let _ = cx.expressions(Some(ExprUser::Expr(this)), [expr])?;
+                    let _ = cx.expressions([(expr, Use::Expr(this))])?;
                 }
 
                 cx.expression_into(this, branch.body.expr, output)?;
@@ -4414,18 +4427,18 @@ fn asm_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, this: PatId, label: Label) -> Result<P
         PatKind::Irrefutable { expr, .. } => {
             // NB: assemble the actual expression to ensure that any potential
             // side effects are taken into account.
-            let _ = cx.lazy(Some(ExprUser::Pat(this)), expr)?;
+            let _ = cx.lazy(Use::Pat(this), expr)?;
             Ok(PatOutcome::Irrefutable)
         }
         PatKind::IrrefutableSequence { expr, items, .. } => {
             let outcome = asm_irrefutable_sequence(cx, items, label)?;
             // NB: assemble the actual expression to ensure that any potential
             // side effects are taken into account.
-            let _ = cx.lazy(Some(ExprUser::Pat(this)), expr)?;
+            let _ = cx.lazy(Use::Pat(this), expr)?;
             Ok(outcome)
         }
         PatKind::Lit { expr, lit } => {
-            let [expr] = cx.expressions(Some(ExprUser::Pat(this)), [expr])?;
+            let [expr] = cx.expressions([(expr, Use::Pat(this))])?;
             asm_bound_lit(cx, expr, lit, label)
         }
         PatKind::Vec {
@@ -4434,7 +4447,7 @@ fn asm_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, this: PatId, label: Label) -> Result<P
             is_open,
             items,
         } => {
-            let [expr] = cx.expressions(Some(ExprUser::Pat(this)), [expr])?;
+            let [expr] = cx.expressions([(expr, Use::Pat(this))])?;
             asm_bound_vec(cx, expr, address, is_open, items, label)
         }
         PatKind::AnonymousTuple {
@@ -4443,7 +4456,7 @@ fn asm_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, this: PatId, label: Label) -> Result<P
             is_open,
             items,
         } => {
-            let [expr] = cx.expressions(Some(ExprUser::Pat(this)), [expr])?;
+            let [expr] = cx.expressions([(expr, Use::Pat(this))])?;
             asm_anonymous_tuple(cx, expr, address, is_open, items, label)
         }
         PatKind::AnonymousObject {
@@ -4453,7 +4466,7 @@ fn asm_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, this: PatId, label: Label) -> Result<P
             is_open,
             items,
         } => {
-            let [expr] = cx.expressions(Some(ExprUser::Pat(this)), [expr])?;
+            let [expr] = cx.expressions([(expr, Use::Pat(this))])?;
             asm_anonymous_object(cx, expr, address, slot, is_open, items, label)
         }
         PatKind::TypedSequence {
@@ -4461,7 +4474,7 @@ fn asm_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, this: PatId, label: Label) -> Result<P
             type_match,
             items,
         } => {
-            let [expr] = cx.expressions(Some(ExprUser::Pat(this)), [expr])?;
+            let [expr] = cx.expressions([(expr, Use::Pat(this))])?;
             asm_typed_sequence(cx, expr, type_match, items, label)
         }
         _ => Err(cx.msg("trying to assemble pattern which hasn't been bound")),
@@ -4491,7 +4504,7 @@ fn asm_pat<'hir>(cx: &mut Ctxt<'_, 'hir>, this: PatId, label: Label) -> Result<P
         lit: UsedExprId,
         label: Label,
     ) -> Result<PatOutcome> {
-        match cx.expr(lit.id())?.kind {
+        match cx.expr(lit.id)?.kind {
             ExprKind::Store { value } => {
                 cx.push(Inst::MatchValue {
                     address: expr,
@@ -4777,7 +4790,7 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
         let rhs = expr_value(cx, &hir.rhs)?;
         let lhs = expr_value(cx, &hir.lhs)?;
 
-        let kind = match cx.expr(lhs.id())?.kind {
+        let kind = match cx.expr(lhs.id)?.kind {
             ExprKind::StructFieldAccess { lhs, field, .. } => {
                 ExprKind::AssignStructField { lhs, field, rhs }
             }
@@ -4807,7 +4820,7 @@ fn expr<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Expr<'hir>, needs: Needs) -> R
     fn call<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::ExprCall<'hir>) -> Result<UsedExprId> {
         let expr = expr_value(cx, hir.expr)?;
 
-        match cx.expr(expr.id())?.kind {
+        match cx.expr(expr.id)?.kind {
             ExprKind::Meta { meta, named, .. } => {
                 match &meta.kind {
                     PrivMetaKind::Struct {
@@ -5782,11 +5795,6 @@ impl UsedExprId {
         }
     }
 
-    /// Get the underlying expression id.
-    const fn id(&self) -> ExprId {
-        self.id
-    }
-
     /// Construct a used expression id from a binding.
     fn binding(id: ExprId, binding: Binding, use_kind: UseKind) -> Self {
         Self {
@@ -5810,8 +5818,8 @@ impl UsedExprId {
     {
         let kind = map(cx, cx.expr(self.id)?.kind)?;
         let replaced = mem::replace(&mut cx.expr_mut(self.id)?.kind, kind);
-        cx.release_expr_kind(replaced, ExprUser::Expr(self.id))?;
-        cx.retain_expr_kind(kind, ExprUser::Expr(self.id))?;
+        cx.release_expr_kind(replaced, Use::Expr(self.id))?;
+        cx.retain_expr_kind(kind, Use::Expr(self.id))?;
         Ok(self)
     }
 }
@@ -6160,7 +6168,7 @@ fn pat<'hir>(cx: &mut Ctxt<'_, 'hir>, hir: &hir::Pat<'hir>, expr: UsedExprId) ->
                 let ghost_expr = cx.insert_expr(ExprKind::Empty)?;
 
                 let name = cx.scopes.name(name);
-                let replaced = cx.declare(name, ghost_expr.id())?;
+                let replaced = cx.declare(name, ghost_expr.id)?;
 
                 if replaced.is_some() {
                     if let Some(span) = removed.insert(name, cx.span) {
